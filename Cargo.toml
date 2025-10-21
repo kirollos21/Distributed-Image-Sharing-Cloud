@@ -1,0 +1,40 @@
+[package]
+name = "distributed-image-cloud"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.35", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"
+env_logger = "0.11"
+rand = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+eframe = "0.28"
+egui = "0.28"
+egui_extras = { version = "0.28", features = ["image"] }
+image = "0.25"
+rfd = "0.14"  # File dialogs
+poll-promise = "0.3"  # Async promises for egui
+
+[[bin]]
+name = "cloud-node"
+path = "src/bin/cloud_node.rs"
+
+[[bin]]
+name = "client"
+path = "src/bin/client.rs"
+
+[[bin]]
+name = "demo"
+path = "src/bin/demo.rs"
+
+[[bin]]
+name = "client-gui"
+path = "src/bin/client_gui.rs"
+
+[[bin]]
+name = "server-gui"
+path = "src/bin/server_gui.rs"
