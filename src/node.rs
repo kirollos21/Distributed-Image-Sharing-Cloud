@@ -1,16 +1,26 @@
 use crate::election::{ElectionManager, ElectionResult};
 use crate::encryption;
-use crate::messages::{Message, NodeId, NodeState};
+use crate::messages::{Message, NodeId, NodeState, ReceivedImageInfo};
 use log::{debug, error, info};
 use rand::Rng;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{interval, sleep};
+
+/// Stored image data
+#[derive(Clone, Debug)]
+pub struct StoredImage {
+    pub image_id: String,
+    pub from_username: String,
+    pub encrypted_data: Vec<u8>,
+    pub remaining_views: u32,
+    pub max_views: u32,
+    pub timestamp: i64,
+}
 
 /// Cloud Node that participates in the distributed system
 pub struct CloudNode {
@@ -22,6 +32,8 @@ pub struct CloudNode {
     pub queue_length: Arc<RwLock<usize>>,
     pub peer_addresses: HashMap<NodeId, String>,
     pub processed_requests: Arc<RwLock<usize>>,
+    pub active_sessions: Arc<RwLock<HashMap<String, String>>>, // username -> client_id
+    pub stored_images: Arc<RwLock<HashMap<String, Vec<StoredImage>>>>, // username -> list of images
 }
 
 impl CloudNode {
@@ -37,6 +49,8 @@ impl CloudNode {
             queue_length: Arc::new(RwLock::new(0)),
             peer_addresses,
             processed_requests: Arc::new(RwLock::new(0)),
+            active_sessions: Arc::new(RwLock::new(HashMap::new())),
+            stored_images: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -44,8 +58,8 @@ impl CloudNode {
     pub async fn start(self: Arc<Self>) -> Result<(), Box<dyn std::error::Error>> {
         info!("[Node {}] Starting on {}", self.id, self.address);
 
-        let listener = TcpListener::bind(&self.address).await?;
-        info!("[Node {}] Listening on {}", self.id, self.address);
+        let socket = UdpSocket::bind(&self.address).await?;
+        info!("[Node {}] Listening on {} (UDP)", self.id, self.address);
 
         // Start background tasks
         let self_clone = self.clone();
@@ -58,54 +72,64 @@ impl CloudNode {
             self_clone.periodic_election_task().await;
         });
 
-        // Accept incoming connections
+        // Receive incoming datagrams
+        let socket = Arc::new(socket);
+        let mut buffer = vec![0u8; 65535]; // Max UDP packet size
+
         loop {
-            match listener.accept().await {
-                Ok((stream, addr)) => {
+            match socket.recv_from(&mut buffer).await {
+                Ok((n, addr)) => {
+                    let data = buffer[..n].to_vec();
                     let self_clone = self.clone();
+                    let socket_clone = socket.clone();
+
                     tokio::spawn(async move {
-                        if let Err(e) = self_clone.handle_connection(stream, addr).await {
-                            error!("[Node {}] Error handling connection: {}", self_clone.id, e);
+                        if let Err(e) = self_clone.handle_datagram(socket_clone, data, addr).await {
+                            error!("[Node {}] Error handling datagram: {}", self_clone.id, e);
                         }
                     });
                 }
                 Err(e) => {
-                    error!("[Node {}] Error accepting connection: {}", self.id, e);
+                    error!("[Node {}] Error receiving datagram: {}", self.id, e);
                 }
             }
         }
     }
 
-    /// Handle incoming connection
-    async fn handle_connection(
+    /// Handle incoming UDP datagram
+    async fn handle_datagram(
         &self,
-        mut stream: TcpStream,
+        socket: Arc<UdpSocket>,
+        data: Vec<u8>,
         addr: SocketAddr,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Check if node is in Failed state
         let state = self.state.read().await;
         if *state == NodeState::Failed {
-            debug!("[Node {}] Ignoring connection (FAILED state)", self.id);
+            debug!("[Node {}] Ignoring datagram (FAILED state)", self.id);
             return Ok(());
         }
         drop(state);
 
-        let mut buffer = vec![0u8; 1024 * 1024]; // 1MB buffer
-        let n = stream.read(&mut buffer).await?;
-
-        if n == 0 {
-            return Ok(());
-        }
-
-        let message: Message = serde_json::from_slice(&buffer[..n])?;
+        // Parse message
+        let message: Message = serde_json::from_slice(&data)?;
         debug!("[Node {}] Received from {}: {}", self.id, addr, message);
 
         // Process message based on type
         let response = self.process_message(message).await;
 
+        // Send response if any
         if let Some(response) = response {
             let response_bytes = serde_json::to_vec(&response)?;
-            stream.write_all(&response_bytes).await?;
+
+            // Check if response fits in UDP packet
+            if response_bytes.len() > 65507 {
+                error!("[Node {}] Response too large for UDP: {} bytes", self.id, response_bytes.len());
+                return Err("Response exceeds UDP packet size limit".into());
+            }
+
+            socket.send_to(&response_bytes, addr).await?;
+            debug!("[Node {}] Sent response to {}", self.id, addr);
         }
 
         Ok(())
@@ -114,8 +138,37 @@ impl CloudNode {
     /// Process incoming message
     async fn process_message(&self, message: Message) -> Option<Message> {
         match message {
+            Message::SessionRegister { client_id, username } => {
+                let mut sessions = self.active_sessions.write().await;
+
+                // Check if username is already taken
+                if sessions.contains_key(&username) {
+                    info!("[Node {}] Session registration failed: username '{}' already taken", self.id, username);
+                    Some(Message::SessionRegisterResponse {
+                        success: false,
+                        error: Some(format!("Username '{}' is already in use", username)),
+                    })
+                } else {
+                    // Register the session
+                    sessions.insert(username.clone(), client_id.clone());
+                    info!("[Node {}] Session registered: username '{}' for client '{}'", self.id, username, client_id);
+                    Some(Message::SessionRegisterResponse {
+                        success: true,
+                        error: None,
+                    })
+                }
+            }
+
+            Message::SessionUnregister { client_id: _, username } => {
+                let mut sessions = self.active_sessions.write().await;
+                sessions.remove(&username);
+                info!("[Node {}] Session unregistered: username '{}'", self.id, username);
+                None
+            }
+
             Message::EncryptionRequest {
                 request_id,
+                client_username: _,
                 image_data,
                 usernames,
                 quota,
@@ -183,6 +236,110 @@ impl CloudNode {
                 })
             }
 
+            Message::SendImage {
+                from_username,
+                to_usernames,
+                encrypted_image,
+                max_views,
+                image_id,
+            } => {
+                let mut stored = self.stored_images.write().await;
+                let timestamp = chrono::Utc::now().timestamp();
+
+                for username in to_usernames {
+                    let image = StoredImage {
+                        image_id: image_id.clone(),
+                        from_username: from_username.clone(),
+                        encrypted_data: encrypted_image.clone(),
+                        remaining_views: max_views,
+                        max_views,
+                        timestamp,
+                    };
+
+                    stored.entry(username.clone()).or_insert_with(Vec::new).push(image);
+                }
+
+                info!("[Node {}] Stored image {} from {}", self.id, image_id, from_username);
+
+                Some(Message::SendImageResponse {
+                    success: true,
+                    image_id,
+                    error: None,
+                })
+            }
+
+            Message::QueryReceivedImages { username } => {
+                let stored = self.stored_images.read().await;
+                let images = stored
+                    .get(&username)
+                    .map(|imgs| {
+                        imgs.iter()
+                            .filter(|img| img.remaining_views > 0)
+                            .map(|img| ReceivedImageInfo {
+                                image_id: img.image_id.clone(),
+                                from_username: img.from_username.clone(),
+                                remaining_views: img.remaining_views,
+                                timestamp: img.timestamp,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                Some(Message::QueryReceivedImagesResponse { images })
+            }
+
+            Message::CheckUsernameAvailable { username } => {
+                let sessions = self.active_sessions.read().await;
+                let is_available = !sessions.contains_key(&username);
+                Some(Message::CheckUsernameAvailableResponse {
+                    username,
+                    is_available,
+                })
+            }
+
+            Message::ViewImage { username, image_id } => {
+                let mut stored = self.stored_images.write().await;
+
+                if let Some(user_images) = stored.get_mut(&username) {
+                    if let Some(img) = user_images.iter_mut().find(|i| i.image_id == image_id) {
+                        if img.remaining_views > 0 {
+                            img.remaining_views -= 1;
+                            info!(
+                                "[Node {}] User {} viewed image {} (remaining: {})",
+                                self.id, username, image_id, img.remaining_views
+                            );
+                            Some(Message::ViewImageResponse {
+                                success: true,
+                                image_data: Some(img.encrypted_data.clone()),
+                                remaining_views: Some(img.remaining_views),
+                                error: None,
+                            })
+                        } else {
+                            Some(Message::ViewImageResponse {
+                                success: false,
+                                image_data: None,
+                                remaining_views: Some(0),
+                                error: Some("No views remaining".to_string()),
+                            })
+                        }
+                    } else {
+                        Some(Message::ViewImageResponse {
+                            success: false,
+                            image_data: None,
+                            remaining_views: None,
+                            error: Some("Image not found".to_string()),
+                        })
+                    }
+                } else {
+                    Some(Message::ViewImageResponse {
+                        success: false,
+                        image_data: None,
+                        remaining_views: None,
+                        error: Some("No images for this user".to_string()),
+                    })
+                }
+            }
+
             _ => None,
         }
     }
@@ -244,14 +401,23 @@ impl CloudNode {
     /// Send message to another node
     async fn send_message_to_node(&self, node_id: NodeId, message: Message) -> Result<Option<Message>, Box<dyn std::error::Error>> {
         if let Some(address) = self.peer_addresses.get(&node_id) {
-            let mut stream = TcpStream::connect(address).await?;
-            let message_bytes = serde_json::to_vec(&message)?;
-            stream.write_all(&message_bytes).await?;
+            // Create a temporary UDP socket
+            let socket = UdpSocket::bind("0.0.0.0:0").await?;
 
-            // Try to read response
-            let mut buffer = vec![0u8; 1024 * 1024];
-            match tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buffer)).await {
-                Ok(Ok(n)) if n > 0 => {
+            let message_bytes = serde_json::to_vec(&message)?;
+
+            // Check message size
+            if message_bytes.len() > 65507 {
+                return Err("Message exceeds UDP packet size limit".into());
+            }
+
+            // Send the message
+            socket.send_to(&message_bytes, address).await?;
+
+            // Try to read response with timeout
+            let mut buffer = vec![0u8; 65535];
+            match tokio::time::timeout(Duration::from_millis(500), socket.recv_from(&mut buffer)).await {
+                Ok(Ok((n, _))) => {
                     let response: Message = serde_json::from_slice(&buffer[..n])?;
                     Ok(Some(response))
                 }
@@ -413,6 +579,8 @@ impl Clone for CloudNode {
             queue_length: Arc::clone(&self.queue_length),
             peer_addresses: self.peer_addresses.clone(),
             processed_requests: Arc::clone(&self.processed_requests),
+            active_sessions: Arc::clone(&self.active_sessions),
+            stored_images: Arc::clone(&self.stored_images),
         }
     }
 }

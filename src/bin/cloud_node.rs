@@ -13,34 +13,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
     let args: Vec<String> = env::args().collect();
 
-    if args.len() != 2 {
-        eprintln!("Usage: {} <node_id>", args[0]);
-        eprintln!("Example: {} 1", args[0]);
+    if args.len() < 3 {
+        eprintln!("Usage: {} <node_id> <bind_address> <peer_addresses>", args[0]);
+        eprintln!("Example (local):      {} 1 127.0.0.1:8001 127.0.0.1:8002,127.0.0.1:8003", args[0]);
+        eprintln!("Example (multi-device): {} 1 0.0.0.0:8001 192.168.1.11:8002,192.168.1.12:8003", args[0]);
         std::process::exit(1);
     }
 
     let node_id: u32 = args[1].parse().expect("Invalid node ID");
+    let my_address = args[2].clone();
 
-    // Define node addresses (3 cloud nodes)
-    let node_addresses = vec![
-        (1, "127.0.0.1:8001".to_string()),
-        (2, "127.0.0.1:8002".to_string()),
-        (3, "127.0.0.1:8003".to_string()),
-    ];
-
-    // Get this node's address
-    let my_address = node_addresses
-        .iter()
-        .find(|(id, _)| *id == node_id)
-        .expect("Invalid node ID")
-        .1
-        .clone();
-
-    // Build peer addresses map (excluding self)
+    // Parse peer addresses from comma-separated list
     let mut peer_addresses = HashMap::new();
-    for (id, addr) in node_addresses {
-        if id != node_id {
-            peer_addresses.insert(id, addr);
+    if args.len() > 3 {
+        let peers_str = &args[3];
+        for (idx, peer_addr) in peers_str.split(',').enumerate() {
+            // Assign peer IDs based on position (not ideal but works)
+            // For 3 nodes: if we're node 1, peers are 2,3; if node 2, peers are 1,3; if node 3, peers are 1,2
+            let mut peer_id = idx as u32 + 1;
+            if peer_id >= node_id {
+                peer_id += 1;
+            }
+            peer_addresses.insert(peer_id, peer_addr.trim().to_string());
         }
     }
 

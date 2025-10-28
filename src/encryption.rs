@@ -2,6 +2,7 @@ use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::time::sleep;
+use image::{DynamicImage, ImageFormat};
 
 /// Embedded metadata in the image
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -10,8 +11,9 @@ pub struct ImageMetadata {
     pub quota: u32,
 }
 
-/// Encrypt image using LSB steganography
-/// Embeds usernames and viewing quota into the image data
+/// Encrypt image using LSB steganography + pixel scrambling
+/// Embeds usernames and viewing quota, then scrambles pixels for visual encryption
+/// Preserves the original image format (JPEG/PNG)
 pub async fn encrypt_image(
     image_data: Vec<u8>,
     usernames: Vec<String>,
@@ -27,13 +29,29 @@ pub async fn encrypt_image(
     let processing_delay = Duration::from_millis(500 + (image_data.len() / 100) as u64);
     sleep(processing_delay).await;
 
+    // Detect image format
+    let format = image::guess_format(&image_data).map_err(|e| format!("Cannot detect image format: {}", e))?;
+    info!("Detected image format: {:?}", format);
+
+    // Decode image to pixels
+    let img = image::load_from_memory(&image_data)
+        .map_err(|e| format!("Failed to decode image: {}", e))?;
+
+    // Convert to RGBA for easier manipulation
+    let mut rgba_img = img.to_rgba8();
+    let (width, height) = rgba_img.dimensions();
+    info!("Image dimensions: {}x{}", width, height);
+
+    // Get mutable pixel data
+    let pixels = rgba_img.as_mut();
+
     let metadata = ImageMetadata { usernames, quota };
     let metadata_json = serde_json::to_string(&metadata).map_err(|e| e.to_string())?;
     let metadata_bytes = metadata_json.as_bytes();
 
-    // Check if image has enough capacity
+    // Check if image has enough capacity (using pixel data, not file bytes)
     let required_bits = (metadata_bytes.len() + 4) * 8; // +4 for length prefix
-    let available_bits = image_data.len();
+    let available_bits = pixels.len(); // Each pixel byte can store 1 bit
 
     if required_bits > available_bits {
         return Err(format!(
@@ -42,9 +60,7 @@ pub async fn encrypt_image(
         ));
     }
 
-    let mut encrypted_image = image_data.clone();
-
-    // Embed metadata length (4 bytes = 32 bits)
+    // Embed metadata length (4 bytes = 32 bits) into LSB
     let metadata_len = metadata_bytes.len() as u32;
     let len_bytes = metadata_len.to_be_bytes();
 
@@ -52,9 +68,9 @@ pub async fn encrypt_image(
         for bit in 0..8 {
             let bit_value = (byte >> (7 - bit)) & 1;
             let pixel_index = i * 8 + bit;
-            if pixel_index < encrypted_image.len() {
+            if pixel_index < pixels.len() {
                 // Clear LSB and set to bit_value
-                encrypted_image[pixel_index] = (encrypted_image[pixel_index] & 0xFE) | bit_value;
+                pixels[pixel_index] = (pixels[pixel_index] & 0xFE) | bit_value;
             }
         }
     }
@@ -65,35 +81,142 @@ pub async fn encrypt_image(
         for bit in 0..8 {
             let bit_value = (byte >> (7 - bit)) & 1;
             let pixel_index = start_offset + i * 8 + bit;
-            if pixel_index < encrypted_image.len() {
-                encrypted_image[pixel_index] = (encrypted_image[pixel_index] & 0xFE) | bit_value;
+            if pixel_index < pixels.len() {
+                pixels[pixel_index] = (pixels[pixel_index] & 0xFE) | bit_value;
             }
         }
     }
 
-    debug!("Encryption completed: embedded {} bytes", metadata_bytes.len());
-    Ok(encrypted_image)
+    debug!("Metadata embedded: {} bytes", metadata_bytes.len());
+
+    // VISUAL ENCRYPTION: Scramble pixels using Fisher-Yates shuffle
+    // Use metadata hash as seed for deterministic scrambling
+    let seed = calculate_seed(&metadata);
+    scramble_pixels(pixels, seed);
+    info!("Pixels scrambled using seed derived from metadata");
+
+    // Convert back to the original format
+    let dynamic_img = DynamicImage::ImageRgba8(rgba_img);
+    let mut output_bytes = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut output_bytes);
+
+    // Re-encode in the same format
+    match format {
+        ImageFormat::Jpeg => {
+            dynamic_img.write_to(&mut cursor, ImageFormat::Jpeg)
+                .map_err(|e| format!("Failed to encode JPEG: {}", e))?;
+        }
+        ImageFormat::Png => {
+            dynamic_img.write_to(&mut cursor, ImageFormat::Png)
+                .map_err(|e| format!("Failed to encode PNG: {}", e))?;
+        }
+        _ => {
+            // Default to JPEG for other formats
+            dynamic_img.write_to(&mut cursor, ImageFormat::Jpeg)
+                .map_err(|e| format!("Failed to encode JPEG: {}", e))?;
+        }
+    }
+
+    info!("Encrypted image created: {} bytes (scrambled + metadata embedded)", output_bytes.len());
+    Ok(output_bytes)
 }
 
-/// Decrypt image using LSB steganography
-/// Extracts usernames and viewing quota from the image data
+/// Calculate a seed from metadata for deterministic scrambling
+fn calculate_seed(metadata: &ImageMetadata) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    for username in &metadata.usernames {
+        username.hash(&mut hasher);
+    }
+    metadata.quota.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Scramble pixels using Fisher-Yates shuffle with a seed
+fn scramble_pixels(pixels: &mut [u8], seed: u64) {
+    let len = pixels.len() / 4; // Number of RGBA pixels
+
+    // Create a simple LCG (Linear Congruential Generator) for deterministic randomness
+    let mut rng_state = seed;
+
+    for i in (1..len).rev() {
+        // Generate pseudo-random index
+        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let j = (rng_state % (i as u64 + 1)) as usize;
+
+        // Swap pixels (4 bytes each: RGBA)
+        let idx_i = i * 4;
+        let idx_j = j * 4;
+
+        for k in 0..4 {
+            pixels.swap(idx_i + k, idx_j + k);
+        }
+    }
+}
+
+/// Unscramble pixels using the reverse of Fisher-Yates
+fn unscramble_pixels(pixels: &mut [u8], seed: u64) {
+    let len = pixels.len() / 4; // Number of RGBA pixels
+
+    // Store all the swap indices
+    let mut swap_indices = Vec::with_capacity(len);
+    let mut rng_state = seed;
+
+    for i in (1..len).rev() {
+        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let j = (rng_state % (i as u64 + 1)) as usize;
+        swap_indices.push((i, j));
+    }
+
+    // Apply swaps in reverse order
+    for (i, j) in swap_indices.iter().rev() {
+        let idx_i = i * 4;
+        let idx_j = j * 4;
+
+        for k in 0..4 {
+            pixels.swap(idx_i + k, idx_j + k);
+        }
+    }
+}
+
+/// Decrypt image: unscrambles pixels and extracts metadata
+/// Extracts usernames and viewing quota, then unscrambles to restore original
+/// The encrypted_image is a valid image file (JPEG/PNG) with scrambled pixels and embedded metadata
 pub async fn decrypt_image(encrypted_image: Vec<u8>) -> Result<(Vec<u8>, ImageMetadata), String> {
-    info!("Starting decryption of image");
+    info!("Starting decryption of scrambled image");
+    eprintln!("[DEBUG DECRYPT] Step 1: Starting decryption");
 
     // Simulate processing delay
     sleep(Duration::from_millis(200)).await;
+    eprintln!("[DEBUG DECRYPT] Step 2: Sleep complete");
 
-    if encrypted_image.len() < 32 {
+    // Detect format
+    let format = image::guess_format(&encrypted_image).map_err(|e| format!("Cannot detect image format: {}", e))?;
+    eprintln!("[DEBUG DECRYPT] Step 3: Format detected: {:?}", format);
+
+    // Decode scrambled image to pixels to extract metadata
+    let img = image::load_from_memory(&encrypted_image)
+        .map_err(|e| format!("Failed to decode image: {}", e))?;
+    eprintln!("[DEBUG DECRYPT] Step 4: Image decoded");
+
+    let mut rgba_img = img.to_rgba8();
+    let (_width, _height) = rgba_img.dimensions();
+    let pixels = rgba_img.as_mut();
+    eprintln!("[DEBUG DECRYPT] Step 5: Pixel data extracted ({} bytes)", pixels.len());
+
+    if pixels.len() < 32 {
         return Err("Image too small to contain metadata".to_string());
     }
 
-    // Extract metadata length from first 32 bits
+    // Extract metadata length from first 32 bits (from pixel LSBs)
     let mut len_bytes = [0u8; 4];
     for i in 0..4 {
         let mut byte = 0u8;
         for bit in 0..8 {
             let pixel_index = i * 8 + bit;
-            let bit_value = encrypted_image[pixel_index] & 1;
+            let bit_value = pixels[pixel_index] & 1;
             byte = (byte << 1) | bit_value;
         }
         len_bytes[i] = byte;
@@ -105,7 +228,7 @@ pub async fn decrypt_image(encrypted_image: Vec<u8>) -> Result<(Vec<u8>, ImageMe
         return Err(format!("Invalid metadata length: {}", metadata_len));
     }
 
-    // Extract metadata bytes
+    // Extract metadata bytes from pixel LSBs
     let start_offset = 32;
     let mut metadata_bytes = vec![0u8; metadata_len];
 
@@ -113,21 +236,57 @@ pub async fn decrypt_image(encrypted_image: Vec<u8>) -> Result<(Vec<u8>, ImageMe
         let mut byte = 0u8;
         for bit in 0..8 {
             let pixel_index = start_offset + i * 8 + bit;
-            if pixel_index >= encrypted_image.len() {
-                return Err("Unexpected end of image data".to_string());
+            if pixel_index >= pixels.len() {
+                return Err("Unexpected end of pixel data".to_string());
             }
-            let bit_value = encrypted_image[pixel_index] & 1;
+            let bit_value = pixels[pixel_index] & 1;
             byte = (byte << 1) | bit_value;
         }
         metadata_bytes[i] = byte;
     }
 
     // Deserialize metadata
+    eprintln!("[DEBUG DECRYPT] Step 6: Deserializing metadata");
     let metadata_json = String::from_utf8(metadata_bytes).map_err(|e| e.to_string())?;
     let metadata: ImageMetadata = serde_json::from_str(&metadata_json).map_err(|e| e.to_string())?;
 
-    debug!("Decryption completed: extracted {} usernames", metadata.usernames.len());
-    Ok((encrypted_image.clone(), metadata))
+    debug!("Metadata extracted: {} usernames", metadata.usernames.len());
+    eprintln!("[DEBUG DECRYPT] Step 7: Metadata extracted - usernames: {:?}, quota: {}", metadata.usernames, metadata.quota);
+
+    // VISUAL DECRYPTION: Unscramble pixels using same seed
+    let seed = calculate_seed(&metadata);
+    eprintln!("[DEBUG DECRYPT] Step 8: Calculated seed: {}, starting unscramble", seed);
+    unscramble_pixels(pixels, seed);
+    info!("Pixels unscrambled - original image restored");
+    eprintln!("[DEBUG DECRYPT] Step 9: Pixels unscrambled successfully");
+
+    // Convert back to original format
+    eprintln!("[DEBUG DECRYPT] Step 10: Re-encoding image");
+    let dynamic_img = DynamicImage::ImageRgba8(rgba_img);
+    let mut output_bytes = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut output_bytes);
+
+    // Re-encode in the same format
+    match format {
+        ImageFormat::Jpeg => {
+            dynamic_img.write_to(&mut cursor, ImageFormat::Jpeg)
+                .map_err(|e| format!("Failed to encode JPEG: {}", e))?;
+        }
+        ImageFormat::Png => {
+            dynamic_img.write_to(&mut cursor, ImageFormat::Png)
+                .map_err(|e| format!("Failed to encode PNG: {}", e))?;
+        }
+        _ => {
+            dynamic_img.write_to(&mut cursor, ImageFormat::Jpeg)
+                .map_err(|e| format!("Failed to encode JPEG: {}", e))?;
+        }
+    }
+
+    info!("Decryption completed: {} bytes (original image restored)", output_bytes.len());
+    eprintln!("[DEBUG DECRYPT] Step 11: Decryption complete! Returning {} bytes", output_bytes.len());
+
+    // Return the decrypted (unscrambled) image and the extracted metadata
+    Ok((output_bytes, metadata))
 }
 
 /// Check if a user is authorized to view the image

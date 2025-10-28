@@ -1,10 +1,10 @@
 use crate::messages::Message;
 use crate::metrics::MetricsCollector;
+use crate::encryption;
 use log::{debug, error, info, warn};
 use rand::Rng;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::UdpSocket;
 use tokio::time::{sleep, Instant};
 
 /// Client that sends encryption requests to the cloud
@@ -21,17 +21,77 @@ impl Client {
         }
     }
 
+    /// Register a session with a username
+    /// Returns Ok(()) if successful, Err with error message if username is taken
+    pub async fn register_session(
+        &self,
+        client_id: String,
+        username: String,
+    ) -> Result<(), String> {
+        let message = Message::SessionRegister {
+            client_id: client_id.clone(),
+            username: username.clone(),
+        };
+
+        info!("[Client {}] Registering username: {}", self.id, username);
+
+        // Try to register with any available node
+        for address in &self.cloud_addresses {
+            match Self::send_to_node(self.id, address, message.clone()).await {
+                Ok(Message::SessionRegisterResponse { success, error }) => {
+                    if success {
+                        info!("[Client {}] Successfully registered username: {}", self.id, username);
+                        return Ok(());
+                    } else {
+                        return Err(error.unwrap_or_else(|| "Registration failed".to_string()));
+                    }
+                }
+                Ok(_) => {
+                    return Err("Unexpected response from server".to_string());
+                }
+                Err(e) => {
+                    warn!("[Client {}] Failed to register with {}: {}", self.id, address, e);
+                    continue;
+                }
+            }
+        }
+
+        Err("Failed to connect to any cloud node".to_string())
+    }
+
+    /// Unregister a session
+    pub async fn unregister_session(&self, client_id: String, username: String) {
+        let message = Message::SessionUnregister {
+            client_id,
+            username: username.clone(),
+        };
+
+        info!("[Client {}] Unregistering username: {}", self.id, username);
+
+        // Send to all nodes (fire and forget)
+        for address in &self.cloud_addresses {
+            let address = address.clone();
+            let message = message.clone();
+            let id = self.id;
+            tokio::spawn(async move {
+                let _ = Self::send_to_node(id, &address, message).await;
+            });
+        }
+    }
+
     /// Send an encryption request by multicasting to all cloud nodes
     /// Returns the first successful response
     pub async fn send_encryption_request(
         &self,
         request_id: String,
+        client_username: String,
         image_data: Vec<u8>,
         usernames: Vec<String>,
         quota: u32,
     ) -> Result<Message, String> {
         let message = Message::EncryptionRequest {
             request_id: request_id.clone(),
+            client_username,
             image_data,
             usernames,
             quota,
@@ -70,29 +130,38 @@ impl Client {
         address: &str,
         message: Message,
     ) -> Result<Message, String> {
-        // Try to connect
-        let mut stream = match TcpStream::connect(address).await {
+        // Create UDP socket
+        let socket = match UdpSocket::bind("0.0.0.0:0").await {
             Ok(s) => s,
             Err(e) => {
-                warn!("[Client {}] Failed to connect to {}: {}", client_id, address, e);
-                return Err(format!("Connection failed: {}", e));
+                warn!("[Client {}] Failed to create socket: {}", client_id, e);
+                return Err(format!("Socket creation failed: {}", e));
             }
         };
 
-        // Send message
+        // Serialize message
         let message_bytes = serde_json::to_vec(&message).map_err(|e| e.to_string())?;
-        stream
-            .write_all(&message_bytes)
+
+        // Check message size
+        if message_bytes.len() > 65507 {
+            return Err("Message exceeds UDP packet size limit".to_string());
+        }
+
+        // Send message
+        socket
+            .send_to(&message_bytes, address)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("Send error: {}", e))?;
+
+        debug!("[Client {}] Sent {} bytes to {}", client_id, message_bytes.len(), address);
 
         // Read response with timeout
-        let mut buffer = vec![0u8; 2 * 1024 * 1024]; // 2MB buffer for response
-        let n = match tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buffer)).await
+        let mut buffer = vec![0u8; 65535]; // Max UDP packet size
+        let n = match tokio::time::timeout(Duration::from_secs(10), socket.recv_from(&mut buffer)).await
         {
-            Ok(Ok(n)) => n,
+            Ok(Ok((n, _))) => n,
             Ok(Err(e)) => {
-                return Err(format!("Read error: {}", e));
+                return Err(format!("Receive error: {}", e));
             }
             Err(_) => {
                 return Err("Timeout waiting for response".to_string());
@@ -106,7 +175,171 @@ impl Client {
         // Parse response
         let response: Message = serde_json::from_slice(&buffer[..n]).map_err(|e| e.to_string())?;
 
+        debug!("[Client {}] Received response from {}", client_id, address);
+
         Ok(response)
+    }
+
+    /// Check if a username is available (not already registered)
+    pub async fn check_username_available(&self, username: String) -> Result<bool, String> {
+        let message = Message::CheckUsernameAvailable {
+            username: username.clone(),
+        };
+
+        // Try to check with any available node
+        for address in &self.cloud_addresses {
+            match Self::send_to_node(self.id, address, message.clone()).await {
+                Ok(Message::CheckUsernameAvailableResponse { is_available, .. }) => {
+                    return Ok(is_available);
+                }
+                Ok(_) => {
+                    return Err("Unexpected response from server".to_string());
+                }
+                Err(e) => {
+                    warn!("[Client {}] Failed to check with {}: {}", self.id, address, e);
+                    continue;
+                }
+            }
+        }
+
+        Err("Failed to connect to any cloud node".to_string())
+    }
+
+    /// Send an encrypted image to other users
+    pub async fn send_image(
+        &self,
+        from_username: String,
+        to_usernames: Vec<String>,
+        encrypted_image: Vec<u8>,
+        max_views: u32,
+        image_id: String,
+    ) -> Result<String, String> {
+        let message = Message::SendImage {
+            from_username: from_username.clone(),
+            to_usernames: to_usernames.clone(),
+            encrypted_image,
+            max_views,
+            image_id: image_id.clone(),
+        };
+
+        info!("[Client {}] Sending image {} to {:?}", self.id, image_id, to_usernames);
+
+        // Try to send to any available node
+        for address in &self.cloud_addresses {
+            match Self::send_to_node(self.id, address, message.clone()).await {
+                Ok(Message::SendImageResponse { success, image_id, error }) => {
+                    if success {
+                        info!("[Client {}] Successfully sent image: {}", self.id, image_id);
+                        return Ok(image_id);
+                    } else {
+                        return Err(error.unwrap_or_else(|| "Send failed".to_string()));
+                    }
+                }
+                Ok(_) => {
+                    return Err("Unexpected response from server".to_string());
+                }
+                Err(e) => {
+                    warn!("[Client {}] Failed to send to {}: {}", self.id, address, e);
+                    continue;
+                }
+            }
+        }
+
+        Err("Failed to connect to any cloud node".to_string())
+    }
+
+    /// Query received images for a username
+    pub async fn query_received_images(
+        &self,
+        username: String,
+    ) -> Result<Vec<crate::messages::ReceivedImageInfo>, String> {
+        let message = Message::QueryReceivedImages {
+            username: username.clone(),
+        };
+
+        info!("[Client {}] Querying received images for: {}", self.id, username);
+
+        // Try to query from any available node
+        for address in &self.cloud_addresses {
+            match Self::send_to_node(self.id, address, message.clone()).await {
+                Ok(Message::QueryReceivedImagesResponse { images }) => {
+                    info!("[Client {}] Found {} images for {}", self.id, images.len(), username);
+                    return Ok(images);
+                }
+                Ok(_) => {
+                    return Err("Unexpected response from server".to_string());
+                }
+                Err(e) => {
+                    warn!("[Client {}] Failed to query {}: {}", self.id, address, e);
+                    continue;
+                }
+            }
+        }
+
+        Err("Failed to connect to any cloud node".to_string())
+    }
+
+    /// View an image (decrements the view counter)
+    pub async fn view_image(
+        &self,
+        username: String,
+        image_id: String,
+    ) -> Result<(Vec<u8>, u32), String> {
+        let message = Message::ViewImage {
+            username: username.clone(),
+            image_id: image_id.clone(),
+        };
+
+        info!("[Client {}] Viewing image {} for: {}", self.id, image_id, username);
+
+        // Try to view from any available node
+        for address in &self.cloud_addresses {
+            match Self::send_to_node(self.id, address, message.clone()).await {
+                Ok(Message::ViewImageResponse {
+                    success,
+                    image_data,
+                    remaining_views,
+                    error,
+                }) => {
+                    if success {
+                        let encrypted_data = image_data.ok_or_else(|| "No image data returned".to_string())?;
+                        let remaining = remaining_views.ok_or_else(|| "No view count returned".to_string())?;
+
+                        info!("[Client {}] Received encrypted image {} ({} bytes) for viewing", self.id, image_id, encrypted_data.len());
+                        eprintln!("[DEBUG] Starting decryption for image {} ({} bytes)", image_id, encrypted_data.len());
+
+                        // Decrypt the image to extract metadata and get viewable image
+                        match encryption::decrypt_image(encrypted_data.clone()).await {
+                            Ok((decrypted_image, metadata)) => {
+                                info!(
+                                    "[Client {}] Successfully decrypted image {} - authorized users: {:?}, original quota: {}",
+                                    self.id, image_id, metadata.usernames, metadata.quota
+                                );
+                                eprintln!("[DEBUG] Decryption successful! Image size: {} bytes", decrypted_image.len());
+                                // Return the decrypted image (original unscrambled)
+                                return Ok((decrypted_image, remaining));
+                            }
+                            Err(e) => {
+                                error!("[Client {}] Failed to decrypt image {}: {}", self.id, image_id, e);
+                                eprintln!("[DEBUG] Decryption failed: {}", e);
+                                return Err(format!("Decryption failed: {}", e));
+                            }
+                        }
+                    } else {
+                        return Err(error.unwrap_or_else(|| "View failed".to_string()));
+                    }
+                }
+                Ok(_) => {
+                    return Err("Unexpected response from server".to_string());
+                }
+                Err(e) => {
+                    warn!("[Client {}] Failed to view from {}: {}", self.id, address, e);
+                    continue;
+                }
+            }
+        }
+
+        Err("Failed to connect to any cloud node".to_string())
     }
 
     /// Generate a random test image
@@ -121,6 +354,7 @@ impl Client {
 
         let request_id = format!("client_{}_req_{}", self.id, request_num);
         let image_data = Self::generate_test_image(10); // 10KB image
+        let client_username = format!("stress_test_user_{}", self.id);
         let usernames = vec![
             format!("user_{}", self.id),
             format!("user_{}", (self.id + 1) % 100),
@@ -128,7 +362,7 @@ impl Client {
         let quota = 5;
 
         match self
-            .send_encryption_request(request_id.clone(), image_data, usernames, quota)
+            .send_encryption_request(request_id.clone(), client_username, image_data, usernames, quota)
             .await
         {
             Ok(Message::EncryptionResponse { success, error, .. }) => {

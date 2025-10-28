@@ -11,7 +11,11 @@ pub struct ServerMonitorApp {
     // Node reference
     node: Option<Arc<CloudNode>>,
 
-    // Node statistics
+    // Monitored node ID (for display)
+    monitored_node_id: Option<u32>,
+
+    // Node statistics (reserved for future use)
+    #[allow(dead_code)]
     current_stats: Option<NodeStats>,
 
     // Logs
@@ -78,6 +82,7 @@ impl ServerMonitorApp {
 
         Self {
             node: None,
+            monitored_node_id: None,
             current_stats: None,
             log_entries,
             selected_tab: Tab::Overview,
@@ -90,6 +95,10 @@ impl ServerMonitorApp {
     pub fn with_node(mut self, node: Arc<CloudNode>) -> Self {
         self.node = Some(node);
         self
+    }
+
+    pub fn set_monitored_node_id(&mut self, node_id: u32) {
+        self.monitored_node_id = Some(node_id);
     }
 
     fn add_log(&self, level: LogLevel, message: String) {
@@ -111,6 +120,7 @@ impl ServerMonitorApp {
         });
     }
 
+    #[allow(dead_code)]
     fn update_stats(&mut self) {
         if let Some(node) = &self.node {
             let node = node.clone();
@@ -452,6 +462,10 @@ impl eframe::App for ServerMonitorApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(node) = &self.node {
                         ui.label(RichText::new(format!("Node {}", node.id))
+                            .color(Color32::from_rgb(0, 200, 255))
+                            .strong());
+                    } else if let Some(node_id) = self.monitored_node_id {
+                        ui.label(RichText::new(format!("Monitoring Node {}", node_id))
                             .color(Color32::from_rgb(0, 200, 255))
                             .strong());
                     } else {
