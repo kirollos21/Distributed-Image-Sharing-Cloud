@@ -98,9 +98,9 @@ impl ClientApp {
         Self {
             client_id,
             cloud_addresses: vec![
-                "10.40.98.68:8001".to_string(),
-                "10.40.98.127:8002".to_string(),
-                "10.40.98.225:8003".to_string(),
+                "10.32.39.236:8001".to_string(),
+                "10.32.39.24:8002".to_string(),
+                "10.32.39.210:8003".to_string(),
             ],
             runtime: Some(runtime),
             viewing_quota: 5,
