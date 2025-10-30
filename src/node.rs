@@ -62,10 +62,11 @@ impl CloudNode {
         info!("[Node {}] Listening on {} (UDP)", self.id, self.address);
 
         // Start background tasks
-        let self_clone = self.clone();
-        tokio::spawn(async move {
-            self_clone.failure_simulation_task().await;
-        });
+        // PRODUCTION MODE: Failure simulation disabled
+        // let self_clone = self.clone();
+        // tokio::spawn(async move {
+        //     self_clone.failure_simulation_task().await;
+        // });
 
         let self_clone = self.clone();
         tokio::spawn(async move {
