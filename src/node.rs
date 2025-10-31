@@ -1,7 +1,7 @@
 use crate::election::{ElectionManager, ElectionResult};
 use crate::encryption;
 use crate::messages::{Message, NodeId, NodeState, ReceivedImageInfo};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use rand::Rng;
 use std::collections::HashMap;
 use std::net::SocketAddr;
