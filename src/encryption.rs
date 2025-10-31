@@ -95,29 +95,46 @@ pub async fn encrypt_image(
     scramble_pixels(pixels, seed);
     info!("Pixels scrambled using seed derived from metadata");
 
-    // Convert back to the original format
+    // OPTIMIZATION: Resize image if too large for UDP transmission
+    // Target: encrypted output should be < 40KB to fit in UDP packets safely
     let dynamic_img = DynamicImage::ImageRgba8(rgba_img);
+    
+    // Calculate approximate output size (rough estimate)
+    let estimated_size = (width * height * 3) / 2; // JPEG is roughly 1.5 bytes per pixel
+    let max_safe_size = 30000; // 30KB target to leave room for JSON overhead
+    
+    let resized_img = if estimated_size > max_safe_size {
+        // Calculate scale factor to reduce size
+        let scale = ((max_safe_size as f32) / (estimated_size as f32)).sqrt();
+        let new_width = ((width as f32) * scale) as u32;
+        let new_height = ((height as f32) * scale) as u32;
+        
+        info!("Resizing from {}x{} to {}x{} for UDP compatibility", 
+              width, height, new_width, new_height);
+        dynamic_img.resize(new_width, new_height, image::imageops::FilterType::Lanczos3)
+    } else {
+        dynamic_img
+    };
+
+    // Always encode as JPEG with aggressive compression for UDP transmission
     let mut output_bytes = Vec::new();
     let mut cursor = std::io::Cursor::new(&mut output_bytes);
+    
+    // Use JPEG with quality 60 for good balance of size/quality
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, 60);
+    resized_img.write_with_encoder(encoder)
+        .map_err(|e| format!("Failed to encode JPEG: {}", e))?;
 
-    // Re-encode in the same format
-    match format {
-        ImageFormat::Jpeg => {
-            dynamic_img.write_to(&mut cursor, ImageFormat::Jpeg)
-                .map_err(|e| format!("Failed to encode JPEG: {}", e))?;
-        }
-        ImageFormat::Png => {
-            dynamic_img.write_to(&mut cursor, ImageFormat::Png)
-                .map_err(|e| format!("Failed to encode PNG: {}", e))?;
-        }
-        _ => {
-            // Default to JPEG for other formats
-            dynamic_img.write_to(&mut cursor, ImageFormat::Jpeg)
-                .map_err(|e| format!("Failed to encode JPEG: {}", e))?;
-        }
+    info!("Encrypted image created: {} bytes (scrambled + metadata embedded + compressed)", output_bytes.len());
+    
+    // Final safety check
+    if output_bytes.len() > 50000 {
+        return Err(format!(
+            "Encrypted image too large: {} bytes. Maximum safe size for UDP is ~50KB. Try a smaller input image.",
+            output_bytes.len()
+        ));
     }
-
-    info!("Encrypted image created: {} bytes (scrambled + metadata embedded)", output_bytes.len());
+    
     Ok(output_bytes)
 }
 
