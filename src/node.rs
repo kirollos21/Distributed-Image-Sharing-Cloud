@@ -320,28 +320,6 @@ impl CloudNode {
                     }
                 }
             }
-                        }
-                        Ok(None) => {
-                            warn!("[Node {}] No response from coordinator for {}", self.id, request_id);
-                            Some(Message::EncryptionResponse {
-                                request_id,
-                                encrypted_image: vec![],
-                                success: false,
-                                error: Some("Coordinator did not respond".to_string()),
-                            })
-                        }
-                        Err(e) => {
-                            error!("[Node {}] Failed to forward request {}: {}", self.id, request_id, e);
-                            Some(Message::EncryptionResponse {
-                                request_id,
-                                encrypted_image: vec![],
-                                success: false,
-                                error: Some(format!("Forward failed: {}", e)),
-                            })
-                        }
-                    }
-                }
-            }
 
             Message::Election { from_node } => {
                 let load = *self.current_load.read().await;
