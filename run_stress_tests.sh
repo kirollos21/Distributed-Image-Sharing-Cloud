@@ -20,19 +20,22 @@ echo ""
 # Function to display menu
 show_menu() {
     echo ""
-    echo "=========================================="
-    echo "  SELECT TEST TYPE"
-    echo "=========================================="
-    echo "1) Load Test (10k, 12.5k, 15k, 17.5k, 20k images)"
-    echo "2) Custom Load Test (specify range)"
-    echo "3) Failure Test - NO failures (baseline)"
-    echo "4) Failure Test - ONE node fails"
-    echo "5) Failure Test - TWO nodes fail"
-    echo "6) Run All Tests (Full Suite)"
-    echo "7) Analyze Existing Results"
-    echo "8) Exit"
-    echo "=========================================="
-    echo -n "Enter choice [1-8]: "
+    echo "========================================================================"
+    echo "  DISTRIBUTED IMAGE CLOUD - STRESS TESTING MENU"
+    echo "========================================================================"
+    echo ""
+    echo "  1) Standard Load Test (10k to 20k images, step 2.5k)"
+    echo "  2) Custom Load Test (specify range and step)"
+    echo "  3) Concurrent Client Test (flexible: N clients × M requests each)"
+    echo "  4) Failure Test: Baseline (no failures)"
+    echo "  5) Failure Test: One Node Failure"
+    echo "  6) Failure Test: Two Node Failures"
+    echo "  7) Full Test Suite (all of the above)"
+    echo "  8) Analyze Results"
+    echo "  9) Exit"
+    echo ""
+    echo "========================================================================"
+    echo -n "Enter your choice (1-9): "
 }
 
 # Function to get test parameters
@@ -98,6 +101,50 @@ run_load_test() {
     
     echo "Run the above commands in separate terminals (one per client)"
     echo "Press Enter when all tests are complete..."
+    read
+}
+
+# Function to run concurrent client test
+run_concurrent_test() {
+    local num_clients=$1
+    local requests_per_client=$2
+    
+    echo ""
+    echo "========================================================================"
+    echo "  CONCURRENT CLIENT TEST"
+    echo "========================================================================"
+    echo "  Clients: $num_clients concurrent threads"
+    echo "  Requests per client: $requests_per_client"
+    echo "  Total requests: $((num_clients * requests_per_client))"
+    echo "========================================================================"
+    echo ""
+    
+    for i in $(seq 1 $NUM_CLIENTS); do
+        local username="${USERNAMES[$i]}"
+        local timestamp=$(date +%Y%m%d_%H%M%S)
+        local client_output="$RESULTS_DIR/concurrent_${num_clients}x${requests_per_client}_user${username}_${timestamp}.json"
+        
+        echo "User $i (${username}) command:"
+        echo "  python3 stress_test_concurrent.py \\"
+        echo "    --clients $num_clients \\"
+        echo "    --requests-per-client $requests_per_client \\"
+        echo "    --servers \"$SERVERS\" \\"
+        echo "    --username \"$username\" \\"
+        echo "    --target-users \"$TARGET_USERS\" \\"
+        echo "    --image \"$TEST_IMAGE\" \\"
+        echo "    --output \"$client_output\""
+        echo ""
+    done
+    
+    echo "INSTRUCTIONS:"
+    echo "1. Start all server nodes in separate terminals"
+    echo "2. Run the above command(s) in separate terminal(s)"
+    echo "3. Each command will simulate $num_clients concurrent clients"
+    echo "4. Each client will send $requests_per_client requests"
+    echo "5. Results will show throughput, response times, and load distribution"
+    echo ""
+    
+    echo "Press Enter when test is complete..."
     read
 }
 
@@ -167,21 +214,27 @@ while true; do
             run_load_test $start $end $step $gap
             ;;
         3)
-            read -p "Number of images (default 15000): " num
-            num=${num:-15000}
-            run_failure_test "none" $num
+            echo ""
+            read -p "Number of concurrent clients (threads): " num_clients
+            read -p "Number of requests per client: " requests_per_client
+            run_concurrent_test $num_clients $requests_per_client
             ;;
         4)
             read -p "Number of images (default 15000): " num
             num=${num:-15000}
-            run_failure_test "one" $num
+            run_failure_test "none" $num
             ;;
         5)
             read -p "Number of images (default 15000): " num
             num=${num:-15000}
-            run_failure_test "two" $num
+            run_failure_test "one" $num
             ;;
         6)
+            read -p "Number of images (default 15000): " num
+            num=${num:-15000}
+            run_failure_test "two" $num
+            ;;
+        7)
             echo ""
             echo "========================================================================"
             echo "  FULL TEST SUITE"
@@ -215,7 +268,7 @@ while true; do
                 echo "Full test suite complete!"
             fi
             ;;
-        7)
+        8)
             echo ""
             echo "Analyzing results in $RESULTS_DIR..."
             if ls "$RESULTS_DIR"/*.json 1> /dev/null 2>&1; then
@@ -226,13 +279,13 @@ while true; do
                 echo "No result files found in $RESULTS_DIR"
             fi
             ;;
-        8)
+        9)
             echo ""
             echo "Exiting..."
             exit 0
             ;;
         *)
-            echo "Invalid choice. Please enter 1-8."
+            echo "Invalid choice. Please enter 1-9."
             ;;
     esac
 done
