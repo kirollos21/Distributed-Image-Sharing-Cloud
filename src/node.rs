@@ -372,10 +372,12 @@ impl CloudNode {
             Message::LoadQuery { from_node: _ } => {
                 let load = *self.current_load.read().await;
                 let queue = *self.queue_length.read().await;
+                let processed = *self.processed_requests.read().await;
                 Some(Message::LoadResponse {
                     node_id: self.id,
                     load,
                     queue_length: queue,
+                    processed_count: processed,
                 })
             }
 
@@ -534,8 +536,8 @@ impl CloudNode {
         {
             let queue = *self.queue_length.read().await;
             let mut load = self.current_load.write().await;
-            // Load is purely based on queue: 0 when idle, increases with queue
-            *load = queue as f64 * 0.1;
+            // Load is queue length directly: reflects actual workload
+            *load = queue as f64;
         }
 
         // Perform encryption
@@ -584,9 +586,9 @@ impl CloudNode {
             let load_query = Message::LoadQuery { from_node: self.id };
             
             match self.send_message_to_node(*peer_id, load_query).await {
-                Ok(Some(Message::LoadResponse { node_id, load, queue_length })) => {
-                    info!("[Node {}] Node {} load: {:.2} (queue: {})", 
-                          self.id, node_id, load, queue_length);
+                Ok(Some(Message::LoadResponse { node_id, load, queue_length, processed_count })) => {
+                    info!("[Node {}] Node {} load: {:.2} (queue: {}, processed: {})", 
+                          self.id, node_id, load, queue_length, processed_count);
                     
                     if load < lowest_load {
                         lowest_load = load;
@@ -746,27 +748,47 @@ impl CloudNode {
     /// Trigger an election
     async fn trigger_election(&self) {
         let current_load = *self.current_load.read().await;
+        let current_processed = *self.processed_requests.read().await;
         let mut manager = self.election_manager.lock().await;
 
-        // Collect load from all nodes
+        // Collect load and processed counts from all nodes
         let mut all_loads = HashMap::new();
+        let mut all_processed = HashMap::new();
         all_loads.insert(self.id, current_load);
+        all_processed.insert(self.id, current_processed);
 
         for (&peer_id, _) in &self.peer_addresses {
             let message = Message::LoadQuery { from_node: self.id };
-            if let Ok(Some(Message::LoadResponse { node_id, load, .. })) =
+            if let Ok(Some(Message::LoadResponse { node_id, load, processed_count, .. })) =
                 self.send_message_to_node(peer_id, message).await
             {
                 all_loads.insert(node_id, load);
+                all_processed.insert(node_id, processed_count);
             }
         }
 
+        // Calculate total processed and percentages
+        let total_processed: usize = all_processed.values().sum();
+        
         // Find node with lowest load
         if let Some((&lowest_node, &lowest_load)) =
             all_loads.iter().min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
         {
             let result = ElectionResult::new(lowest_node, lowest_load, all_loads);
             result.log_result();
+            
+            // Log work distribution percentages
+            if total_processed > 0 {
+                info!("=== WORK DISTRIBUTION ===");
+                let mut sorted_nodes: Vec<_> = all_processed.iter().collect();
+                sorted_nodes.sort_by(|a, b| b.1.cmp(a.1)); // Sort by processed count descending
+                for (node_id, processed) in sorted_nodes {
+                    let percentage = (*processed as f64 / total_processed as f64) * 100.0;
+                    info!("  Node {}: {} requests ({:.1}%)", node_id, processed, percentage);
+                }
+                info!("  Total: {} requests", total_processed);
+                info!("=========================");
+            }
 
             if lowest_node == self.id {
                 // This node should be coordinator

@@ -55,7 +55,12 @@ pub enum Message {
 
     // Load query for election
     LoadQuery { from_node: NodeId },
-    LoadResponse { node_id: NodeId, load: f64, queue_length: usize },
+    LoadResponse { 
+        node_id: NodeId, 
+        load: f64, 
+        queue_length: usize,
+        processed_count: usize, // Total requests processed by this node
+    },
 
     // State synchronization
     StateSync { from_node: NodeId },
@@ -137,8 +142,9 @@ impl fmt::Display for Message {
                 write!(f, "ENCRYPTION_RESPONSE {} (success: {})", request_id, success)
             }
             Message::LoadQuery { from_node } => write!(f, "LOAD_QUERY from Node {}", from_node),
-            Message::LoadResponse { node_id, load, queue_length } => {
-                write!(f, "LOAD_RESPONSE Node {} (load: {:.2}, queue: {})", node_id, load, queue_length)
+            Message::LoadResponse { node_id, load, queue_length, processed_count } => {
+                write!(f, "LOAD_RESPONSE from Node {} (load: {:.2}, queue: {}, processed: {})", 
+                       node_id, load, queue_length, processed_count)
             }
             Message::StateSync { from_node } => write!(f, "STATE_SYNC from Node {}", from_node),
             Message::StateSyncResponse { coordinator_id, .. } => {
