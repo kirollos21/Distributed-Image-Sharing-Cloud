@@ -91,6 +91,7 @@ impl ElectionManager {
             node_id: self.node_id,
             load: my_load,
             queue_length: 0, // Will be filled by actual node
+            processed_count: 0, // Will be filled by actual node
         });
     }
 

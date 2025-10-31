@@ -228,50 +228,22 @@ impl CloudNode {
                             Ok(None) => {
                                 warn!("[Node {}] No response from coordinator Node {} for {}", 
                                       self.id, coordinator_id, request_id);
-                                // Coordinator may have failed - try processing locally as fallback
-                                info!("[Node {}] Coordinator unresponsive, processing {} locally as fallback", 
-                                      self.id, request_id);
-                                
-                                {
-                                    let mut queue = self.queue_length.write().await;
-                                    *queue += 1;
-                                }
-                                
-                                let self_clone = Arc::new(self.clone());
-                                let result = self_clone
-                                    .process_encryption_request(request_id.clone(), image_data, usernames, quota)
-                                    .await;
-                                
-                                {
-                                    let mut queue = self.queue_length.write().await;
-                                    *queue = queue.saturating_sub(1);
-                                }
-                                
-                                Some(result)
+                                Some(Message::EncryptionResponse {
+                                    request_id,
+                                    encrypted_image: vec![],
+                                    success: false,
+                                    error: Some("Coordinator did not respond".to_string()),
+                                })
                             }
                             Err(e) => {
                                 error!("[Node {}] Failed to contact coordinator Node {} for {}: {}", 
                                        self.id, coordinator_id, request_id, e);
-                                // Process locally as fallback
-                                info!("[Node {}] Processing {} locally due to coordinator error", 
-                                      self.id, request_id);
-                                
-                                {
-                                    let mut queue = self.queue_length.write().await;
-                                    *queue += 1;
-                                }
-                                
-                                let self_clone = Arc::new(self.clone());
-                                let result = self_clone
-                                    .process_encryption_request(request_id.clone(), image_data, usernames, quota)
-                                    .await;
-                                
-                                {
-                                    let mut queue = self.queue_length.write().await;
-                                    *queue = queue.saturating_sub(1);
-                                }
-                                
-                                Some(result)
+                                Some(Message::EncryptionResponse {
+                                    request_id,
+                                    encrypted_image: vec![],
+                                    success: false,
+                                    error: Some(format!("Coordinator unreachable: {}", e)),
+                                })
                             }
                         }
                     } else {
