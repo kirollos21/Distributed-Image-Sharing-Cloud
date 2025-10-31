@@ -62,11 +62,11 @@ impl CloudNode {
         info!("[Node {}] Listening on {} (UDP)", self.id, self.address);
 
         // Start background tasks
-        // DATA COLLECTION MODE: Failure simulation enabled for testing fault tolerance
-        let self_clone = self.clone();
-        tokio::spawn(async move {
-            self_clone.failure_simulation_task().await;
-        });
+        // PRODUCTION MODE: Failure simulation disabled for controlled testing
+        // let self_clone = self.clone();
+        // tokio::spawn(async move {
+        //     self_clone.failure_simulation_task().await;
+        // });
 
         let self_clone = self.clone();
         tokio::spawn(async move {
