@@ -498,11 +498,12 @@ impl CloudNode {
             self.id, request_id
         );
 
-        // Update load (simulate based on queue length and processing)
+        // Update load (based on queue length)
         {
             let queue = *self.queue_length.read().await;
             let mut load = self.current_load.write().await;
-            *load = (queue as f64 * 0.1) + 0.5; // Simulated load calculation
+            // Load is purely based on queue: 0 when idle, increases with queue
+            *load = queue as f64 * 0.1;
         }
 
         // Perform encryption
@@ -561,8 +562,13 @@ impl CloudNode {
                               self_clone.id, node_id, load, queue_length);
                         Some((node_id, load))
                     }
-                    Ok(_) => {
-                        warn!("[Node {}] Unexpected response from Node {}", self_clone.id, peer_id);
+                    Ok(Some(other_msg)) => {
+                        warn!("[Node {}] Unexpected response from Node {}: {:?}", 
+                              self_clone.id, peer_id, other_msg);
+                        None
+                    }
+                    Ok(None) => {
+                        warn!("[Node {}] No response from Node {} (timeout)", self_clone.id, peer_id);
                         None
                     }
                     Err(e) => {
