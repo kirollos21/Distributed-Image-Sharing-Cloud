@@ -38,7 +38,8 @@ class FailureStressTestClient:
                 "client_username": username,
                 "image_data": list(image_data),
                 "usernames": target_users,
-                "quota": quota
+                "quota": quota,
+                "forwarded": False
             }
         }
         

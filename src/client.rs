@@ -95,6 +95,7 @@ impl Client {
             image_data,
             usernames,
             quota,
+            forwarded: false,
         };
 
         debug!("[Client {}] Multicasting request: {}", self.id, request_id);

@@ -42,6 +42,7 @@ pub enum Message {
         image_data: Vec<u8>,
         usernames: Vec<String>,
         quota: u32,
+        forwarded: bool, // Prevent infinite forwarding loops
     },
 
     // Response messages

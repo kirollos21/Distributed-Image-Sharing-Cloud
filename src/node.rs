@@ -173,15 +173,11 @@ impl CloudNode {
                 image_data,
                 usernames,
                 quota,
+                forwarded,
             } => {
-                // Check if this node is the coordinator (lowest load)
-                let manager = self.election_manager.lock().await;
-                let coordinator_id = manager.get_coordinator().unwrap_or(self.id);
-                drop(manager); // Release lock
-                
-                if coordinator_id == self.id {
-                    // This node is the coordinator - process locally
-                    info!("[Node {}] Processing request {} locally (coordinator)", self.id, request_id);
+                if forwarded {
+                    // Request already forwarded once - process locally to prevent loops
+                    info!("[Node {}] Processing forwarded request {} locally", self.id, request_id);
                     
                     // Increment queue length
                     {
@@ -189,7 +185,7 @@ impl CloudNode {
                         *queue += 1;
                     }
 
-                    // Process encryption in a separate task
+                    // Process encryption
                     let self_clone = Arc::new(self.clone());
                     let result = self_clone
                         .process_encryption_request(request_id.clone(), image_data, usernames, quota)
@@ -203,21 +199,127 @@ impl CloudNode {
 
                     Some(result)
                 } else {
-                    // Forward to coordinator
-                    info!("[Node {}] Forwarding request {} to coordinator Node {}", self.id, request_id, coordinator_id);
+                    // Check if this node is the coordinator
+                    let manager = self.election_manager.lock().await;
+                    let coordinator_id = manager.get_coordinator().unwrap_or(self.id);
+                    drop(manager); // Release lock
                     
-                    let forward_message = Message::EncryptionRequest {
-                        request_id: request_id.clone(),
-                        client_username,
-                        image_data,
-                        usernames,
-                        quota,
-                    };
-                    
-                    match self.send_message_to_node(coordinator_id, forward_message).await {
-                        Ok(Some(response)) => {
-                            info!("[Node {}] Received forwarded response for {}", self.id, request_id);
-                            Some(response)
+                    if coordinator_id != self.id {
+                        // Not coordinator - forward to coordinator for load balancing
+                        info!("[Node {}] Forwarding request {} to coordinator Node {} for load balancing", 
+                              self.id, request_id, coordinator_id);
+                        
+                        let forward_message = Message::EncryptionRequest {
+                            request_id: request_id.clone(),
+                            client_username,
+                            image_data,
+                            usernames,
+                            quota,
+                            forwarded: false, // Let coordinator do load balancing
+                        };
+                        
+                        match self.send_message_to_node(coordinator_id, forward_message).await {
+                            Ok(Some(response)) => {
+                                info!("[Node {}] Received response from coordinator for {}", self.id, request_id);
+                                Some(response)
+                            }
+                            Ok(None) => {
+                                warn!("[Node {}] No response from coordinator for {}", self.id, request_id);
+                                Some(Message::EncryptionResponse {
+                                    request_id,
+                                    encrypted_image: vec![],
+                                    success: false,
+                                    error: Some("Coordinator did not respond".to_string()),
+                                })
+                            }
+                            Err(e) => {
+                                error!("[Node {}] Failed to contact coordinator for {}: {}", self.id, request_id, e);
+                                Some(Message::EncryptionResponse {
+                                    request_id,
+                                    encrypted_image: vec![],
+                                    success: false,
+                                    error: Some(format!("Coordinator unreachable: {}", e)),
+                                })
+                            }
+                        }
+                    } else {
+                        // This node IS the coordinator - perform load balancing
+                        info!("[Node {}] Coordinator performing load balancing for request {}", self.id, request_id);
+                        
+                        // Query all nodes for their current load
+                        let lowest_load_node = self.find_lowest_load_node().await;
+                        
+                        info!("[Node {}] Load balancing: Selected Node {} for request {}", 
+                              self.id, lowest_load_node, request_id);
+                        
+                        if lowest_load_node == self.id {
+                            // This coordinator has lowest load - process locally
+                            info!("[Node {}] Processing request {} locally (lowest load)", self.id, request_id);
+                            
+                            // Increment queue length
+                            {
+                                let mut queue = self.queue_length.write().await;
+                                *queue += 1;
+                            }
+
+                            // Process encryption
+                            let self_clone = Arc::new(self.clone());
+                            let result = self_clone
+                                .process_encryption_request(request_id.clone(), image_data, usernames, quota)
+                                .await;
+
+                            // Decrement queue length
+                            {
+                                let mut queue = self.queue_length.write().await;
+                                *queue = queue.saturating_sub(1);
+                            }
+
+                            Some(result)
+                        } else {
+                            // Forward to lowest-load node
+                            info!("[Node {}] Forwarding request {} to lowest-load Node {}", 
+                                  self.id, request_id, lowest_load_node);
+                            
+                            let forward_message = Message::EncryptionRequest {
+                                request_id: request_id.clone(),
+                                client_username,
+                                image_data,
+                                usernames,
+                                quota,
+                                forwarded: true, // Mark as forwarded to prevent loops
+                            };
+                            
+                            match self.send_message_to_node(lowest_load_node, forward_message).await {
+                                Ok(Some(response)) => {
+                                    info!("[Node {}] Received response from Node {} for {}", 
+                                          self.id, lowest_load_node, request_id);
+                                    Some(response)
+                                }
+                                Ok(None) => {
+                                    warn!("[Node {}] No response from Node {} for {}", 
+                                          self.id, lowest_load_node, request_id);
+                                    Some(Message::EncryptionResponse {
+                                        request_id,
+                                        encrypted_image: vec![],
+                                        success: false,
+                                        error: Some("Selected node did not respond".to_string()),
+                                    })
+                                }
+                                Err(e) => {
+                                    error!("[Node {}] Failed to forward to Node {} for {}: {}", 
+                                           self.id, lowest_load_node, request_id, e);
+                                    Some(Message::EncryptionResponse {
+                                        request_id,
+                                        encrypted_image: vec![],
+                                        success: false,
+                                        error: Some(format!("Forward to selected node failed: {}", e)),
+                                    })
+                                }
+                            }
+                        }
+                    }
+                }
+            }
                         }
                         Ok(None) => {
                             warn!("[Node {}] No response from coordinator for {}", self.id, request_id);
@@ -459,9 +561,63 @@ impl CloudNode {
         }
     }
 
+    /// Find the node with the lowest load (including self)
+    async fn find_lowest_load_node(&self) -> NodeId {
+        let mut lowest_load = *self.current_load.read().await;
+        let mut lowest_node = self.id;
+        
+        info!("[Node {}] Current load: {:.2}", self.id, lowest_load);
+        
+        // Query all peer nodes for their load IN PARALLEL
+        let mut handles = vec![];
+        
+        for (peer_id, _) in &self.peer_addresses {
+            let peer_id = *peer_id;
+            let self_clone = self.clone();
+            
+            let handle = tokio::spawn(async move {
+                let load_query = Message::LoadQuery { from_node: self_clone.id };
+                match self_clone.send_message_to_node(peer_id, load_query).await {
+                    Ok(Some(Message::LoadResponse { node_id, load, queue_length })) => {
+                        info!("[Node {}] Node {} load: {:.2} (queue: {})", 
+                              self_clone.id, node_id, load, queue_length);
+                        Some((node_id, load))
+                    }
+                    Ok(_) => {
+                        warn!("[Node {}] Unexpected response from Node {}", self_clone.id, peer_id);
+                        None
+                    }
+                    Err(e) => {
+                        warn!("[Node {}] Failed to query load from Node {}: {}", self_clone.id, peer_id, e);
+                        None
+                    }
+                }
+            });
+            
+            handles.push(handle);
+        }
+        
+        // Wait for all queries to complete
+        for handle in handles {
+            if let Ok(Some((node_id, load))) = handle.await {
+                if load < lowest_load {
+                    lowest_load = load;
+                    lowest_node = node_id;
+                }
+            }
+        }
+        
+        info!("[Node {}] Lowest load node: {} (load: {:.2})", self.id, lowest_node, lowest_load);
+        lowest_node
+    }
+
     /// Send message to another node
     async fn send_message_to_node(&self, node_id: NodeId, message: Message) -> Result<Option<Message>, Box<dyn std::error::Error>> {
-        if let Some(address) = self.peer_addresses.get(&node_id) {
+        if let Some(address_str) = self.peer_addresses.get(&node_id) {
+            // Parse the address string to SocketAddr
+            let address: SocketAddr = address_str.parse()
+                .map_err(|e| format!("Invalid address '{}': {}", address_str, e))?;
+            
             // Create a temporary UDP socket
             let socket = UdpSocket::bind("0.0.0.0:0").await?;
 
@@ -476,8 +632,14 @@ impl CloudNode {
             socket.send_to(&message_bytes, address).await?;
 
             // Try to read response with timeout
+            // Use longer timeout for encryption requests (10 seconds)
+            let timeout_duration = match message {
+                Message::EncryptionRequest { .. } => Duration::from_secs(10),
+                _ => Duration::from_millis(500),
+            };
+            
             let mut buffer = vec![0u8; 65535];
-            match tokio::time::timeout(Duration::from_millis(500), socket.recv_from(&mut buffer)).await {
+            match tokio::time::timeout(timeout_duration, socket.recv_from(&mut buffer)).await {
                 Ok(Ok((n, _))) => {
                     let response: Message = serde_json::from_slice(&buffer[..n])?;
                     Ok(Some(response))
