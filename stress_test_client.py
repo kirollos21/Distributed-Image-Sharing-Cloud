@@ -40,7 +40,7 @@ class StressTestClient:
         
         message_bytes = json.dumps(message).encode('utf-8')
         
-        # Try each server until one responds
+        # Try each server until one responds (server-side forwarding handles load balancing)
         for server_addr in self.server_addresses:
             try:
                 host, port = server_addr.split(':')

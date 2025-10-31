@@ -169,30 +169,76 @@ impl CloudNode {
 
             Message::EncryptionRequest {
                 request_id,
-                client_username: _,
+                client_username,
                 image_data,
                 usernames,
                 quota,
             } => {
-                // Increment queue length
-                {
-                    let mut queue = self.queue_length.write().await;
-                    *queue += 1;
+                // Check if this node is the coordinator (lowest load)
+                let manager = self.election_manager.lock().await;
+                let coordinator_id = manager.get_coordinator().unwrap_or(self.id);
+                drop(manager); // Release lock
+                
+                if coordinator_id == self.id {
+                    // This node is the coordinator - process locally
+                    info!("[Node {}] Processing request {} locally (coordinator)", self.id, request_id);
+                    
+                    // Increment queue length
+                    {
+                        let mut queue = self.queue_length.write().await;
+                        *queue += 1;
+                    }
+
+                    // Process encryption in a separate task
+                    let self_clone = Arc::new(self.clone());
+                    let result = self_clone
+                        .process_encryption_request(request_id.clone(), image_data, usernames, quota)
+                        .await;
+
+                    // Decrement queue length
+                    {
+                        let mut queue = self.queue_length.write().await;
+                        *queue = queue.saturating_sub(1);
+                    }
+
+                    Some(result)
+                } else {
+                    // Forward to coordinator
+                    info!("[Node {}] Forwarding request {} to coordinator Node {}", self.id, request_id, coordinator_id);
+                    
+                    let forward_message = Message::EncryptionRequest {
+                        request_id: request_id.clone(),
+                        client_username,
+                        image_data,
+                        usernames,
+                        quota,
+                    };
+                    
+                    match self.send_message_to_node(coordinator_id, forward_message).await {
+                        Ok(Some(response)) => {
+                            info!("[Node {}] Received forwarded response for {}", self.id, request_id);
+                            Some(response)
+                        }
+                        Ok(None) => {
+                            warn!("[Node {}] No response from coordinator for {}", self.id, request_id);
+                            Some(Message::EncryptionResponse {
+                                request_id,
+                                encrypted_image: vec![],
+                                success: false,
+                                error: Some("Coordinator did not respond".to_string()),
+                            })
+                        }
+                        Err(e) => {
+                            error!("[Node {}] Failed to forward request {}: {}", self.id, request_id, e);
+                            Some(Message::EncryptionResponse {
+                                request_id,
+                                encrypted_image: vec![],
+                                success: false,
+                                error: Some(format!("Forward failed: {}", e)),
+                            })
+                        }
+                    }
                 }
-
-                // Process encryption in a separate task
-                let self_clone = Arc::new(self.clone());
-                let result = self_clone
-                    .process_encryption_request(request_id.clone(), image_data, usernames, quota)
-                    .await;
-
-                // Decrement queue length
-                {
-                    let mut queue = self.queue_length.write().await;
-                    *queue = queue.saturating_sub(1);
-                }
-
-                Some(result)
             }
 
             Message::Election { from_node } => {
@@ -234,6 +280,20 @@ impl CloudNode {
                     coordinator_id,
                     load_metrics: vec![],
                     timestamp: chrono::Utc::now().timestamp(),
+                })
+            }
+
+            Message::CoordinatorQuery => {
+                let manager = self.election_manager.lock().await;
+                let coordinator_id = manager.get_coordinator().unwrap_or(self.id);
+                
+                // Map coordinator ID to address
+                let coordinator_address = self.peer_addresses.get(&coordinator_id)
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_else(|| self.address.to_string());
+                
+                Some(Message::CoordinatorQueryResponse {
+                    coordinator_address,
                 })
             }
 

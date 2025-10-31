@@ -64,6 +64,12 @@ pub enum Message {
         timestamp: i64,
     },
 
+    // Coordinator query (for clients)
+    CoordinatorQuery,
+    CoordinatorQueryResponse {
+        coordinator_address: String,
+    },
+
     // Heartbeat
     Heartbeat { from_node: NodeId },
     HeartbeatAck { from_node: NodeId },
@@ -136,6 +142,10 @@ impl fmt::Display for Message {
             Message::StateSync { from_node } => write!(f, "STATE_SYNC from Node {}", from_node),
             Message::StateSyncResponse { coordinator_id, .. } => {
                 write!(f, "STATE_SYNC_RESPONSE (coordinator: {})", coordinator_id)
+            }
+            Message::CoordinatorQuery => write!(f, "COORDINATOR_QUERY"),
+            Message::CoordinatorQueryResponse { coordinator_address } => {
+                write!(f, "COORDINATOR_QUERY_RESPONSE (address: {})", coordinator_address)
             }
             Message::Heartbeat { from_node } => write!(f, "HEARTBEAT from Node {}", from_node),
             Message::HeartbeatAck { from_node } => write!(f, "HEARTBEAT_ACK from Node {}", from_node),
