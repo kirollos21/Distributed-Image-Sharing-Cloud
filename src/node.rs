@@ -176,8 +176,9 @@ impl CloudNode {
                 forwarded,
             } => {
                 if forwarded {
-                    // Request already forwarded once - process locally to prevent loops
-                    info!("[Node {}] Processing forwarded request {} locally", self.id, request_id);
+                    // Request forwarded by coordinator - MUST process locally regardless of current state
+                    // This prevents loops and ensures coordinator's decision is respected
+                    info!("[Node {}] Processing forwarded request {} locally (from coordinator)", self.id, request_id);
                     
                     // Increment queue length
                     {
@@ -199,13 +200,13 @@ impl CloudNode {
 
                     Some(result)
                 } else {
-                    // Check if this node is the coordinator
+                    // Get current coordinator (may change due to elections)
                     let manager = self.election_manager.lock().await;
                     let coordinator_id = manager.get_coordinator().unwrap_or(self.id);
-                    drop(manager); // Release lock
+                    drop(manager); // Release lock immediately
                     
                     if coordinator_id != self.id {
-                        // Not coordinator - forward to coordinator for load balancing
+                        // Not coordinator - forward to current coordinator for load balancing
                         info!("[Node {}] Forwarding request {} to coordinator Node {} for load balancing", 
                               self.id, request_id, coordinator_id);
                         
@@ -215,31 +216,62 @@ impl CloudNode {
                             image_data,
                             usernames,
                             quota,
-                            forwarded: false, // Let coordinator do load balancing
+                            forwarded: false, // Coordinator will do load balancing
                         };
                         
                         match self.send_message_to_node(coordinator_id, forward_message).await {
                             Ok(Some(response)) => {
-                                info!("[Node {}] Received response from coordinator for {}", self.id, request_id);
+                                info!("[Node {}] Received response from coordinator Node {} for {}", 
+                                      self.id, coordinator_id, request_id);
                                 Some(response)
                             }
                             Ok(None) => {
-                                warn!("[Node {}] No response from coordinator for {}", self.id, request_id);
-                                Some(Message::EncryptionResponse {
-                                    request_id,
-                                    encrypted_image: vec![],
-                                    success: false,
-                                    error: Some("Coordinator did not respond".to_string()),
-                                })
+                                warn!("[Node {}] No response from coordinator Node {} for {}", 
+                                      self.id, coordinator_id, request_id);
+                                // Coordinator may have failed - try processing locally as fallback
+                                info!("[Node {}] Coordinator unresponsive, processing {} locally as fallback", 
+                                      self.id, request_id);
+                                
+                                {
+                                    let mut queue = self.queue_length.write().await;
+                                    *queue += 1;
+                                }
+                                
+                                let self_clone = Arc::new(self.clone());
+                                let result = self_clone
+                                    .process_encryption_request(request_id.clone(), image_data, usernames, quota)
+                                    .await;
+                                
+                                {
+                                    let mut queue = self.queue_length.write().await;
+                                    *queue = queue.saturating_sub(1);
+                                }
+                                
+                                Some(result)
                             }
                             Err(e) => {
-                                error!("[Node {}] Failed to contact coordinator for {}: {}", self.id, request_id, e);
-                                Some(Message::EncryptionResponse {
-                                    request_id,
-                                    encrypted_image: vec![],
-                                    success: false,
-                                    error: Some(format!("Coordinator unreachable: {}", e)),
-                                })
+                                error!("[Node {}] Failed to contact coordinator Node {} for {}: {}", 
+                                       self.id, coordinator_id, request_id, e);
+                                // Process locally as fallback
+                                info!("[Node {}] Processing {} locally due to coordinator error", 
+                                      self.id, request_id);
+                                
+                                {
+                                    let mut queue = self.queue_length.write().await;
+                                    *queue += 1;
+                                }
+                                
+                                let self_clone = Arc::new(self.clone());
+                                let result = self_clone
+                                    .process_encryption_request(request_id.clone(), image_data, usernames, quota)
+                                    .await;
+                                
+                                {
+                                    let mut queue = self.queue_length.write().await;
+                                    *queue = queue.saturating_sub(1);
+                                }
+                                
+                                Some(result)
                             }
                         }
                     } else {
@@ -547,46 +579,29 @@ impl CloudNode {
         
         info!("[Node {}] Current load: {:.2}", self.id, lowest_load);
         
-        // Query all peer nodes for their load IN PARALLEL
-        let mut handles = vec![];
-        
+        // Query all peer nodes for their load SEQUENTIALLY (more stable)
         for (peer_id, _) in &self.peer_addresses {
-            let peer_id = *peer_id;
-            let self_clone = self.clone();
+            let load_query = Message::LoadQuery { from_node: self.id };
             
-            let handle = tokio::spawn(async move {
-                let load_query = Message::LoadQuery { from_node: self_clone.id };
-                match self_clone.send_message_to_node(peer_id, load_query).await {
-                    Ok(Some(Message::LoadResponse { node_id, load, queue_length })) => {
-                        info!("[Node {}] Node {} load: {:.2} (queue: {})", 
-                              self_clone.id, node_id, load, queue_length);
-                        Some((node_id, load))
-                    }
-                    Ok(Some(other_msg)) => {
-                        warn!("[Node {}] Unexpected response from Node {}: {:?}", 
-                              self_clone.id, peer_id, other_msg);
-                        None
-                    }
-                    Ok(None) => {
-                        warn!("[Node {}] No response from Node {} (timeout)", self_clone.id, peer_id);
-                        None
-                    }
-                    Err(e) => {
-                        warn!("[Node {}] Failed to query load from Node {}: {}", self_clone.id, peer_id, e);
-                        None
+            match self.send_message_to_node(*peer_id, load_query).await {
+                Ok(Some(Message::LoadResponse { node_id, load, queue_length })) => {
+                    info!("[Node {}] Node {} load: {:.2} (queue: {})", 
+                          self.id, node_id, load, queue_length);
+                    
+                    if load < lowest_load {
+                        lowest_load = load;
+                        lowest_node = node_id;
                     }
                 }
-            });
-            
-            handles.push(handle);
-        }
-        
-        // Wait for all queries to complete
-        for handle in handles {
-            if let Ok(Some((node_id, load))) = handle.await {
-                if load < lowest_load {
-                    lowest_load = load;
-                    lowest_node = node_id;
+                Ok(Some(other_msg)) => {
+                    warn!("[Node {}] Unexpected response from Node {}: {:?}", 
+                          self.id, peer_id, other_msg);
+                }
+                Ok(None) => {
+                    warn!("[Node {}] No response from Node {} (timeout)", self.id, peer_id);
+                }
+                Err(e) => {
+                    warn!("[Node {}] Failed to query load from Node {}: {}", self.id, peer_id, e);
                 }
             }
         }
@@ -602,8 +617,16 @@ impl CloudNode {
             let address: SocketAddr = address_str.parse()
                 .map_err(|e| format!("Invalid address '{}': {}", address_str, e))?;
             
-            // Create a temporary UDP socket
-            let socket = UdpSocket::bind("0.0.0.0:0").await?;
+            // Create a temporary UDP socket bound to a specific port (node's port + 1000)
+            // This avoids using random ephemeral ports that might be blocked
+            let bind_addr = format!("0.0.0.0:{}", 9000 + self.id);
+            let socket = match UdpSocket::bind(&bind_addr).await {
+                Ok(s) => s,
+                Err(_) => {
+                    // Fallback to any available port if specific port fails
+                    UdpSocket::bind("0.0.0.0:0").await?
+                }
+            };
 
             let message_bytes = serde_json::to_vec(&message)?;
 
