@@ -177,7 +177,7 @@ def main():
     cleaned_results = []
     for result in all_results:
         cleaned = {k: v for k, v in result.items() 
-                   if k not in ['encrypted_data', 'decrypted_data']}
+                   if k not in ['encrypted_data']}
         # Add size information instead of actual bytes
         if 'encrypted_data' in result:
             cleaned['encrypted_size'] = len(result['encrypted_data'])
