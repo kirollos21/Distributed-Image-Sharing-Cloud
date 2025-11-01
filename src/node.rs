@@ -317,9 +317,10 @@ impl CloudNode {
                         let mut queue = self.queue_length.write().await;
                         *queue = queue.saturating_sub(1);
                         
-                        // Update load to reflect new queue size
+                        // Update load to reflect new queue size + in-flight requests
+                        let in_flight_count = { self.in_flight_requests.read().await.len() };
                         let mut load = self.current_load.write().await;
-                        *load = *queue as f64;
+                        *load = *queue as f64 + in_flight_count as f64;
                     }
 
                     Some(result)
@@ -401,9 +402,10 @@ impl CloudNode {
                                 let mut queue = self.queue_length.write().await;
                                 *queue = queue.saturating_sub(1);
                                 
-                                // Update load to reflect new queue size
+                                // Update load to reflect new queue size + in-flight requests
+                                let in_flight_count = { self.in_flight_requests.read().await.len() };
                                 let mut load = self.current_load.write().await;
-                                *load = *queue as f64;
+                                *load = *queue as f64 + in_flight_count as f64;
                             }
 
                             Some(result)
