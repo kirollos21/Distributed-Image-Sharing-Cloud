@@ -246,7 +246,7 @@ impl Client {
                 Ok(chunked_message) => {
                     // Track multi-packet metadata for retransmission
                     if let ChunkedMessage::MultiPacket {
-                        ref chunk_id: cid,
+                        chunk_id: ref cid,
                         chunk_index,
                         total_chunks,
                         ..
