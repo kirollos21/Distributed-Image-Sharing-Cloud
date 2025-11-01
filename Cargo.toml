@@ -18,6 +18,7 @@ egui_extras = { version = "0.28", features = ["image"] }
 image = "0.25"
 rfd = "0.14"  # File dialogs
 poll-promise = "0.3"  # Async promises for egui
+sha2 = "0.10"  # SHA256 for deterministic seed calculation
 
 [[bin]]
 name = "cloud-node"

@@ -60,10 +60,17 @@ pub async fn encrypt_image(
         ));
     }
 
-    // STEP 1: Embed metadata into LSBs FIRST (before scrambling)
-    // This way when we scramble, the metadata stays with its pixels
-    // and can be extracted after unscrambling
-    
+    // STEP 1: SCRAMBLE PIXELS FIRST!
+    // Calculate seed before modifying any LSBs
+    let seed = calculate_seed(&metadata);
+    scramble_pixels(pixels, seed);
+    info!("Pixels scrambled using seed derived from metadata");
+    debug!("Scrambling complete, now embedding metadata in fixed positions");
+
+    // STEP 2: Embed metadata into LSBs AFTER scrambling
+    // This way metadata is in KNOWN positions (0 to N) and can be extracted
+    // before unscrambling during decryption
+
     // Embed metadata length (4 bytes = 32 bits) into LSB
     let metadata_len = metadata_bytes.len() as u32;
     let len_bytes = metadata_len.to_be_bytes();
@@ -91,14 +98,7 @@ pub async fn encrypt_image(
         }
     }
 
-    debug!("Metadata embedded: {} bytes (before scrambling)", metadata_bytes.len());
-
-    // STEP 2: VISUAL ENCRYPTION - Scramble pixels AFTER embedding metadata
-    // The metadata LSBs will be scrambled along with the pixels
-    // Client must unscramble first, then extract metadata
-    let seed = calculate_seed(&metadata);
-    scramble_pixels(pixels, seed);
-    info!("Pixels scrambled using seed derived from metadata");
+    debug!("Metadata embedded: {} bytes (AFTER scrambling, in fixed positions)", metadata_bytes.len());
 
     // OPTIMIZATION: Resize image if too large for UDP transmission
     // Target: encrypted output should be < 50KB to fit in UDP packets safely
@@ -146,16 +146,23 @@ pub async fn encrypt_image(
 }
 
 /// Calculate a seed from metadata for deterministic scrambling
+/// Uses SHA256 to match Python decryptor implementation
 fn calculate_seed(metadata: &ImageMetadata) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use sha2::{Sha256, Digest};
 
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = Sha256::new();
+
+    // Hash usernames
     for username in &metadata.usernames {
-        username.hash(&mut hasher);
+        hasher.update(username.as_bytes());
     }
-    metadata.quota.hash(&mut hasher);
-    hasher.finish()
+
+    // Hash quota as string (to match Python: str(metadata['quota']))
+    hasher.update(metadata.quota.to_string().as_bytes());
+
+    // Get first 8 bytes of hash as u64 (big-endian)
+    let hash_bytes = hasher.finalize();
+    u64::from_be_bytes(hash_bytes[0..8].try_into().unwrap())
 }
 
 /// Scramble pixels using Fisher-Yates shuffle with a seed
@@ -234,6 +241,9 @@ pub async fn decrypt_image(encrypted_image: Vec<u8>) -> Result<(Vec<u8>, ImageMe
         return Err("Image too small to contain metadata".to_string());
     }
 
+    // STEP 1: Extract metadata from FIXED positions (embedded AFTER scrambling)
+    // So metadata is in known locations and can be read before unscrambling
+
     // Extract metadata length from first 32 bits (from pixel LSBs)
     let mut len_bytes = [0u8; 4];
     for i in 0..4 {
@@ -274,14 +284,15 @@ pub async fn decrypt_image(encrypted_image: Vec<u8>) -> Result<(Vec<u8>, ImageMe
     let metadata_json = String::from_utf8(metadata_bytes).map_err(|e| e.to_string())?;
     let metadata: ImageMetadata = serde_json::from_str(&metadata_json).map_err(|e| e.to_string())?;
 
-    debug!("Metadata extracted: {} usernames", metadata.usernames.len());
+    debug!("Metadata extracted: {} usernames (from fixed positions)", metadata.usernames.len());
     eprintln!("[DEBUG DECRYPT] Step 7: Metadata extracted - usernames: {:?}, quota: {}", metadata.usernames, metadata.quota);
 
-    // VISUAL DECRYPTION: Unscramble pixels using same seed
+    // STEP 2: UNSCRAMBLE pixels using seed from metadata
+    // This restores the original image (but LSBs will have minor modifications)
     let seed = calculate_seed(&metadata);
     eprintln!("[DEBUG DECRYPT] Step 8: Calculated seed: {}, starting unscramble", seed);
     unscramble_pixels(pixels, seed);
-    info!("Pixels unscrambled - original image restored");
+    info!("Pixels unscrambled - original image restored (with minor LSB modifications)");
     eprintln!("[DEBUG DECRYPT] Step 9: Pixels unscrambled successfully");
 
     // Convert back to original format
