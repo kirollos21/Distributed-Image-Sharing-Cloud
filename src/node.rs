@@ -101,6 +101,12 @@ impl CloudNode {
             self_clone.failure_detector_task().await;
         });
 
+        // Start load monitoring (log load distribution every 10 seconds)
+        let self_clone = self.clone();
+        tokio::spawn(async move {
+            self_clone.load_monitoring_task().await;
+        });
+
         // Receive incoming datagrams
         let socket = Arc::new(socket);
         let mut buffer = vec![0u8; 65535]; // Max UDP packet size
@@ -1258,6 +1264,125 @@ impl CloudNode {
                     // The coordinator will notice when it tries to load balance to this node
                 }
             }
+        }
+    }
+
+    /// Load monitoring task - logs load distribution every 10 seconds
+    async fn load_monitoring_task(&self) {
+        // Wait for system to stabilize before starting monitoring
+        sleep(Duration::from_secs(20)).await;
+
+        let mut interval = interval(Duration::from_secs(10));
+
+        loop {
+            interval.tick().await;
+
+            // Get current coordinator
+            let manager = self.election_manager.lock().await;
+            let coordinator_id = manager.get_coordinator();
+            drop(manager);
+
+            // Get failed nodes
+            let failed = self.failed_nodes.read().await;
+
+            // Collect load information from all nodes
+            let mut load_info = Vec::new();
+
+            // Add this node's info
+            let self_load = self.current_load.read().await;
+            let self_processed = self.processed_requests.read().await;
+            let self_active = self.active_requests.read().await;
+
+            let is_coordinator = coordinator_id == Some(self.id);
+            let status = if is_coordinator { "COORDINATOR" } else { "Worker" };
+
+            load_info.push((
+                self.id,
+                *self_load,
+                *self_processed,
+                *self_active,
+                status.to_string(),
+            ));
+
+            drop(self_load);
+            drop(self_processed);
+            drop(self_active);
+
+            // Query all peer nodes for their load
+            for (&peer_id, peer_addr) in &self.peer_addresses {
+                // Skip failed nodes
+                if failed.contains(&peer_id) {
+                    load_info.push((peer_id, 0.0, 0, 0, "FAILED".to_string()));
+                    continue;
+                }
+
+                // Send load query
+                let message = Message::LoadQuery { from_node: self.id };
+
+                match serde_json::to_vec(&message) {
+                    Ok(message_bytes) => {
+                        // Create temporary socket for query
+                        match UdpSocket::bind("0.0.0.0:0").await {
+                            Ok(query_socket) => {
+                                // Set short timeout for monitoring query
+                                match tokio::time::timeout(
+                                    Duration::from_secs(2),
+                                    async {
+                                        // Send query
+                                        query_socket.send_to(&message_bytes, peer_addr).await?;
+
+                                        // Wait for response
+                                        let mut buf = vec![0u8; 65535];
+                                        let (n, _) = query_socket.recv_from(&mut buf).await?;
+                                        let response: Message = serde_json::from_slice(&buf[..n])?;
+
+                                        Ok::<Message, Box<dyn std::error::Error>>(response)
+                                    }
+                                ).await {
+                                    Ok(Ok(Message::LoadResponse { node_id, load, processed_count, .. })) => {
+                                        let status = if coordinator_id == Some(node_id) {
+                                            "COORDINATOR"
+                                        } else {
+                                            "Worker"
+                                        };
+                                        load_info.push((node_id, load, processed_count, 0, status.to_string()));
+                                    }
+                                    _ => {
+                                        // Query failed or timed out
+                                        load_info.push((peer_id, 0.0, 0, 0, "NO_RESPONSE".to_string()));
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                // Socket creation failed
+                                load_info.push((peer_id, 0.0, 0, 0, "ERROR".to_string()));
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Serialization failed
+                        load_info.push((peer_id, 0.0, 0, 0, "ERROR".to_string()));
+                    }
+                }
+            }
+
+            drop(failed);
+
+            // Sort by node ID for consistent display
+            load_info.sort_by_key(|(id, _, _, _, _)| *id);
+
+            // Log the load distribution
+            info!("[Node {}] ════════════════ CLUSTER LOAD DISTRIBUTION ════════════════", self.id);
+            info!("[Node {}] ┌────────┬────────────┬───────────┬────────────┬──────────────┐", self.id);
+            info!("[Node {}] │ Node   │ Status     │ Load      │ Processed  │ Active Reqs  │", self.id);
+            info!("[Node {}] ├────────┼────────────┼───────────┼────────────┼──────────────┤", self.id);
+
+            for (node_id, load, processed, active, status) in load_info {
+                info!("[Node {}] │ Node {} │ {:10} │ {:8.2}% │ {:10} │ {:12} │",
+                      self.id, node_id, status, load * 100.0, processed, active);
+            }
+
+            info!("[Node {}] └────────┴────────────┴───────────┴────────────┴──────────────┘", self.id);
         }
     }
 
