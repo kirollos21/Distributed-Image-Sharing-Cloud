@@ -58,53 +58,101 @@ def fragment_message(data):
     return chunks
 
 def reassemble_chunks(sock, timeout=30.0):
-    """Receive and reassemble chunked messages with base64 decoding"""
-    sock.settimeout(timeout)
+    """Receive and reassemble chunked messages with automatic retransmission requests"""
+    sock.settimeout(5.0)  # Use short timeout to detect when stream ends
 
     incomplete = {}
+    chunk_id_tracker = None
+    server_addr = None
+    start_time = time.time()
+    retransmit_attempts = 0
+    MAX_RETRANSMIT_ATTEMPTS = 3
 
     while True:
-        # Receive chunk
-        chunk_data, _ = sock.recvfrom(65535)
-        chunk_msg = json.loads(chunk_data.decode('utf-8'))
+        if time.time() - start_time > timeout:
+            raise socket.timeout("Overall timeout exceeded")
+            
+        try:
+            # Receive chunk
+            chunk_data, addr = sock.recvfrom(65535)
+            if server_addr is None:
+                server_addr = addr
+            chunk_msg = json.loads(chunk_data.decode('utf-8'))
 
-        # Check if single packet
-        if "SinglePacket" in chunk_msg:
-            encoded = chunk_msg["SinglePacket"]
-            decoded = base64.b64decode(encoded)
-            print(f"📥 Received single packet: {len(decoded)} bytes")
-            return decoded
+            # Check if single packet
+            if "SinglePacket" in chunk_msg:
+                encoded = chunk_msg["SinglePacket"]
+                decoded = base64.b64decode(encoded)
+                print(f"📥 Received single packet: {len(decoded)} bytes")
+                return decoded
 
-        # Multi-packet
-        if "MultiPacket" in chunk_msg:
-            mp = chunk_msg["MultiPacket"]
-            chunk_id = mp["chunk_id"]
-            chunk_index = mp["chunk_index"]
-            total_chunks = mp["total_chunks"]
+            # Multi-packet
+            if "MultiPacket" in chunk_msg:
+                mp = chunk_msg["MultiPacket"]
+                chunk_id = mp["chunk_id"]
+                chunk_index = mp["chunk_index"]
+                total_chunks = mp["total_chunks"]
+                
+                chunk_id_tracker = chunk_id
 
-            # Base64 decode the chunk data
-            encoded_data = mp["data"]
-            data = base64.b64decode(encoded_data)
+                # Base64 decode the chunk data
+                encoded_data = mp["data"]
+                data = base64.b64decode(encoded_data)
 
-            print(f"📥 Received chunk {chunk_index + 1}/{total_chunks} for {chunk_id[:8]}... ({len(data)} bytes)")
+                print(f"📥 Received chunk {chunk_index + 1}/{total_chunks} for {chunk_id[:8]}... ({len(data)} bytes)")
 
-            # Store chunk
-            if chunk_id not in incomplete:
-                incomplete[chunk_id] = {"total": total_chunks, "chunks": {}}
+                # Store chunk
+                if chunk_id not in incomplete:
+                    incomplete[chunk_id] = {"total": total_chunks, "chunks": {}}
 
-            incomplete[chunk_id]["chunks"][chunk_index] = data
+                incomplete[chunk_id]["chunks"][chunk_index] = data
 
-            # Check if complete
-            if len(incomplete[chunk_id]["chunks"]) == total_chunks:
-                print(f"✓ All chunks received, reassembling...")
+                # Check if complete
+                if len(incomplete[chunk_id]["chunks"]) == total_chunks:
+                    print(f"✓ All chunks received, reassembling...")
 
-                # Reassemble in order
-                complete_data = b""
-                for i in range(total_chunks):
-                    complete_data += incomplete[chunk_id]["chunks"][i]
+                    # Reassemble in order
+                    complete_data = b""
+                    for i in range(total_chunks):
+                        complete_data += incomplete[chunk_id]["chunks"][i]
 
-                print(f"✓ Reassembly complete: {len(complete_data)} bytes")
-                return complete_data
+                    print(f"✓ Reassembly complete: {len(complete_data)} bytes")
+                    return complete_data
+                    
+        except socket.timeout:
+            # Timeout means no more packets are coming - check if we're missing any
+            if chunk_id_tracker and chunk_id_tracker in incomplete and server_addr:
+                received = len(incomplete[chunk_id_tracker]["chunks"])
+                total = incomplete[chunk_id_tracker]["total"]
+                
+                if received < total and retransmit_attempts < MAX_RETRANSMIT_ATTEMPTS:
+                    # Find missing chunks
+                    missing = [i for i in range(total) if i not in incomplete[chunk_id_tracker]["chunks"]]
+                    
+                    retransmit_attempts += 1
+                    print(f"\n⚠️  Packet loss detected: {received}/{total} chunks received")
+                    print(f"🔄 Requesting retransmission of {len(missing)} missing chunks (attempt {retransmit_attempts}/{MAX_RETRANSMIT_ATTEMPTS})...")
+                    
+                    # Send retransmit request
+                    retransmit_request = {
+                        "RetransmitRequest": {
+                            "chunk_id": chunk_id_tracker,
+                            "missing_indices": missing[:50]  # Limit to first 50 to avoid huge request
+                        }
+                    }
+                    request_bytes = json.dumps(retransmit_request).encode('utf-8')
+                    sock.sendto(request_bytes, server_addr)
+                    
+                    # Reset timeout and continue receiving
+                    sock.settimeout(5.0)
+                    continue
+                elif received < total:
+                    # Max retransmits reached
+                    missing = [i for i in range(total) if i not in incomplete[chunk_id_tracker]["chunks"]]
+                    print(f"\n❌ Failed after {retransmit_attempts} retransmission attempts")
+                    print(f"   Still missing {len(missing)} chunks: {missing[:20]}")
+                    raise Exception(f"UDP packet loss: missing {len(missing)}/{total} chunks after {retransmit_attempts} retries")
+            raise
 
 class ImageTestClient:
     def __init__(self, server_address, image_path):

@@ -25,6 +25,12 @@ pub enum ChunkedMessage {
         total_chunks: u32,     // Total number of chunks
         data: String,          // Chunk data (base64 encoded)
     },
+    
+    /// Request retransmission of missing chunks
+    RetransmitRequest {
+        chunk_id: String,      // ID of the multi-packet message
+        missing_indices: Vec<u32>, // Indices of missing chunks to retransmit
+    },
 }
 
 impl ChunkedMessage {
@@ -96,6 +102,13 @@ impl ChunkReassembler {
                         None
                     }
                 }
+            }
+            
+            ChunkedMessage::RetransmitRequest { .. } => {
+                // Retransmit requests should be handled at a higher level (node.rs)
+                // This shouldn't reach here in normal flow
+                warn!("Received RetransmitRequest in process_chunk - ignoring");
+                None
             }
 
             ChunkedMessage::MultiPacket {

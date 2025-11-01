@@ -37,6 +37,7 @@ pub struct CloudNode {
     pub stored_images: Arc<RwLock<HashMap<String, Vec<StoredImage>>>>, // username -> list of images
     pub chunk_reassembler: Arc<Mutex<ChunkReassembler>>, // For reassembling multi-packet messages
     pub in_flight_requests: Arc<RwLock<HashSet<String>>>, // Track active request IDs to prevent duplicates
+    pub chunk_cache: Arc<RwLock<HashMap<String, Vec<ChunkedMessage>>>>, // Cache sent chunks for retransmission
 }
 
 impl CloudNode {
@@ -56,6 +57,7 @@ impl CloudNode {
             stored_images: Arc::new(RwLock::new(HashMap::new())),
             chunk_reassembler: Arc::new(Mutex::new(ChunkReassembler::new())),
             in_flight_requests: Arc::new(RwLock::new(HashSet::new())),
+            chunk_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -121,7 +123,35 @@ impl CloudNode {
         // If that fails, parse as direct Message (for node-to-node communication)
         let message: Message = match serde_json::from_slice::<ChunkedMessage>(&data) {
             Ok(chunked_message) => {
-                // It's a chunked message from a client
+                // Check if it's a retransmit request
+                if let ChunkedMessage::RetransmitRequest { chunk_id, missing_indices } = chunked_message {
+                    info!("[Node {}] Received retransmit request for {} chunks (ID: {})", 
+                          self.id, missing_indices.len(), &chunk_id[..8]);
+                    
+                    // Look up cached chunks
+                    let cache = self.chunk_cache.read().await;
+                    if let Some(cached_chunks) = cache.get(&chunk_id) {
+                        info!("[Node {}] Retransmitting {} missing chunks", self.id, missing_indices.len());
+                        
+                        // Resend only the missing chunks
+                        for &index in &missing_indices {
+                            if let Some(chunk) = cached_chunks.get(index as usize) {
+                                let chunk_bytes = serde_json::to_vec(chunk)?;
+                                socket.send_to(&chunk_bytes, addr).await?;
+                                debug!("[Node {}] Retransmitted chunk {}", self.id, index);
+                                
+                                // Small delay between retransmissions
+                                tokio::time::sleep(Duration::from_millis(2)).await;
+                            }
+                        }
+                        info!("[Node {}] Retransmission complete", self.id);
+                    } else {
+                        warn!("[Node {}] No cached chunks found for ID {}", self.id, chunk_id);
+                    }
+                    return Ok(());
+                }
+                
+                // It's a normal chunked message from a client
                 debug!("[Node {}] Received chunked message from {}", self.id, addr);
 
                 // Try to reassemble
@@ -181,16 +211,23 @@ impl CloudNode {
 
                 debug!("[Node {}] Sending {} chunks to {}", self.id, chunks.len(), addr);
 
+                // Cache chunks for potential retransmission
+                if let ChunkedMessage::MultiPacket { ref chunk_id, .. } = chunks[0] {
+                    let mut cache = self.chunk_cache.write().await;
+                    cache.insert(chunk_id.clone(), chunks.clone());
+                    debug!("[Node {}] Cached {} chunks with ID {}", self.id, chunks.len(), chunk_id);
+                }
+
                 // Send all chunks with delay to prevent UDP packet loss and buffer exhaustion
                 for (i, chunk) in chunks.iter().enumerate() {
                     let chunk_bytes = serde_json::to_vec(&chunk)?;
                     socket.send_to(&chunk_bytes, addr).await?;
 
                     // Delay between chunks to prevent overwhelming receiver's socket buffer
-                    // 2ms gives receiver time to process and prevents OS buffer exhaustion (error 105)
+                    // 15ms delay to eliminate packet loss (2/229 lost with 10ms, testing 15ms)
                     // Only delay if not the last chunk
                     if i < chunks.len() - 1 {
-                        tokio::time::sleep(Duration::from_millis(2)).await;
+                        tokio::time::sleep(Duration::from_millis(15)).await;
                     }
                 }
 
@@ -1024,6 +1061,7 @@ impl Clone for CloudNode {
             stored_images: Arc::clone(&self.stored_images),
             chunk_reassembler: Arc::clone(&self.chunk_reassembler),
             in_flight_requests: Arc::clone(&self.in_flight_requests),
+            chunk_cache: Arc::clone(&self.chunk_cache),
         }
     }
 }
