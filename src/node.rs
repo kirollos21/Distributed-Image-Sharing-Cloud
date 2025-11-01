@@ -30,9 +30,9 @@ pub struct CloudNode {
     pub state: Arc<RwLock<NodeState>>,
     pub election_manager: Arc<Mutex<ElectionManager>>,
     pub current_load: Arc<RwLock<f64>>,
-    pub queue_length: Arc<RwLock<usize>>,
+    pub active_requests: Arc<RwLock<usize>>, // Number of requests currently being processed
     pub peer_addresses: HashMap<NodeId, String>,
-    pub processed_requests: Arc<RwLock<usize>>,
+    pub processed_requests: Arc<RwLock<usize>>, // Total completed (for metrics only)
     pub active_sessions: Arc<RwLock<HashMap<String, String>>>, // username -> client_id
     pub stored_images: Arc<RwLock<HashMap<String, Vec<StoredImage>>>>, // username -> list of images
     pub chunk_reassembler: Arc<Mutex<ChunkReassembler>>, // For reassembling multi-packet messages
@@ -50,7 +50,7 @@ impl CloudNode {
             state: Arc::new(RwLock::new(NodeState::Active)),
             election_manager: Arc::new(Mutex::new(election_manager)),
             current_load: Arc::new(RwLock::new(0.0)),
-            queue_length: Arc::new(RwLock::new(0)),
+            active_requests: Arc::new(RwLock::new(0)),
             peer_addresses,
             processed_requests: Arc::new(RwLock::new(0)),
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -296,27 +296,14 @@ impl CloudNode {
 
                 // Process request and ensure cleanup happens regardless of outcome
                 let response = if forwarded {
-                    // Request forwarded by coordinator - MUST process locally regardless of current state
-                    // This prevents loops and ensures coordinator's decision is respected
+                    // Request forwarded by coordinator - MUST process locally
                     info!("[Node {}] Processing forwarded request {} locally (from coordinator)", self.id, request_id);
 
-                    // Increment queue length
-                    {
-                        let mut queue = self.queue_length.write().await;
-                        *queue += 1;
-                    }
-
-                    // Process encryption
+                    // Process encryption (active_requests incremented inside process_encryption_request)
                     let self_clone = Arc::new(self.clone());
                     let result = self_clone
                         .process_encryption_request(request_id.clone(), image_data, usernames, quota)
                         .await;
-
-                    // Decrement queue length (load will be updated when we remove from in_flight)
-                    {
-                        let mut queue = self.queue_length.write().await;
-                        *queue = queue.saturating_sub(1);
-                    }
 
                     Some(result)
                 } else {
@@ -380,23 +367,11 @@ impl CloudNode {
                             // This coordinator has lowest load - process locally
                             info!("[Node {}] Processing request {} locally (lowest load)", self.id, request_id);
 
-                            // Increment queue length
-                            {
-                                let mut queue = self.queue_length.write().await;
-                                *queue += 1;
-                            }
-
-                            // Process encryption
+                            // Process encryption (active_requests managed inside process_encryption_request)
                             let self_clone = Arc::new(self.clone());
                             let result = self_clone
                                 .process_encryption_request(request_id.clone(), image_data, usernames, quota)
                                 .await;
-
-                            // Decrement queue length (load will be updated when we remove from in_flight)
-                            {
-                                let mut queue = self.queue_length.write().await;
-                                *queue = queue.saturating_sub(1);
-                            }
 
                             Some(result)
                         } else {
@@ -445,14 +420,10 @@ impl CloudNode {
                 };
 
                 // Remove request from in-flight set now that it's complete
+                // Note: load is already updated in process_encryption_request when it decrements active_requests
                 {
                     let mut in_flight = self.in_flight_requests.write().await;
                     in_flight.remove(&request_id);
-                    
-                    // Update current_load after removing from in_flight
-                    let queue = *self.queue_length.read().await;
-                    let mut load = self.current_load.write().await;
-                    *load = queue as f64 + in_flight.len() as f64;
                 }
 
                 response
@@ -495,12 +466,12 @@ impl CloudNode {
 
             Message::LoadQuery { from_node: _ } => {
                 let load = *self.current_load.read().await;
-                let queue = *self.queue_length.read().await;
+                let active = *self.active_requests.read().await;
                 let processed = *self.processed_requests.read().await;
                 Some(Message::LoadResponse {
                     node_id: self.id,
                     load,
-                    queue_length: queue,
+                    queue_length: active, // Report active requests as "queue"
                     processed_count: processed,
                 })
             }
@@ -656,17 +627,16 @@ impl CloudNode {
             self.id, request_id
         );
 
-        // Update load (based on queue length + number of in-flight requests)
+        // Increment active requests and update load
         {
-            let queue = *self.queue_length.read().await;
-            let in_flight_count = { self.in_flight_requests.read().await.len() };
+            let mut active = self.active_requests.write().await;
+            *active += 1;
             let mut load = self.current_load.write().await;
-            // Load is queue length plus active in-flight requests to better reflect real concurrency
-            *load = queue as f64 + in_flight_count as f64;
+            *load = *active as f64;
         }
 
         // Perform encryption
-        match encryption::encrypt_image(image_data, usernames, quota).await {
+        let result = match encryption::encrypt_image(image_data, usernames, quota).await {
             Ok(encrypted_image) => {
                 let mut processed = self.processed_requests.write().await;
                 *processed += 1;
@@ -696,7 +666,17 @@ impl CloudNode {
                     error: Some(e),
                 }
             }
+        };
+
+        // Decrement active requests and update load
+        {
+            let mut active = self.active_requests.write().await;
+            *active = active.saturating_sub(1);
+            let mut load = self.current_load.write().await;
+            *load = *active as f64;
         }
+
+        result
     }
 
     async fn process_decryption_request(
@@ -1047,7 +1027,7 @@ impl CloudNode {
             id: self.id,
             state: self.state.read().await.clone(),
             load: *self.current_load.read().await,
-            queue_length: *self.queue_length.read().await,
+            queue_length: *self.active_requests.read().await,
             processed_requests: *self.processed_requests.read().await,
             is_coordinator: self.election_manager.lock().await.is_coordinator(),
         }
@@ -1062,7 +1042,7 @@ impl Clone for CloudNode {
             state: Arc::clone(&self.state),
             election_manager: Arc::clone(&self.election_manager),
             current_load: Arc::clone(&self.current_load),
-            queue_length: Arc::clone(&self.queue_length),
+            active_requests: Arc::clone(&self.active_requests),
             peer_addresses: self.peer_addresses.clone(),
             processed_requests: Arc::clone(&self.processed_requests),
             active_sessions: Arc::clone(&self.active_sessions),
