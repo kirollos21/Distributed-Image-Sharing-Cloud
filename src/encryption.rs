@@ -41,6 +41,12 @@ pub async fn encrypt_image(
     let mut rgb_img = img.to_rgb8();
     let (width, height) = rgb_img.dimensions();
     info!("Image dimensions: {}x{}", width, height);
+    
+    // Note: Encrypted size will be significantly larger than original due to:
+    // 1. JPEG (lossy) -> RGB pixels (raw) -> PNG (lossless) conversion
+    // 2. Pixel scrambling prevents effective compression
+    // 3. Network transmission adds ~3.5x overhead (JSON + base64 encoding)
+    // This is expected behavior for pixel-level encryption with LSB steganography
 
     // Get mutable pixel data
     let pixels = rgb_img.as_mut();
@@ -107,9 +113,13 @@ pub async fn encrypt_image(
     // JPEG compression would destroy the LSB-encoded metadata
     let mut output_bytes = Vec::new();
 
-    // Use explicit PNG encoder to ensure lossless encoding
+    // Use PNG with maximum compression to reduce size
     let mut cursor = std::io::Cursor::new(&mut output_bytes);
-    let encoder = image::codecs::png::PngEncoder::new(&mut cursor);
+    let encoder = image::codecs::png::PngEncoder::new_with_quality(
+        &mut cursor,
+        image::codecs::png::CompressionType::Best,
+        image::codecs::png::FilterType::Adaptive,
+    );
     final_img.write_with_encoder(encoder)
         .map_err(|e| format!("Failed to encode PNG: {}", e))?;
 

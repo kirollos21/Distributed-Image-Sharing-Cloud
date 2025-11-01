@@ -4,9 +4,8 @@ use std::time::{Duration, Instant};
 use log::{debug, warn};
 use base64::{Engine as _, engine::general_purpose};
 
-/// Maximum size for a single chunk (45KB of actual data)
-/// After base64 encoding (~33% overhead), becomes ~60KB
-/// With JSON wrapper, stays under 65KB UDP limit
+/// Maximum size for a single chunk (45KB of actual data before base64 encoding)
+/// 45KB data -> ~60KB base64 -> ~65KB with JSON wrapper (fits in 65KB UDP limit)
 const CHUNK_SIZE: usize = 45000;
 
 /// Timeout for incomplete chunk reassembly (30 seconds)
@@ -28,7 +27,7 @@ pub enum ChunkedMessage {
 }
 
 impl ChunkedMessage {
-    /// Fragment a large message into chunks with base64 encoding
+    /// Fragment a large message into chunks using base64 encoding
     pub fn fragment(data: Vec<u8>) -> Vec<ChunkedMessage> {
         let data_len = data.len();
 
@@ -85,7 +84,7 @@ impl ChunkReassembler {
     pub fn process_chunk(&mut self, chunk: ChunkedMessage) -> Option<Vec<u8>> {
         match chunk {
             ChunkedMessage::SinglePacket(encoded_data) => {
-                // Base64 decode the data
+                // Base64 decode and return
                 match general_purpose::STANDARD.decode(&encoded_data) {
                     Ok(data) => {
                         debug!("Received single packet: {} bytes", data.len());

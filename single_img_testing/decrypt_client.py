@@ -95,7 +95,7 @@ class ImageDecryptor:
         # These differences are visually imperceptible but prevent exact pixel match
         
         pixels = bytearray(pixels)
-        num_pixels = len(pixels) // 4  # RGBA pixels
+        num_pixels = len(pixels) // 3  # RGB pixels (3 bytes each)
         
         # Generate same sequence of swaps as encryption
         swap_indices = []
@@ -115,11 +115,11 @@ class ImageDecryptor:
         
         # Apply swaps in REVERSE order to unscramble
         for i, j in reversed(swap_indices):
-            idx_i = i * 4
-            idx_j = j * 4
+            idx_i = i * 3
+            idx_j = j * 3
             
-            # Swap RGBA pixels (4 bytes each)
-            for k in range(4):
+            # Swap RGB pixels (3 bytes each)
+            for k in range(3):
                 pixels[idx_i + k], pixels[idx_j + k] = pixels[idx_j + k], pixels[idx_i + k]
         
         print(f"✓ Pixels unscrambled successfully")
@@ -153,10 +153,10 @@ class ImageDecryptor:
         print(f"\n🔒 Displaying ENCRYPTED image (scrambled)...")
         img.show(title="2. ENCRYPTED IMAGE (Before Decryption - Scrambled)")
         
-        # Convert to RGBA
-        rgba_img = img.convert('RGBA')
-        pixels = rgba_img.tobytes()
-        print(f"✓ Converted to RGBA: {len(pixels)} bytes")
+        # Convert to RGB (no alpha channel - matches server encryption)
+        rgb_img = img.convert('RGB')
+        pixels = rgb_img.tobytes()
+        print(f"✓ Converted to RGB: {len(pixels)} bytes")
         
         # Step 2: Extract metadata
         metadata = self.extract_metadata(pixels)
@@ -172,7 +172,7 @@ class ImageDecryptor:
         print(f"STEP 5: Creating Decrypted Image")
         print(f"{'='*70}")
         
-        decrypted_img = Image.frombytes('RGBA', (width, height), unscrambled_pixels)
+        decrypted_img = Image.frombytes('RGB', (width, height), unscrambled_pixels)
         
         # Save decrypted image
         decrypted_path = self.output_dir / "03_decrypted_image.png"
