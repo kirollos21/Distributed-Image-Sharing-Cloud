@@ -178,10 +178,10 @@ fn unscramble_pixels(pixels: &mut [u8], seed: u64) {
 
     // Apply swaps in reverse order
     for (i, j) in swap_indices.iter().rev() {
-        let idx_i = i * 4;
-        let idx_j = j * 4;
+        let idx_i = i * 3;
+        let idx_j = j * 3;
 
-        for k in 0..4 {
+        for k in 0..3 {
             pixels.swap(idx_i + k, idx_j + k);
         }
     }
@@ -207,9 +207,9 @@ pub async fn decrypt_image(encrypted_image: Vec<u8>) -> Result<(Vec<u8>, ImageMe
         .map_err(|e| format!("Failed to decode image: {}", e))?;
     eprintln!("[DEBUG DECRYPT] Step 4: Image decoded");
 
-    let mut rgba_img = img.to_rgba8();
-    let (_width, _height) = rgba_img.dimensions();
-    let pixels = rgba_img.as_mut();
+    let mut rgb_img = img.to_rgb8();
+    let (_width, _height) = rgb_img.dimensions();
+    let pixels = rgb_img.as_mut();
     eprintln!("[DEBUG DECRYPT] Step 5: Pixel data extracted ({} bytes)", pixels.len());
 
     if pixels.len() < 32 {
@@ -272,7 +272,7 @@ pub async fn decrypt_image(encrypted_image: Vec<u8>) -> Result<(Vec<u8>, ImageMe
 
     // Convert back to original format
     eprintln!("[DEBUG DECRYPT] Step 10: Re-encoding image");
-    let dynamic_img = DynamicImage::ImageRgba8(rgba_img);
+    let dynamic_img = DynamicImage::ImageRgb8(rgb_img);
     let mut output_bytes = Vec::new();
     let mut cursor = std::io::Cursor::new(&mut output_bytes);
 
