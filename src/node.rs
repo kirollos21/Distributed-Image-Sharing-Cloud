@@ -414,6 +414,25 @@ impl CloudNode {
                 response
             }
 
+            Message::DecryptionRequest {
+                request_id,
+                client_username: _,
+                encrypted_image,
+                usernames: _,
+                quota: _,
+            } => {
+                // Decryption is fast and doesn't require load balancing
+                // Process locally on whatever node receives the request
+                info!("[Node {}] Processing decryption request: {}", self.id, request_id);
+
+                let self_clone = Arc::new(self.clone());
+                let result = self_clone
+                    .process_decryption_request(request_id.clone(), encrypted_image)
+                    .await;
+
+                Some(result)
+            }
+
             Message::Election { from_node } => {
                 let load = *self.current_load.read().await;
                 let manager = self.election_manager.lock().await;
@@ -635,6 +654,47 @@ impl CloudNode {
         }
     }
 
+    async fn process_decryption_request(
+        &self,
+        request_id: String,
+        encrypted_image: Vec<u8>,
+    ) -> Message {
+        info!(
+            "[Node {}] Processing decryption request: {}",
+            self.id, request_id
+        );
+
+        // Perform decryption
+        match encryption::decrypt_image(encrypted_image).await {
+            Ok((decrypted_image, _metadata)) => {
+                info!(
+                    "[Node {}] Successfully decrypted request: {}",
+                    self.id, request_id
+                );
+
+                Message::DecryptionResponse {
+                    request_id,
+                    decrypted_image,
+                    success: true,
+                    error: None,
+                }
+            }
+            Err(e) => {
+                error!(
+                    "[Node {}] Decryption failed for request {}: {}",
+                    self.id, request_id, e
+                );
+
+                Message::DecryptionResponse {
+                    request_id,
+                    decrypted_image: vec![],
+                    success: false,
+                    error: Some(e),
+                }
+            }
+        }
+    }
+
     /// Find the node with the lowest load (including self)
     async fn find_lowest_load_node(&self) -> NodeId {
         let mut lowest_load = *self.current_load.read().await;
@@ -694,11 +754,16 @@ impl CloudNode {
             let message_bytes = serde_json::to_vec(&message)?;
 
             // Determine if message needs chunking
-            let needs_chunking = matches!(message, Message::EncryptionRequest { .. } | Message::EncryptionResponse { .. });
+            let needs_chunking = matches!(message,
+                Message::EncryptionRequest { .. } |
+                Message::EncryptionResponse { .. } |
+                Message::DecryptionRequest { .. } |
+                Message::DecryptionResponse { .. }
+            );
 
-            // Use longer timeout for encryption requests (30 seconds)
+            // Use longer timeout for encryption/decryption requests (30 seconds)
             let timeout_duration = match message {
-                Message::EncryptionRequest { .. } => Duration::from_secs(30),
+                Message::EncryptionRequest { .. } | Message::DecryptionRequest { .. } => Duration::from_secs(30),
                 _ => Duration::from_millis(500),
             };
 

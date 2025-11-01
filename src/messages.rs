@@ -44,11 +44,24 @@ pub enum Message {
         quota: u32,
         forwarded: bool, // Prevent infinite forwarding loops
     },
+    DecryptionRequest {
+        request_id: String,
+        client_username: String,
+        encrypted_image: Vec<u8>,
+        usernames: Vec<String>,
+        quota: u32,
+    },
 
     // Response messages
     EncryptionResponse {
         request_id: String,
         encrypted_image: Vec<u8>,
+        success: bool,
+        error: Option<String>,
+    },
+    DecryptionResponse {
+        request_id: String,
+        decrypted_image: Vec<u8>,
         success: bool,
         error: Option<String>,
     },
@@ -138,8 +151,14 @@ impl fmt::Display for Message {
             Message::EncryptionRequest { request_id, .. } => {
                 write!(f, "ENCRYPTION_REQUEST {}", request_id)
             }
+            Message::DecryptionRequest { request_id, .. } => {
+                write!(f, "DECRYPTION_REQUEST {}", request_id)
+            }
             Message::EncryptionResponse { request_id, success, .. } => {
                 write!(f, "ENCRYPTION_RESPONSE {} (success: {})", request_id, success)
+            }
+            Message::DecryptionResponse { request_id, success, .. } => {
+                write!(f, "DECRYPTION_RESPONSE {} (success: {})", request_id, success)
             }
             Message::LoadQuery { from_node } => write!(f, "LOAD_QUERY from Node {}", from_node),
             Message::LoadResponse { node_id, load, queue_length, processed_count } => {
