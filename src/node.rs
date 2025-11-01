@@ -312,15 +312,10 @@ impl CloudNode {
                         .process_encryption_request(request_id.clone(), image_data, usernames, quota)
                         .await;
 
-                    // Decrement queue length and update load
+                    // Decrement queue length (load will be updated when we remove from in_flight)
                     {
                         let mut queue = self.queue_length.write().await;
                         *queue = queue.saturating_sub(1);
-                        
-                        // Update load to reflect new queue size + in-flight requests
-                        let in_flight_count = { self.in_flight_requests.read().await.len() };
-                        let mut load = self.current_load.write().await;
-                        *load = *queue as f64 + in_flight_count as f64;
                     }
 
                     Some(result)
@@ -397,15 +392,10 @@ impl CloudNode {
                                 .process_encryption_request(request_id.clone(), image_data, usernames, quota)
                                 .await;
 
-                            // Decrement queue length and update load
+                            // Decrement queue length (load will be updated when we remove from in_flight)
                             {
                                 let mut queue = self.queue_length.write().await;
                                 *queue = queue.saturating_sub(1);
-                                
-                                // Update load to reflect new queue size + in-flight requests
-                                let in_flight_count = { self.in_flight_requests.read().await.len() };
-                                let mut load = self.current_load.write().await;
-                                *load = *queue as f64 + in_flight_count as f64;
                             }
 
                             Some(result)
