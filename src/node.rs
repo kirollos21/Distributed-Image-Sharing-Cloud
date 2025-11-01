@@ -795,18 +795,27 @@ impl CloudNode {
         let mut node_data: HashMap<NodeId, (f64, usize)> = HashMap::new();
         node_data.insert(self.id, (my_load, my_processed));
         
+        // Get list of failed nodes to skip them
+        let failed = self.failed_nodes.read().await;
+
         // Query all peer nodes for their load SEQUENTIALLY (more stable)
         for (peer_id, _) in &self.peer_addresses {
+            // Skip failed nodes - don't even try to query them
+            if failed.contains(peer_id) {
+                info!("[Node {}] Skipping failed Node {} in load balancing", self.id, peer_id);
+                continue;
+            }
+
             let load_query = Message::LoadQuery { from_node: self.id };
-            
+
             match self.send_message_to_node(*peer_id, load_query).await {
                 Ok(Some(Message::LoadResponse { node_id, load, queue_length, processed_count })) => {
-                    info!("[Node {}] Node {} load: {:.2} (queue: {}, processed: {})", 
+                    info!("[Node {}] Node {} load: {:.2} (queue: {}, processed: {})",
                           self.id, node_id, load, queue_length, processed_count);
                     node_data.insert(node_id, (load, processed_count));
                 }
                 Ok(Some(other_msg)) => {
-                    warn!("[Node {}] Unexpected response from Node {}: {:?}", 
+                    warn!("[Node {}] Unexpected response from Node {}: {:?}",
                           self.id, peer_id, other_msg);
                 }
                 Ok(None) => {
@@ -817,6 +826,8 @@ impl CloudNode {
                 }
             }
         }
+
+        drop(failed); // Release read lock
         
         // Calculate total processed requests across all nodes
         let total_processed: usize = node_data.values().map(|(_, p)| p).sum();
@@ -967,6 +978,7 @@ impl CloudNode {
     }
 
     /// Periodic failure simulation task
+    #[allow(dead_code)]
     async fn failure_simulation_task(&self) {
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::from_entropy();
@@ -1007,6 +1019,7 @@ impl CloudNode {
     }
 
     /// Recover state from coordinator
+    #[allow(dead_code)]
     async fn recover_state(&self) {
         info!("[Node {}] Recovering state from peers...", self.id);
 
@@ -1035,20 +1048,46 @@ impl CloudNode {
         // Wait a bit for other nodes to start
         sleep(Duration::from_secs(3)).await;
 
+        // Create a dedicated socket for heartbeats (reuse it instead of creating new ones)
+        let bind_addr = format!("0.0.0.0:{}", 10000 + self.id);
+        let heartbeat_socket = match UdpSocket::bind(&bind_addr).await {
+            Ok(s) => s,
+            Err(_) => {
+                // Fallback to any available port
+                match UdpSocket::bind("0.0.0.0:0").await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("[Node {}] Failed to create heartbeat socket: {}", self.id, e);
+                        return;
+                    }
+                }
+            }
+        };
+
         let mut interval = interval(Duration::from_secs(2));
 
         loop {
             interval.tick().await;
 
             // Send heartbeat to all peers
-            for (&peer_id, peer_addr) in &self.peer_addresses {
+            for (peer_id, peer_addr) in &self.peer_addresses {
                 let message = Message::Heartbeat { from_node: self.id };
 
-                // Send heartbeat (fire and forget, don't wait for response)
-                let socket_result = UdpSocket::bind("0.0.0.0:0").await;
-                if let Ok(socket) = socket_result {
-                    if let Ok(message_bytes) = serde_json::to_vec(&message) {
-                        let _ = socket.send_to(&message_bytes, peer_addr).await;
+                match serde_json::to_vec(&message) {
+                    Ok(message_bytes) => {
+                        match heartbeat_socket.send_to(&message_bytes, peer_addr).await {
+                            Ok(_) => {
+                                // Heartbeat sent successfully (silent success)
+                            }
+                            Err(e) => {
+                                // Log error but continue - temporary network issues shouldn't crash the task
+                                warn!("[Node {}] Failed to send heartbeat to Node {} ({}): {}",
+                                      self.id, peer_id, peer_addr, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("[Node {}] Failed to serialize heartbeat: {}", self.id, e);
                     }
                 }
             }
@@ -1061,7 +1100,7 @@ impl CloudNode {
         sleep(Duration::from_secs(8)).await;
 
         let mut interval = interval(Duration::from_secs(3));
-        const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(6); // No heartbeat for 6 seconds = failed
+        const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10); // Increased from 6s to 10s for more forgiveness
 
         loop {
             interval.tick().await;
@@ -1082,13 +1121,17 @@ impl CloudNode {
 
                     // Check if we've received a heartbeat from this peer
                     if let Some(&last_seen) = heartbeats.get(&peer_id) {
-                        if now.duration_since(last_seen) > HEARTBEAT_TIMEOUT {
+                        let elapsed = now.duration_since(last_seen);
+                        if elapsed > HEARTBEAT_TIMEOUT {
+                            debug!("[Node {}] Node {} missed heartbeat (last seen {:.1}s ago)",
+                                   self.id, peer_id, elapsed.as_secs_f64());
                             newly_failed_nodes.push(peer_id);
                         }
                     } else {
                         // Never received a heartbeat from this peer - may not have started yet
                         // Only mark as failed if enough time has passed since our startup
                         // (we start checking after 8 seconds, so this is reasonable)
+                        debug!("[Node {}] Node {} never sent heartbeat (may not be started)", self.id, peer_id);
                     }
                 }
             }
@@ -1122,6 +1165,7 @@ impl CloudNode {
 
     /// Periodic election task (DEPRECATED - now only used for initial election)
     /// Elections are now triggered only on coordinator failure
+    #[allow(dead_code)]
     async fn periodic_election_task(&self) {
         // Wait a bit before starting elections
         sleep(Duration::from_secs(5)).await;
@@ -1155,7 +1199,16 @@ impl CloudNode {
         all_loads.insert(self.id, current_load);
         all_processed.insert(self.id, current_processed);
 
+        // Get list of failed nodes to skip them in election
+        let failed = self.failed_nodes.read().await;
+
         for (&peer_id, _) in &self.peer_addresses {
+            // Skip failed nodes - they cannot be elected as coordinator
+            if failed.contains(&peer_id) {
+                info!("[Node {}] Skipping failed Node {} in election", self.id, peer_id);
+                continue;
+            }
+
             let message = Message::LoadQuery { from_node: self.id };
             if let Ok(Some(Message::LoadResponse { node_id, load, processed_count, .. })) =
                 self.send_message_to_node(peer_id, message).await
@@ -1164,6 +1217,8 @@ impl CloudNode {
                 all_processed.insert(node_id, processed_count);
             }
         }
+
+        drop(failed); // Release read lock
 
         // Calculate total processed and percentages
         let total_processed: usize = all_processed.values().sum();
