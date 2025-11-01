@@ -129,11 +129,27 @@ impl ChunkReassembler {
                 }
 
                 // Store this chunk
-                chunks.insert(chunk_index, data);
+                chunks.insert(chunk_index, data.clone());
+
+                debug!("Stored chunk {} for message {}, total stored: {}/{}",
+                       chunk_index, chunk_id, chunks.len(), total_chunks);
 
                 // Check if we have all chunks
                 if chunks.len() == total_chunks as usize {
                     debug!("All chunks received for message {}, reassembling", chunk_id);
+
+                    // Verify we have all indices
+                    let mut missing_indices = Vec::new();
+                    for i in 0..total_chunks {
+                        if !chunks.contains_key(&i) {
+                            missing_indices.push(i);
+                        }
+                    }
+
+                    if !missing_indices.is_empty() {
+                        warn!("Missing chunks for {}: {:?}", chunk_id, missing_indices);
+                        return None;
+                    }
 
                     // Reassemble in order
                     let mut complete_data = Vec::new();

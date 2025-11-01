@@ -1,3 +1,4 @@
+use crate::chunking::{ChunkedMessage, ChunkReassembler};
 use crate::messages::Message;
 use crate::metrics::MetricsCollector;
 use crate::encryption;
@@ -156,29 +157,63 @@ impl Client {
 
         debug!("[Client {}] Sent {} bytes to {}", client_id, message_bytes.len(), address);
 
-        // Read response with timeout
+        // Create chunk reassembler for receiving response
+        let mut reassembler = ChunkReassembler::new();
         let mut buffer = vec![0u8; 65535]; // Max UDP packet size
-        let n = match tokio::time::timeout(Duration::from_secs(10), socket.recv_from(&mut buffer)).await
-        {
-            Ok(Ok((n, _))) => n,
-            Ok(Err(e)) => {
-                return Err(format!("Receive error: {}", e));
-            }
-            Err(_) => {
-                return Err("Timeout waiting for response".to_string());
-            }
-        };
 
-        if n == 0 {
-            return Err("Empty response".to_string());
+        // Loop to receive all chunks
+        loop {
+            // Read response with timeout
+            let n = match tokio::time::timeout(Duration::from_secs(10), socket.recv_from(&mut buffer)).await
+            {
+                Ok(Ok((n, _))) => n,
+                Ok(Err(e)) => {
+                    return Err(format!("Receive error: {}", e));
+                }
+                Err(_) => {
+                    return Err("Timeout waiting for response".to_string());
+                }
+            };
+
+            if n == 0 {
+                return Err("Empty response".to_string());
+            }
+
+            // Try to parse as ChunkedMessage first
+            match serde_json::from_slice::<ChunkedMessage>(&buffer[..n]) {
+                Ok(chunked_message) => {
+                    debug!("[Client {}] Received chunk from {}", client_id, address);
+
+                    // Process chunk through reassembler
+                    if let Some(complete_data) = reassembler.process_chunk(chunked_message) {
+                        debug!("[Client {}] All chunks received, reassembled {} bytes", client_id, complete_data.len());
+
+                        // Parse complete message
+                        let response: Message = serde_json::from_slice(&complete_data)
+                            .map_err(|e| format!("Failed to parse reassembled message: {}", e))?;
+
+                        debug!("[Client {}] Received response from {}", client_id, address);
+                        return Ok(response);
+                    } else {
+                        // Need more chunks, continue loop
+                        debug!("[Client {}] Waiting for more chunks...", client_id);
+                        continue;
+                    }
+                }
+                Err(_) => {
+                    // Not a chunked message, try parsing as direct Message (for small responses)
+                    match serde_json::from_slice::<Message>(&buffer[..n]) {
+                        Ok(response) => {
+                            debug!("[Client {}] Received direct (non-chunked) response from {}", client_id, address);
+                            return Ok(response);
+                        }
+                        Err(e) => {
+                            return Err(format!("Failed to parse response: {}", e));
+                        }
+                    }
+                }
+            }
         }
-
-        // Parse response
-        let response: Message = serde_json::from_slice(&buffer[..n]).map_err(|e| e.to_string())?;
-
-        debug!("[Client {}] Received response from {}", client_id, address);
-
-        Ok(response)
     }
 
     /// Check if a username is available (not already registered)
