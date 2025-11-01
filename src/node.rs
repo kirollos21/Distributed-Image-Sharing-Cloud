@@ -7,7 +7,7 @@ use rand::Rng;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{interval, sleep};
@@ -38,6 +38,8 @@ pub struct CloudNode {
     pub chunk_reassembler: Arc<Mutex<ChunkReassembler>>, // For reassembling multi-packet messages
     pub in_flight_requests: Arc<RwLock<HashSet<String>>>, // Track active request IDs to prevent duplicates
     pub chunk_cache: Arc<RwLock<HashMap<String, Vec<ChunkedMessage>>>>, // Cache sent chunks for retransmission
+    pub last_heartbeat: Arc<RwLock<HashMap<NodeId, Instant>>>, // Track last heartbeat from each peer
+    pub failed_nodes: Arc<RwLock<HashSet<NodeId>>>, // Nodes detected as failed
 }
 
 impl CloudNode {
@@ -58,6 +60,8 @@ impl CloudNode {
             chunk_reassembler: Arc::new(Mutex::new(ChunkReassembler::new())),
             in_flight_requests: Arc::new(RwLock::new(HashSet::new())),
             chunk_cache: Arc::new(RwLock::new(HashMap::new())),
+            last_heartbeat: Arc::new(RwLock::new(HashMap::new())),
+            failed_nodes: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -75,9 +79,26 @@ impl CloudNode {
         //     self_clone.failure_simulation_task().await;
         // });
 
+        // NEW HEARTBEAT-BASED FAILURE DETECTION SYSTEM
+        // Instead of periodic elections, use heartbeat monitoring
+
+        // Perform initial election to establish first coordinator
         let self_clone = self.clone();
         tokio::spawn(async move {
-            self_clone.periodic_election_task().await;
+            sleep(Duration::from_secs(5)).await; // Wait for all nodes to start
+            self_clone.trigger_election().await;
+        });
+
+        // Start heartbeat sender (ping all peers every 2 seconds)
+        let self_clone = self.clone();
+        tokio::spawn(async move {
+            self_clone.heartbeat_sender_task().await;
+        });
+
+        // Start failure detector (check for failed nodes every 3 seconds)
+        let self_clone = self.clone();
+        tokio::spawn(async move {
+            self_clone.failure_detector_task().await;
         });
 
         // Receive incoming datagrams
@@ -287,11 +308,20 @@ impl CloudNode {
                 {
                     let mut in_flight = self.in_flight_requests.write().await;
                     if in_flight.contains(&request_id) {
-                        warn!("[Node {}] Ignoring duplicate request {} (already in flight)", self.id, request_id);
-                        return None; // Silently ignore duplicate
+                        if !forwarded {
+                            // Only ignore non-forwarded duplicates
+                            // Forwarded requests from coordinator MUST be processed even if duplicate
+                            warn!("[Node {}] Ignoring duplicate request {} (already in flight)", self.id, request_id);
+                            return None;
+                        } else {
+                            // Coordinator has selected us to process this - override duplicate detection
+                            info!("[Node {}] Processing coordinator-forwarded request {} despite duplicate (coordinator override)",
+                                  self.id, request_id);
+                        }
+                    } else {
+                        // Mark request as in-flight
+                        in_flight.insert(request_id.clone());
                     }
-                    // Mark request as in-flight
-                    in_flight.insert(request_id.clone());
                 }
 
                 // Process request and ensure cleanup happens regardless of outcome
@@ -495,15 +525,47 @@ impl CloudNode {
             Message::CoordinatorQuery => {
                 let manager = self.election_manager.lock().await;
                 let coordinator_id = manager.get_coordinator().unwrap_or(self.id);
-                
+
                 // Map coordinator ID to address
                 let coordinator_address = self.peer_addresses.get(&coordinator_id)
                     .map(|addr| addr.to_string())
                     .unwrap_or_else(|| self.address.to_string());
-                
+
                 Some(Message::CoordinatorQueryResponse {
                     coordinator_address,
                 })
+            }
+
+            Message::Heartbeat { from_node } => {
+                // Record that we received a heartbeat from this node
+                {
+                    let mut heartbeats = self.last_heartbeat.write().await;
+                    heartbeats.insert(from_node, Instant::now());
+
+                    // If this node was marked as failed, remove it from failed set
+                    let mut failed = self.failed_nodes.write().await;
+                    if failed.remove(&from_node) {
+                        info!("[Node {}] Node {} recovered (heartbeat received)", self.id, from_node);
+                    }
+                }
+
+                // Send acknowledgment
+                Some(Message::HeartbeatAck { from_node: self.id })
+            }
+
+            Message::HeartbeatAck { from_node } => {
+                // Update last heartbeat time for this node
+                {
+                    let mut heartbeats = self.last_heartbeat.write().await;
+                    heartbeats.insert(from_node, Instant::now());
+
+                    // If this node was marked as failed, remove it from failed set
+                    let mut failed = self.failed_nodes.write().await;
+                    if failed.remove(&from_node) {
+                        info!("[Node {}] Node {} recovered (heartbeat ack)", self.id, from_node);
+                    }
+                }
+                None // No response needed
             }
 
             Message::SendImage {
@@ -968,12 +1030,104 @@ impl CloudNode {
         sleep(Duration::from_millis(500)).await;
     }
 
-    /// Periodic election task
+    /// Heartbeat sender task - sends heartbeat to all peers every 2 seconds
+    async fn heartbeat_sender_task(&self) {
+        // Wait a bit for other nodes to start
+        sleep(Duration::from_secs(3)).await;
+
+        let mut interval = interval(Duration::from_secs(2));
+
+        loop {
+            interval.tick().await;
+
+            // Send heartbeat to all peers
+            for (&peer_id, peer_addr) in &self.peer_addresses {
+                let message = Message::Heartbeat { from_node: self.id };
+
+                // Send heartbeat (fire and forget, don't wait for response)
+                let socket_result = UdpSocket::bind("0.0.0.0:0").await;
+                if let Ok(socket) = socket_result {
+                    if let Ok(message_bytes) = serde_json::to_vec(&message) {
+                        let _ = socket.send_to(&message_bytes, peer_addr).await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Failure detector task - checks for failed nodes every 3 seconds
+    async fn failure_detector_task(&self) {
+        // Wait a bit for heartbeats to start flowing
+        sleep(Duration::from_secs(8)).await;
+
+        let mut interval = interval(Duration::from_secs(3));
+        const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(6); // No heartbeat for 6 seconds = failed
+
+        loop {
+            interval.tick().await;
+
+            let now = Instant::now();
+            let mut newly_failed_nodes = Vec::new();
+
+            // Check all peers for heartbeat timeout
+            {
+                let heartbeats = self.last_heartbeat.read().await;
+                let failed = self.failed_nodes.read().await;
+
+                for (&peer_id, _) in &self.peer_addresses {
+                    // Skip if already marked as failed
+                    if failed.contains(&peer_id) {
+                        continue;
+                    }
+
+                    // Check if we've received a heartbeat from this peer
+                    if let Some(&last_seen) = heartbeats.get(&peer_id) {
+                        if now.duration_since(last_seen) > HEARTBEAT_TIMEOUT {
+                            newly_failed_nodes.push(peer_id);
+                        }
+                    } else {
+                        // Never received a heartbeat from this peer - may not have started yet
+                        // Only mark as failed if enough time has passed since our startup
+                        // (we start checking after 8 seconds, so this is reasonable)
+                    }
+                }
+            }
+
+            // Handle newly detected failures
+            if !newly_failed_nodes.is_empty() {
+                let mut failed = self.failed_nodes.write().await;
+
+                for failed_node in newly_failed_nodes {
+                    failed.insert(failed_node);
+                    warn!("[Node {}] FAILURE DETECTED: Node {} is not responding", self.id, failed_node);
+
+                    // Check if the failed node is the coordinator
+                    let manager = self.election_manager.lock().await;
+                    let coordinator_id = manager.get_coordinator();
+                    drop(manager);
+
+                    if coordinator_id == Some(failed_node) {
+                        // COORDINATOR FAILED - trigger election!
+                        error!("[Node {}] COORDINATOR Node {} has FAILED! Triggering election...", self.id, failed_node);
+                        drop(failed); // Release lock before triggering election
+                        self.trigger_election().await;
+                        break; // Exit loop to avoid multiple elections
+                    }
+                    // If non-coordinator node failed, just log it
+                    // The coordinator will notice when it tries to load balance to this node
+                }
+            }
+        }
+    }
+
+    /// Periodic election task (DEPRECATED - now only used for initial election)
+    /// Elections are now triggered only on coordinator failure
     async fn periodic_election_task(&self) {
         // Wait a bit before starting elections
         sleep(Duration::from_secs(5)).await;
 
-        let mut interval = interval(Duration::from_secs(15));
+        // Increased from 15s to 60s to reduce coordinator churn
+        let mut interval = interval(Duration::from_secs(60));
 
         loop {
             interval.tick().await;
@@ -1018,9 +1172,9 @@ impl CloudNode {
         if let Some((&lowest_node, &lowest_load)) =
             all_loads.iter().min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
         {
-            let result = ElectionResult::new(lowest_node, lowest_load, all_loads);
+            let result = ElectionResult::new(lowest_node, lowest_load, all_loads.clone());
             result.log_result();
-            
+
             // Log work distribution percentages
             if total_processed > 0 {
                 info!("=== WORK DISTRIBUTION ===");
@@ -1034,19 +1188,49 @@ impl CloudNode {
                 info!("=========================");
             }
 
-            if lowest_node == self.id {
-                // This node should be coordinator
-                let send_fn = |node: NodeId, msg: Message| {
-                    let self_clone = self.clone();
-                    tokio::spawn(async move {
-                        let _ = self_clone.send_message_to_node(node, msg).await;
-                    });
+            // Add hysteresis: only change coordinator if load difference is significant
+            // This prevents rapid coordinator changes due to minor load fluctuations
+            let current_coordinator = manager.get_coordinator();
+            let should_change = if let Some(current_coord) = current_coordinator {
+                if current_coord == lowest_node {
+                    // Already the right coordinator
+                    false
+                } else if let Some(&current_coord_load) = all_loads.get(&current_coord) {
+                    // Only change if the new coordinator has significantly lower load (>20% difference)
+                    let load_diff_ratio = (current_coord_load - lowest_load) / current_coord_load.max(0.01);
+                    if load_diff_ratio > 0.20 {
+                        info!("[Node {}] Coordinator change justified: current load {:.2}, new load {:.2} ({:.1}% improvement)",
+                              self.id, current_coord_load, lowest_load, load_diff_ratio * 100.0);
+                        true
+                    } else {
+                        info!("[Node {}] Skipping coordinator change: load difference {:.1}% is below 20% threshold",
+                              self.id, load_diff_ratio * 100.0);
+                        false
+                    }
+                } else {
+                    // Current coordinator not in load list (may have failed), change
                     true
-                };
-                manager.announce_coordinator(current_load, send_fn);
+                }
             } else {
-                // Update coordinator
-                manager.update_coordinator(lowest_node, lowest_load);
+                // No coordinator yet, elect one
+                true
+            };
+
+            if should_change {
+                if lowest_node == self.id {
+                    // This node should be coordinator
+                    let send_fn = |node: NodeId, msg: Message| {
+                        let self_clone = self.clone();
+                        tokio::spawn(async move {
+                            let _ = self_clone.send_message_to_node(node, msg).await;
+                        });
+                        true
+                    };
+                    manager.announce_coordinator(current_load, send_fn);
+                } else {
+                    // Update coordinator
+                    manager.update_coordinator(lowest_node, lowest_load);
+                }
             }
         }
     }
@@ -1080,6 +1264,8 @@ impl Clone for CloudNode {
             chunk_reassembler: Arc::clone(&self.chunk_reassembler),
             in_flight_requests: Arc::clone(&self.in_flight_requests),
             chunk_cache: Arc::clone(&self.chunk_cache),
+            last_heartbeat: Arc::clone(&self.last_heartbeat),
+            failed_nodes: Arc::clone(&self.failed_nodes),
         }
     }
 }
