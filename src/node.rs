@@ -225,12 +225,12 @@ impl CloudNode {
                     let chunk_bytes = serde_json::to_vec(&chunk)?;
                     socket.send_to(&chunk_bytes, addr).await?;
 
-                    // Delay between chunks to prevent overwhelming receiver's socket buffer
-                    // 15ms delay to eliminate packet loss (2/229 lost with 10ms, testing 15ms)
-                    // Only delay if not the last chunk
-                    if i < chunks.len() - 1 {
-                        tokio::time::sleep(Duration::from_millis(15)).await;
-                    }
+                        // Delay between chunks to prevent overwhelming receiver's socket buffer
+                        // Reduced to 5ms to improve throughput while relying on retransmission for reliability
+                        // Only delay if not the last chunk
+                        if i < chunks.len() - 1 {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
                 }
 
                 debug!("[Node {}] Sent {} chunks to {}", self.id, chunks.len(), addr);
@@ -659,12 +659,13 @@ impl CloudNode {
             self.id, request_id
         );
 
-        // Update load (based on queue length)
+        // Update load (based on queue length + number of in-flight requests)
         {
             let queue = *self.queue_length.read().await;
+            let in_flight_count = { self.in_flight_requests.read().await.len() };
             let mut load = self.current_load.write().await;
-            // Load is queue length directly: reflects actual workload
-            *load = queue as f64;
+            // Load is queue length plus active in-flight requests to better reflect real concurrency
+            *load = queue as f64 + in_flight_count as f64;
         }
 
         // Perform encryption

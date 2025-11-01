@@ -354,28 +354,15 @@ class TestWorker:
                         with open(enc_path, 'wb') as f:
                             f.write(result['encrypted_data'])
 
-                    # Immediately decrypt the image
-                    print(f"[Process {self.process_id}] Decrypting image {img_id}...")
-                    decrypt_result = self.decrypt_image(result['encrypted_data'], img_id, server)
+                    # Save encrypted image (decryption will be performed in batch later)
+                    if self.config['output_config']['save_encrypted_images']:
+                        enc_path = encrypted_dir / f"encrypted_{self.process_id}_{img_id}.png"
+                        with open(enc_path, 'wb') as f:
+                            f.write(result['encrypted_data'])
 
-                    if decrypt_result['success']:
-                        print(f"[Process {self.process_id}] ✓ Image {img_id} decrypted successfully ({decrypt_result['latency']:.2f}s)")
-
-                        # Save decrypted image
-                        if self.config['output_config']['save_decrypted_images']:
-                            dec_path = Path(self.config['output_config']['decrypted_dir']) / f"decrypted_{self.process_id}_{img_id}.jpg"
-                            with open(dec_path, 'wb') as f:
-                                f.write(decrypt_result['decrypted_data'])
-
-                        # Add decryption metrics to result
-                        result['decryption_success'] = True
-                        result['decryption_latency'] = decrypt_result['latency']
-                        result['decrypted_size'] = len(decrypt_result['decrypted_data'])
-                    else:
-                        print(f"[Process {self.process_id}] ✗ Image {img_id} decryption failed: {decrypt_result['error']}")
-                        result['decryption_success'] = False
-                        result['decryption_error'] = decrypt_result['error']
-                        result['decryption_latency'] = decrypt_result['latency']
+                    # Do not decrypt immediately here to avoid duplicate decryption
+                    # Decryption will be handled by the post-test step `decrypt_all.py`
+                    result['decryption_scheduled'] = True
 
                     break
                 else:
