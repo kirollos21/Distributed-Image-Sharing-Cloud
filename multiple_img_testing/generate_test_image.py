@@ -8,16 +8,19 @@ from PIL import Image, ImageDraw, ImageFont
 import random
 import hashlib
 
-def generate_test_image(process_id, image_id, width=1280, height=720, quality=85):
+def generate_test_image(process_id, image_id, width=1280, height=720, quality=85, random_size=False, max_width=600, max_height=600):
     """
     Generate a unique test image with identifiable patterns
 
     Args:
         process_id: Process number (1-based)
         image_id: Image number within process (1-based)
-        width: Image width
-        height: Image height
+        width: Image width (default or max if random_size=True)
+        height: Image height (default or max if random_size=True)
         quality: JPEG quality
+        random_size: If True, generate random dimensions
+        max_width: Maximum width when random_size=True
+        max_height: Maximum height when random_size=True
 
     Returns:
         bytes: JPEG image data
@@ -26,6 +29,13 @@ def generate_test_image(process_id, image_id, width=1280, height=720, quality=85
     # Create unique seed based on IDs
     seed = f"{process_id}_{image_id}"
     random.seed(hashlib.md5(seed.encode()).hexdigest())
+
+    # Generate random dimensions if requested
+    if random_size:
+        # Minimum size to ensure patterns are visible
+        min_width, min_height = 300, 300
+        width = random.randint(min_width, max_width)
+        height = random.randint(min_height, max_height)
 
     # Create image with unique background gradient
     img = Image.new('RGB', (width, height))
@@ -115,11 +125,11 @@ def generate_test_image(process_id, image_id, width=1280, height=720, quality=85
     return output.getvalue()
 
 
-def save_test_image(process_id, image_id, output_path, width=1280, height=720, quality=85):
+def save_test_image(process_id, image_id, output_path, width=1280, height=720, quality=85, random_size=False, max_width=600, max_height=600):
     """
     Generate and save a test image to file
     """
-    image_data = generate_test_image(process_id, image_id, width, height, quality)
+    image_data = generate_test_image(process_id, image_id, width, height, quality, random_size, max_width, max_height)
 
     with open(output_path, 'wb') as f:
         f.write(image_data)

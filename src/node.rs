@@ -958,6 +958,7 @@ impl Clone for CloudNode {
             active_sessions: Arc::clone(&self.active_sessions),
             stored_images: Arc::clone(&self.stored_images),
             chunk_reassembler: Arc::clone(&self.chunk_reassembler),
+            in_flight_requests: Arc::clone(&self.in_flight_requests),
         }
     }
 }

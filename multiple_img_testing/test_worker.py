@@ -170,6 +170,80 @@ class TestWorker:
         finally:
             sock.close()
 
+    def decrypt_image(self, encrypted_data, image_id, server_address):
+        """Send encrypted image to server and get decrypted version"""
+        request_id = f"P{self.process_id:02d}_I{image_id:03d}_DEC_{int(time.time())}"
+
+        message = {
+            "DecryptionRequest": {
+                "request_id": request_id,
+                "client_username": f"worker_{self.process_id}",
+                "encrypted_image": list(encrypted_data),
+                "usernames": self.config['encryption_config']['usernames'],
+                "quota": self.config['encryption_config']['quota']
+            }
+        }
+
+        message_bytes = json.dumps(message).encode('utf-8')
+        chunks = fragment_message(message_bytes)
+
+        host, port = server_address.split(':')
+        port = int(port)
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        start_time = time.time()
+
+        try:
+            # Send all chunks
+            for chunk in chunks:
+                chunk_bytes = json.dumps(chunk).encode('utf-8')
+                sock.sendto(chunk_bytes, (host, port))
+
+            # Receive response
+            response_data = reassemble_chunks(sock, timeout=self.timeout)
+            elapsed = time.time() - start_time
+
+            response = json.loads(response_data.decode('utf-8'))
+
+            if response.get('DecryptionResponse', {}).get('success'):
+                decrypted_data = bytes(response['DecryptionResponse']['decrypted_image'])
+                return {
+                    'success': True,
+                    'decrypted_data': decrypted_data,
+                    'latency': elapsed,
+                    'server': server_address,
+                    'request_id': request_id
+                }
+            else:
+                error = response.get('DecryptionResponse', {}).get('error', 'Unknown')
+                return {
+                    'success': False,
+                    'error': error,
+                    'latency': elapsed,
+                    'server': server_address,
+                    'request_id': request_id
+                }
+
+        except socket.timeout:
+            return {
+                'success': False,
+                'error': 'Timeout',
+                'latency': time.time() - start_time,
+                'server': server_address,
+                'request_id': request_id
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e),
+                'latency': time.time() - start_time,
+                'server': server_address,
+                'request_id': request_id
+            }
+        finally:
+            sock.close()
+
     def run(self):
         """Run the worker process"""
         print(f"[Process {self.process_id}] Starting...")
@@ -188,9 +262,18 @@ class TestWorker:
         for img_id in range(1, images_per_process + 1):
             img_start = time.time()
 
-            # Generate unique test image
+            # Generate unique test image with random dimensions (300x300 to 600x600)
             print(f"[Process {self.process_id}] Generating image {img_id}/{images_per_process}...")
-            image_data = generate_test_image(self.process_id, img_id, width, height, quality)
+            image_data = generate_test_image(
+                self.process_id,
+                img_id,
+                width,
+                height,
+                quality,
+                random_size=True,
+                max_width=600,
+                max_height=600
+            )
 
             # Save test image if configured
             if self.config['output_config']['save_test_images']:
@@ -217,6 +300,29 @@ class TestWorker:
                         with open(enc_path, 'wb') as f:
                             f.write(result['encrypted_data'])
 
+                    # Immediately decrypt the image
+                    print(f"[Process {self.process_id}] Decrypting image {img_id}...")
+                    decrypt_result = self.decrypt_image(result['encrypted_data'], img_id, server)
+
+                    if decrypt_result['success']:
+                        print(f"[Process {self.process_id}] ✓ Image {img_id} decrypted successfully ({decrypt_result['latency']:.2f}s)")
+
+                        # Save decrypted image
+                        if self.config['output_config']['save_decrypted_images']:
+                            dec_path = Path(self.config['output_config']['decrypted_dir']) / f"decrypted_{self.process_id}_{img_id}.jpg"
+                            with open(dec_path, 'wb') as f:
+                                f.write(decrypt_result['decrypted_data'])
+
+                        # Add decryption metrics to result
+                        result['decryption_success'] = True
+                        result['decryption_latency'] = decrypt_result['latency']
+                        result['decrypted_size'] = len(decrypt_result['decrypted_data'])
+                    else:
+                        print(f"[Process {self.process_id}] ✗ Image {img_id} decryption failed: {decrypt_result['error']}")
+                        result['decryption_success'] = False
+                        result['decryption_error'] = decrypt_result['error']
+                        result['decryption_latency'] = decrypt_result['latency']
+
                     break
                 else:
                     print(f"[Process {self.process_id}] ✗ Image {img_id} failed: {result['error']}")
@@ -235,19 +341,25 @@ class TestWorker:
         # Calculate process statistics
         successes = sum(1 for r in self.results if r['success'])
         failures = len(self.results) - successes
+        decryption_successes = sum(1 for r in self.results if r.get('decryption_success', False))
+        decryption_failures = successes - decryption_successes  # Only count if encryption succeeded
 
         print(f"\n[Process {self.process_id}] COMPLETE")
         print(f"  Total time: {process_elapsed:.2f}s")
-        print(f"  Success: {successes}/{images_per_process}")
-        print(f"  Failure: {failures}/{images_per_process}")
-        print(f"  Success rate: {(successes/images_per_process*100):.1f}%")
+        print(f"  Encryption success: {successes}/{images_per_process}")
+        print(f"  Encryption failure: {failures}/{images_per_process}")
+        print(f"  Decryption success: {decryption_successes}/{successes}")
+        print(f"  Decryption failure: {decryption_failures}/{successes}")
+        print(f"  Overall success rate: {(decryption_successes/images_per_process*100):.1f}%")
 
         return {
             'process_id': self.process_id,
             'results': self.results,
             'total_time': process_elapsed,
             'success_count': successes,
-            'failure_count': failures
+            'failure_count': failures,
+            'decryption_success_count': decryption_successes,
+            'decryption_failure_count': decryption_failures
         }
 
 

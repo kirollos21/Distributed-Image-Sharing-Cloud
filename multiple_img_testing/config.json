@@ -3,8 +3,8 @@
     "num_processes": 5,
     "images_per_process": 5,
     "total_images": 25,
-    "image_width": 1280,
-    "image_height": 720,
+    "image_width": 600,
+    "image_height": 600,
     "image_format": "JPEG",
     "image_quality": 85
   },
