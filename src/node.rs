@@ -1009,7 +1009,8 @@ impl CloudNode {
         // Wait a bit before starting elections
         sleep(Duration::from_secs(5)).await;
 
-        let mut interval = interval(Duration::from_secs(15));
+        // Increased from 15s to 60s to reduce coordinator churn
+        let mut interval = interval(Duration::from_secs(60));
 
         loop {
             interval.tick().await;
@@ -1054,9 +1055,9 @@ impl CloudNode {
         if let Some((&lowest_node, &lowest_load)) =
             all_loads.iter().min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
         {
-            let result = ElectionResult::new(lowest_node, lowest_load, all_loads);
+            let result = ElectionResult::new(lowest_node, lowest_load, all_loads.clone());
             result.log_result();
-            
+
             // Log work distribution percentages
             if total_processed > 0 {
                 info!("=== WORK DISTRIBUTION ===");
@@ -1070,19 +1071,49 @@ impl CloudNode {
                 info!("=========================");
             }
 
-            if lowest_node == self.id {
-                // This node should be coordinator
-                let send_fn = |node: NodeId, msg: Message| {
-                    let self_clone = self.clone();
-                    tokio::spawn(async move {
-                        let _ = self_clone.send_message_to_node(node, msg).await;
-                    });
+            // Add hysteresis: only change coordinator if load difference is significant
+            // This prevents rapid coordinator changes due to minor load fluctuations
+            let current_coordinator = manager.get_coordinator();
+            let should_change = if let Some(current_coord) = current_coordinator {
+                if current_coord == lowest_node {
+                    // Already the right coordinator
+                    false
+                } else if let Some(&current_coord_load) = all_loads.get(&current_coord) {
+                    // Only change if the new coordinator has significantly lower load (>20% difference)
+                    let load_diff_ratio = (current_coord_load - lowest_load) / current_coord_load.max(0.01);
+                    if load_diff_ratio > 0.20 {
+                        info!("[Node {}] Coordinator change justified: current load {:.2}, new load {:.2} ({:.1}% improvement)",
+                              self.id, current_coord_load, lowest_load, load_diff_ratio * 100.0);
+                        true
+                    } else {
+                        info!("[Node {}] Skipping coordinator change: load difference {:.1}% is below 20% threshold",
+                              self.id, load_diff_ratio * 100.0);
+                        false
+                    }
+                } else {
+                    // Current coordinator not in load list (may have failed), change
                     true
-                };
-                manager.announce_coordinator(current_load, send_fn);
+                }
             } else {
-                // Update coordinator
-                manager.update_coordinator(lowest_node, lowest_load);
+                // No coordinator yet, elect one
+                true
+            };
+
+            if should_change {
+                if lowest_node == self.id {
+                    // This node should be coordinator
+                    let send_fn = |node: NodeId, msg: Message| {
+                        let self_clone = self.clone();
+                        tokio::spawn(async move {
+                            let _ = self_clone.send_message_to_node(node, msg).await;
+                        });
+                        true
+                    };
+                    manager.announce_coordinator(current_load, send_fn);
+                } else {
+                    // Update coordinator
+                    manager.update_coordinator(lowest_node, lowest_load);
+                }
             }
         }
     }
