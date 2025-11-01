@@ -65,7 +65,7 @@ def calculate_seed(metadata):
 def unscramble_pixels(pixels, seed, width, height):
     """Unscramble pixels using reverse Fisher-Yates shuffle"""
     pixels = bytearray(pixels)
-    num_pixels = len(pixels) // 4  # RGBA pixels
+    num_pixels = len(pixels) // 3  # RGB pixels (3 bytes per pixel)
 
     # Generate same sequence of swaps as encryption
     swap_indices = []
@@ -83,11 +83,11 @@ def unscramble_pixels(pixels, seed, width, height):
 
     # Apply swaps in REVERSE order to unscramble
     for i, j in reversed(swap_indices):
-        idx_i = i * 4
-        idx_j = j * 4
+        idx_i = i * 3
+        idx_j = j * 3
 
-        # Swap RGBA pixels (4 bytes each)
-        for k in range(4):
+        # Swap RGB pixels (3 bytes each)
+        for k in range(3):
             pixels[idx_i + k], pixels[idx_j + k] = pixels[idx_j + k], pixels[idx_i + k]
 
     return bytes(pixels)
@@ -103,9 +103,9 @@ def decrypt_image(encrypted_image_path):
         img = Image.open(io.BytesIO(encrypted_data))
         width, height = img.size
 
-        # Convert to RGBA
-        rgba_img = img.convert('RGBA')
-        pixels = rgba_img.tobytes()
+        # Convert to RGB (not RGBA - 3 bytes per pixel)
+        rgb_img = img.convert('RGB')
+        pixels = rgb_img.tobytes()
 
         # Extract metadata
         metadata = extract_metadata(pixels)
@@ -116,8 +116,8 @@ def decrypt_image(encrypted_image_path):
         # Unscramble pixels
         unscrambled_pixels = unscramble_pixels(pixels, seed, width, height)
 
-        # Create decrypted image
-        decrypted_img = Image.frombytes('RGBA', (width, height), unscrambled_pixels)
+        # Create decrypted image (RGB format)
+        decrypted_img = Image.frombytes('RGB', (width, height), unscrambled_pixels)
 
         return {
             'success': True,

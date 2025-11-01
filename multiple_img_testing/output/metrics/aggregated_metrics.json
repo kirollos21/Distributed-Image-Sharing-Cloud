@@ -1,0 +1,104 @@
+{
+  "test_config": {
+    "num_processes": 2,
+    "images_per_process": 2,
+    "total_images": 4,
+    "image_width": 1280,
+    "image_height": 720,
+    "image_format": "JPEG",
+    "image_quality": 85
+  },
+  "overall": {
+    "total_images": 4,
+    "successful": 3,
+    "failed": 1,
+    "success_rate": 75.0,
+    "failure_rate": 25.0,
+    "total_time": 33.84418964385986,
+    "throughput": 0.11818867705481301
+  },
+  "latency": {
+    "average": 6.151595115661621,
+    "median": 7.655092000961304,
+    "p95": 8.181678056716919,
+    "p99": 8.181678056716919,
+    "min": 2.6180152893066406,
+    "max": 8.181678056716919,
+    "all_latencies": [
+      2.6180152893066406,
+      7.655092000961304,
+      8.181678056716919
+    ]
+  },
+  "per_server": {
+    "10.40.59.43:8001": {
+      "success": 0,
+      "failure": 0,
+      "total_requests": 0,
+      "success_rate": 0,
+      "avg_latency": 0
+    },
+    "10.40.44.230:8002": {
+      "success": 3,
+      "failure": 1,
+      "total_requests": 4,
+      "success_rate": 75.0,
+      "avg_latency": 6.151595115661621
+    }
+  },
+  "all_results": [
+    {
+      "success": false,
+      "error": "Timeout",
+      "latency": 5.005643129348755,
+      "server": "10.40.44.230:8002",
+      "request_id": "P01_I001_1762018533",
+      "process_id": 1,
+      "image_id": 1,
+      "image_size": 15096,
+      "total_time": 17.04053282737732
+    },
+    {
+      "success": true,
+      "latency": 7.655092000961304,
+      "server": "10.40.44.230:8002",
+      "request_id": "P01_I002_1762018538",
+      "decryption_success": false,
+      "decryption_error": "Timeout",
+      "decryption_latency": 5.366696834564209,
+      "process_id": 1,
+      "image_id": 2,
+      "image_size": 15651,
+      "total_time": 13.152761459350586,
+      "encrypted_size": 691598
+    },
+    {
+      "success": true,
+      "latency": 2.6180152893066406,
+      "server": "10.40.44.230:8002",
+      "request_id": "P02_I001_1762018533",
+      "decryption_success": false,
+      "decryption_error": "Timeout",
+      "decryption_latency": 5.247119903564453,
+      "process_id": 2,
+      "image_id": 1,
+      "image_size": 16529,
+      "total_time": 20.014724016189575,
+      "encrypted_size": 657502
+    },
+    {
+      "success": true,
+      "latency": 8.181678056716919,
+      "server": "10.40.44.230:8002",
+      "request_id": "P02_I002_1762018541",
+      "decryption_success": false,
+      "decryption_error": "Timeout",
+      "decryption_latency": 5.459446668624878,
+      "process_id": 2,
+      "image_id": 2,
+      "image_size": 19593,
+      "total_time": 13.797762870788574,
+      "encrypted_size": 901073
+    }
+  ]
+}

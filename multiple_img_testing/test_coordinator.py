@@ -173,6 +173,30 @@ def main():
         print(f"    Failure: {stats['failure']}")
         print(f"    Avg latency: {avg_server_latency:.3f}s")
 
+    # Clean results for JSON serialization (remove bytes objects)
+    cleaned_results = []
+    for result in all_results:
+        cleaned = {k: v for k, v in result.items() 
+                   if k not in ['encrypted_data', 'decrypted_data']}
+        # Add size information instead of actual bytes
+        if 'encrypted_data' in result:
+            cleaned['encrypted_size'] = len(result['encrypted_data'])
+        if 'decrypted_data' in result:
+            cleaned['decrypted_size'] = len(result['decrypted_data'])
+        cleaned_results.append(cleaned)
+
+    # Clean server stats (remove latency lists for cleaner JSON)
+    cleaned_server_stats = {}
+    for server, stats in server_stats.items():
+        avg_server_latency = (sum(stats['latency']) / len(stats['latency'])) if stats['latency'] else 0
+        cleaned_server_stats[server] = {
+            'success': stats['success'],
+            'failure': stats['failure'],
+            'total_requests': stats['success'] + stats['failure'],
+            'success_rate': (stats['success'] / (stats['success'] + stats['failure']) * 100) if (stats['success'] + stats['failure']) > 0 else 0,
+            'avg_latency': avg_server_latency
+        }
+
     # Save aggregated metrics
     metrics = {
         'test_config': config['test_config'],
@@ -194,8 +218,8 @@ def main():
             'max': max_latency,
             'all_latencies': latencies
         },
-        'per_server': server_stats,
-        'all_results': all_results
+        'per_server': cleaned_server_stats,
+        'all_results': cleaned_results
     }
 
     metrics_file = Path(config['output_config']['metrics_dir']) / "aggregated_metrics.json"

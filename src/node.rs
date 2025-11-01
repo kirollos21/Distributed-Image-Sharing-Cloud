@@ -310,10 +310,14 @@ impl CloudNode {
                         .process_encryption_request(request_id.clone(), image_data, usernames, quota)
                         .await;
 
-                    // Decrement queue length
+                    // Decrement queue length and update load
                     {
                         let mut queue = self.queue_length.write().await;
                         *queue = queue.saturating_sub(1);
+                        
+                        // Update load to reflect new queue size
+                        let mut load = self.current_load.write().await;
+                        *load = *queue as f64;
                     }
 
                     Some(result)
@@ -390,10 +394,14 @@ impl CloudNode {
                                 .process_encryption_request(request_id.clone(), image_data, usernames, quota)
                                 .await;
 
-                            // Decrement queue length
+                            // Decrement queue length and update load
                             {
                                 let mut queue = self.queue_length.write().await;
                                 *queue = queue.saturating_sub(1);
+                                
+                                // Update load to reflect new queue size
+                                let mut load = self.current_load.write().await;
+                                *load = *queue as f64;
                             }
 
                             Some(result)
