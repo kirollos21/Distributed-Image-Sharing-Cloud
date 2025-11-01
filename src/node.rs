@@ -323,11 +323,20 @@ impl CloudNode {
                 {
                     let mut in_flight = self.in_flight_requests.write().await;
                     if in_flight.contains(&request_id) {
-                        warn!("[Node {}] Ignoring duplicate request {} (already in flight)", self.id, request_id);
-                        return None; // Silently ignore duplicate
+                        if !forwarded {
+                            // Only ignore non-forwarded duplicates
+                            // Forwarded requests from coordinator MUST be processed even if duplicate
+                            warn!("[Node {}] Ignoring duplicate request {} (already in flight)", self.id, request_id);
+                            return None;
+                        } else {
+                            // Coordinator has selected us to process this - override duplicate detection
+                            info!("[Node {}] Processing coordinator-forwarded request {} despite duplicate (coordinator override)",
+                                  self.id, request_id);
+                        }
+                    } else {
+                        // Mark request as in-flight
+                        in_flight.insert(request_id.clone());
                     }
-                    // Mark request as in-flight
-                    in_flight.insert(request_id.clone());
                 }
 
                 // Process request and ensure cleanup happens regardless of outcome
