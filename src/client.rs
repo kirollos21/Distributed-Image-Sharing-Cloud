@@ -97,6 +97,7 @@ impl Client {
             usernames,
             quota,
             forwarded: false,
+            client_address: None, // Will be captured by first node that receives it
         };
 
         debug!("[Client {}] Multicasting request: {}", self.id, request_id);

@@ -43,6 +43,7 @@ pub enum Message {
         usernames: Vec<String>,
         quota: u32,
         forwarded: bool, // Prevent infinite forwarding loops
+        client_address: Option<String>, // Original client address for direct response
     },
     DecryptionRequest {
         request_id: String,

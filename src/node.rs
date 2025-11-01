@@ -211,7 +211,7 @@ impl CloudNode {
         debug!("[Node {}] Received from {}: {}", self.id, addr, message);
 
         // Process message based on type
-        let response = self.process_message(message).await;
+        let response = self.process_message(message, addr).await;
 
         // Send response if any
         if let Some(response) = response {
@@ -265,8 +265,52 @@ impl CloudNode {
         Ok(())
     }
 
+    /// Send response directly to client (bypassing coordinator)
+    async fn send_response_to_client(
+        &self,
+        client_addr: SocketAddr,
+        response: Message,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Create a temporary socket for sending (or reuse a dedicated socket)
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+
+        let response_bytes = serde_json::to_vec(&response)?;
+
+        // Check if response needs chunking (large responses with image data)
+        let needs_chunking = matches!(
+            response,
+            Message::EncryptionResponse { .. } |
+            Message::DecryptionResponse { .. } |
+            Message::ViewImageResponse { .. }
+        );
+
+        if needs_chunking {
+            // Fragment response for client
+            let chunks = ChunkedMessage::fragment(response_bytes);
+
+            info!("[Node {}] Sending {} chunks directly to client {}",
+                  self.id, chunks.len(), client_addr);
+
+            // Send all chunks with delay to prevent UDP packet loss
+            for (i, chunk) in chunks.iter().enumerate() {
+                let chunk_bytes = serde_json::to_vec(&chunk)?;
+                socket.send_to(&chunk_bytes, client_addr).await?;
+
+                // Delay between chunks to prevent overwhelming receiver's socket buffer
+                if i < chunks.len() - 1 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        } else {
+            // Small response - send directly
+            socket.send_to(&response_bytes, client_addr).await?;
+        }
+
+        Ok(())
+    }
+
     /// Process incoming message
-    async fn process_message(&self, message: Message) -> Option<Message> {
+    async fn process_message(&self, message: Message, addr: SocketAddr) -> Option<Message> {
         match message {
             Message::SessionRegister { client_id, username } => {
                 let mut sessions = self.active_sessions.write().await;
@@ -303,6 +347,7 @@ impl CloudNode {
                 usernames,
                 quota,
                 forwarded,
+                client_address,
             } => {
                 // Check if this request is already being processed (deduplication)
                 {
@@ -335,7 +380,38 @@ impl CloudNode {
                         .process_encryption_request(request_id.clone(), image_data, usernames, quota)
                         .await;
 
-                    Some(result)
+                    // If we have a client_address, send response directly to client
+                    if let Some(ref client_addr_str) = client_address {
+                        info!("[Node {}] Sending response for {} directly to client at {}",
+                              self.id, request_id, client_addr_str);
+
+                        // Parse client address and send response directly
+                        match client_addr_str.parse::<SocketAddr>() {
+                            Ok(client_sock_addr) => {
+                                // Send response directly to client
+                                if let Err(e) = self_clone.send_response_to_client(client_sock_addr, result.clone()).await {
+                                    error!("[Node {}] Failed to send direct response to client {}: {}",
+                                           self.id, client_addr_str, e);
+                                    // Still return response to coordinator as fallback
+                                    Some(result)
+                                } else {
+                                    info!("[Node {}] Successfully sent response for {} directly to client",
+                                          self.id, request_id);
+                                    // Return None - no need to send back through coordinator
+                                    None
+                                }
+                            }
+                            Err(e) => {
+                                error!("[Node {}] Failed to parse client address '{}': {}",
+                                       self.id, client_addr_str, e);
+                                // Fall back to normal response flow
+                                Some(result)
+                            }
+                        }
+                    } else {
+                        // No client address - return response normally
+                        Some(result)
+                    }
                 } else {
                     // Get current coordinator (may change due to elections)
                     let manager = self.election_manager.lock().await;
@@ -347,6 +423,25 @@ impl CloudNode {
                         info!("[Node {}] Forwarding request {} to coordinator Node {} for load balancing",
                               self.id, request_id, coordinator_id);
 
+                        // Capture client address if not already set (original request from client)
+                        let client_addr = if client_address.is_none() {
+                            // Check if this is from a client (not from a peer node)
+                            let addr_str = addr.to_string();
+                            let is_peer = self.peer_addresses.values().any(|peer_addr| {
+                                // peer_addr is a String like "10.40.59.43:8001"
+                                // Compare with sender's address
+                                peer_addr == &addr_str
+                            });
+
+                            if !is_peer {
+                                Some(addr_str)
+                            } else {
+                                None
+                            }
+                        } else {
+                            client_address
+                        };
+
                         let forward_message = Message::EncryptionRequest {
                             request_id: request_id.clone(),
                             client_username,
@@ -354,6 +449,7 @@ impl CloudNode {
                             usernames,
                             quota,
                             forwarded: false, // Coordinator will do load balancing
+                            client_address: client_addr,
                         };
 
                         match self.send_message_to_node(coordinator_id, forward_message).await {
@@ -416,6 +512,7 @@ impl CloudNode {
                                 usernames,
                                 quota,
                                 forwarded: true, // Mark as forwarded to prevent loops
+                                client_address, // Pass through client address for direct response
                             };
 
                             match self.send_message_to_node(lowest_load_node, forward_message).await {
@@ -1096,8 +1193,9 @@ impl CloudNode {
 
     /// Failure detector task - checks for failed nodes every 3 seconds
     async fn failure_detector_task(&self) {
-        // Wait a bit for heartbeats to start flowing
-        sleep(Duration::from_secs(8)).await;
+        // Wait longer for heartbeats to start flowing and all nodes to be ready
+        // This prevents false-positive failure detection at startup
+        sleep(Duration::from_secs(15)).await;
 
         let mut interval = interval(Duration::from_secs(3));
         const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10); // Increased from 6s to 10s for more forgiveness
