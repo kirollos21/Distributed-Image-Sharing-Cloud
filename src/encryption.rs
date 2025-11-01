@@ -60,6 +60,10 @@ pub async fn encrypt_image(
         ));
     }
 
+    // STEP 1: Embed metadata into LSBs FIRST (before scrambling)
+    // This way when we scramble, the metadata stays with its pixels
+    // and can be extracted after unscrambling
+    
     // Embed metadata length (4 bytes = 32 bits) into LSB
     let metadata_len = metadata_bytes.len() as u32;
     let len_bytes = metadata_len.to_be_bytes();
@@ -87,21 +91,23 @@ pub async fn encrypt_image(
         }
     }
 
-    debug!("Metadata embedded: {} bytes", metadata_bytes.len());
+    debug!("Metadata embedded: {} bytes (before scrambling)", metadata_bytes.len());
 
-    // VISUAL ENCRYPTION: Scramble pixels using Fisher-Yates shuffle
-    // Use metadata hash as seed for deterministic scrambling
+    // STEP 2: VISUAL ENCRYPTION - Scramble pixels AFTER embedding metadata
+    // The metadata LSBs will be scrambled along with the pixels
+    // Client must unscramble first, then extract metadata
     let seed = calculate_seed(&metadata);
     scramble_pixels(pixels, seed);
     info!("Pixels scrambled using seed derived from metadata");
 
     // OPTIMIZATION: Resize image if too large for UDP transmission
-    // Target: encrypted output should be < 40KB to fit in UDP packets safely
+    // Target: encrypted output should be < 50KB to fit in UDP packets safely
+    // PNG is lossless but larger than JPEG - need to be conservative with size
     let dynamic_img = DynamicImage::ImageRgba8(rgba_img);
     
-    // Calculate approximate output size (rough estimate)
-    let estimated_size = (width * height * 3) / 2; // JPEG is roughly 1.5 bytes per pixel
-    let max_safe_size = 30000; // 30KB target to leave room for JSON overhead
+    // Calculate approximate output size for PNG (roughly 4 bytes per pixel with compression)
+    let estimated_size = (width * height * 4); // PNG RGBA is ~4 bytes per pixel
+    let max_safe_size = 12000; // ~12KB pixel data = ~15KB PNG after compression
     
     let resized_img = if estimated_size > max_safe_size {
         // Calculate scale factor to reduce size
@@ -116,16 +122,17 @@ pub async fn encrypt_image(
         dynamic_img
     };
 
-    // Always encode as JPEG with aggressive compression for UDP transmission
+    // CRITICAL: Use PNG (lossless) to preserve LSB metadata!
+    // JPEG compression would destroy the LSB-encoded metadata
     let mut output_bytes = Vec::new();
-    let mut cursor = std::io::Cursor::new(&mut output_bytes);
     
-    // Use JPEG with quality 60 for good balance of size/quality
-    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, 60);
+    // Use explicit PNG encoder to ensure lossless encoding
+    let mut cursor = std::io::Cursor::new(&mut output_bytes);
+    let encoder = image::codecs::png::PngEncoder::new(&mut cursor);
     resized_img.write_with_encoder(encoder)
-        .map_err(|e| format!("Failed to encode JPEG: {}", e))?;
+        .map_err(|e| format!("Failed to encode PNG: {}", e))?;
 
-    info!("Encrypted image created: {} bytes (scrambled + metadata embedded + compressed)", output_bytes.len());
+    info!("Encrypted image created: {} bytes (scrambled + metadata embedded as PNG)", output_bytes.len());
     
     // Final safety check
     if output_bytes.len() > 50000 {

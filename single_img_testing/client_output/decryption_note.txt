@@ -1,0 +1,16 @@
+Decryption Process:
+==================
+
+The encrypted image contains:
+1. Hidden metadata in pixel LSBs (usernames + quota)
+2. Scrambled pixels (Fisher-Yates shuffle)
+
+To decrypt:
+1. Extract metadata length (first 32 bits)
+2. Extract metadata JSON from LSBs
+3. Parse usernames and quota
+4. Calculate seed = hash(usernames + quota)
+5. Unscramble pixels using same seed
+6. Result = original image restored
+
+See src/encryption.rs decrypt_image() for implementation
