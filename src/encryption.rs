@@ -37,7 +37,7 @@ pub async fn encrypt_image(
     let img = image::load_from_memory(&image_data)
         .map_err(|e| format!("Failed to decode image: {}", e))?;
 
-    // Convert to RGBA for easier manipulation
+    // Convert to RGBA for pixel manipulation
     let mut rgba_img = img.to_rgba8();
     let (width, height) = rgba_img.dimensions();
     info!("Image dimensions: {}x{}", width, height);
@@ -100,48 +100,23 @@ pub async fn encrypt_image(
 
     debug!("Metadata embedded: {} bytes (AFTER scrambling, in fixed positions)", metadata_bytes.len());
 
-    // OPTIMIZATION: Resize image if too large for UDP transmission
-    // Target: encrypted output should be < 50KB to fit in UDP packets safely
-    // PNG is lossless but larger than JPEG - need to be conservative with size
-    let dynamic_img = DynamicImage::ImageRgba8(rgba_img);
-    
-    // Calculate approximate output size for PNG (roughly 4 bytes per pixel with compression)
-    let estimated_size = (width * height * 4); // PNG RGBA is ~4 bytes per pixel
-    let max_safe_size = 12000; // ~12KB pixel data = ~15KB PNG after compression
-    
-    let resized_img = if estimated_size > max_safe_size {
-        // Calculate scale factor to reduce size
-        let scale = ((max_safe_size as f32) / (estimated_size as f32)).sqrt();
-        let new_width = ((width as f32) * scale) as u32;
-        let new_height = ((height as f32) * scale) as u32;
-        
-        info!("Resizing from {}x{} to {}x{} for UDP compatibility", 
-              width, height, new_width, new_height);
-        dynamic_img.resize(new_width, new_height, image::imageops::FilterType::Lanczos3)
-    } else {
-        dynamic_img
-    };
+    // Convert to DynamicImage for encoding
+    let final_img = DynamicImage::ImageRgba8(rgba_img);
 
     // CRITICAL: Use PNG (lossless) to preserve LSB metadata!
     // JPEG compression would destroy the LSB-encoded metadata
     let mut output_bytes = Vec::new();
-    
+
     // Use explicit PNG encoder to ensure lossless encoding
     let mut cursor = std::io::Cursor::new(&mut output_bytes);
     let encoder = image::codecs::png::PngEncoder::new(&mut cursor);
-    resized_img.write_with_encoder(encoder)
+    final_img.write_with_encoder(encoder)
         .map_err(|e| format!("Failed to encode PNG: {}", e))?;
 
     info!("Encrypted image created: {} bytes (scrambled + metadata embedded as PNG)", output_bytes.len());
-    
-    // Final safety check
-    if output_bytes.len() > 50000 {
-        return Err(format!(
-            "Encrypted image too large: {} bytes. Maximum safe size for UDP is ~50KB. Try a smaller input image.",
-            output_bytes.len()
-        ));
-    }
-    
+    info!("Multi-packet transmission enabled - image will be sent across {} UDP packets",
+          (output_bytes.len() + 44999) / 45000);
+
     Ok(output_bytes)
 }
 

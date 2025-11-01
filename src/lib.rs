@@ -1,3 +1,4 @@
+pub mod chunking;
 pub mod client;
 pub mod election;
 pub mod encryption;

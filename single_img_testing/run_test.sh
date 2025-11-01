@@ -26,31 +26,33 @@ if [ -z "$1" ]; then
 fi
 
 SERVER_ADDRESS=$1
-IMAGE_PATH="../test_image.jpg"
+IMAGE_PATH="test_image_720p.jpg"
 
 echo "Server: $SERVER_ADDRESS"
-echo "Image: $IMAGE_PATH"
+echo "Image: $IMAGE_PATH (720p - 1280x720)"
 echo "Mode: FULLY AUTOMATED (no manual steps)"
+echo "Features: Multi-packet UDP transmission for large images"
 echo ""
 
 # Create output directories
 mkdir -p client_output server_output
 
-# Step 1: Create test image if it doesn't exist
+# Step 1: Create 720p test image if it doesn't exist
 if [ ! -f "$IMAGE_PATH" ]; then
     echo "=================================================="
-    echo "  STEP 1: Creating Test Image"
+    echo "  STEP 1: Creating 720p Test Image"
     echo "=================================================="
     echo ""
-    python3 create_test_image.py $IMAGE_PATH
+    python3 generate_720p_image.py $IMAGE_PATH
     if [ $? -ne 0 ]; then
-        echo "❌ Failed to create test image"
+        echo "❌ Failed to create 720p test image"
         exit 1
     fi
     echo ""
     sleep 2
 else
-    echo "✓ Test image exists: $IMAGE_PATH"
+    echo "✓ 720p test image exists: $IMAGE_PATH"
+    ls -lh $IMAGE_PATH | awk '{print "  Size: "$5", Modified: "$6" "$7" "$8}'
     echo ""
 fi
 

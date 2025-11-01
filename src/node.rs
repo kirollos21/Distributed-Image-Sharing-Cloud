@@ -1,3 +1,4 @@
+use crate::chunking::{ChunkReassembler, ChunkedMessage};
 use crate::election::{ElectionManager, ElectionResult};
 use crate::encryption;
 use crate::messages::{Message, NodeId, NodeState, ReceivedImageInfo};
@@ -34,6 +35,7 @@ pub struct CloudNode {
     pub processed_requests: Arc<RwLock<usize>>,
     pub active_sessions: Arc<RwLock<HashMap<String, String>>>, // username -> client_id
     pub stored_images: Arc<RwLock<HashMap<String, Vec<StoredImage>>>>, // username -> list of images
+    pub chunk_reassembler: Arc<Mutex<ChunkReassembler>>, // For reassembling multi-packet messages
 }
 
 impl CloudNode {
@@ -51,6 +53,7 @@ impl CloudNode {
             processed_requests: Arc::new(RwLock::new(0)),
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
             stored_images: Arc::new(RwLock::new(HashMap::new())),
+            chunk_reassembler: Arc::new(Mutex::new(ChunkReassembler::new())),
         }
     }
 
@@ -112,8 +115,26 @@ impl CloudNode {
         }
         drop(state);
 
-        // Parse message
-        let message: Message = serde_json::from_slice(&data)?;
+        // Parse as ChunkedMessage
+        let chunked_message: ChunkedMessage = serde_json::from_slice(&data)?;
+
+        // Try to reassemble
+        let complete_data = {
+            let mut reassembler = self.chunk_reassembler.lock().await;
+            reassembler.process_chunk(chunked_message)
+        };
+
+        // If not complete yet, wait for more chunks
+        let complete_data = match complete_data {
+            Some(data) => data,
+            None => {
+                debug!("[Node {}] Waiting for more chunks from {}", self.id, addr);
+                return Ok(());
+            }
+        };
+
+        // Parse complete message
+        let message: Message = serde_json::from_slice(&complete_data)?;
         debug!("[Node {}] Received from {}: {}", self.id, addr, message);
 
         // Process message based on type
@@ -123,14 +144,26 @@ impl CloudNode {
         if let Some(response) = response {
             let response_bytes = serde_json::to_vec(&response)?;
 
-            // Check if response fits in UDP packet
-            if response_bytes.len() > 65507 {
-                error!("[Node {}] Response too large for UDP: {} bytes", self.id, response_bytes.len());
-                return Err("Response exceeds UDP packet size limit".into());
+            debug!("[Node {}] Sending response: {} bytes", self.id, response_bytes.len());
+
+            // Fragment response if needed
+            let chunks = ChunkedMessage::fragment(response_bytes);
+
+            debug!("[Node {}] Sending {} chunks to {}", self.id, chunks.len(), addr);
+
+            // Send all chunks with small delay to prevent UDP packet loss
+            for (i, chunk) in chunks.iter().enumerate() {
+                let chunk_bytes = serde_json::to_vec(&chunk)?;
+                socket.send_to(&chunk_bytes, addr).await?;
+
+                // Small delay between chunks to prevent overwhelming receiver's socket buffer
+                // Only delay if not the last chunk
+                if i < chunks.len() - 1 {
+                    tokio::time::sleep(Duration::from_micros(100)).await;
+                }
             }
 
-            socket.send_to(&response_bytes, addr).await?;
-            debug!("[Node {}] Sent response to {}", self.id, addr);
+            debug!("[Node {}] Sent {} chunks to {}", self.id, chunks.len(), addr);
         }
 
         Ok(())
@@ -805,6 +838,7 @@ impl Clone for CloudNode {
             processed_requests: Arc::clone(&self.processed_requests),
             active_sessions: Arc::clone(&self.active_sessions),
             stored_images: Arc::clone(&self.stored_images),
+            chunk_reassembler: Arc::clone(&self.chunk_reassembler),
         }
     }
 }

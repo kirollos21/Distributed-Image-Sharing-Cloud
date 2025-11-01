@@ -16,14 +16,20 @@ cd /home/khoulykid@auc.egy/Desktop/Distributed-Image-Sharing-Cloud/single_img_te
 ./simple_run.sh 10.40.59.43:8001
 ```
 
-**That's it!** 
+**That's it!**
+
+## ✨ New Features
+
+- 🎬 **720p Image Support** (1280x720 resolution)
+- 📦 **Multi-Packet UDP Transmission** (handles large images)
+- 🔐 **Fixed Encryption** (SHA256 seed matching)
 
 ## 🖼️ What You'll See
 
 3 image windows will open automatically:
 
-1. **Original Image** - Clear, readable
-2. **Encrypted Image** - Scrambled static/noise  
+1. **Original Image** - Clear, readable 720p test image
+2. **Encrypted Image** - Scrambled static/noise
 3. **Decrypted Image** - Clear again (proves it works!)
 
 ## 📁 Where Are The Files?
@@ -33,8 +39,9 @@ ls client_output/
 ```
 
 You'll find:
+- `test_image_720p.jpg` - Original 720p test image (1280x720, ~40KB)
 - `01_original_image.jpg` - Copy of original
-- `02_encrypted_image.jpg` - Encrypted (scrambled)
+- `02_encrypted_image.png` - Encrypted (scrambled, sent via multi-packet UDP)
 - `03_decrypted_image.png` - Decrypted (restored)
 
 ## ✅ How Do I Know It Worked?

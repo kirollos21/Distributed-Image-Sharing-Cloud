@@ -2,6 +2,7 @@
 """
 Single Image Testing - Client Side
 Sends an image to server, receives encrypted version, displays before/after, and decrypts
+Supports multi-packet transmission via chunking protocol
 """
 
 import json
@@ -9,9 +10,101 @@ import socket
 import sys
 import os
 import time
+import uuid
+import base64
 from pathlib import Path
 from PIL import Image
 import io
+
+# Chunk size for actual data (will be base64 encoded, adding ~33% overhead)
+# 45KB data -> ~60KB base64 -> ~65KB with JSON wrapper (fits in UDP packet)
+CHUNK_SIZE = 45000
+
+def fragment_message(data):
+    """Fragment a large message into chunks using base64 encoding"""
+    data_bytes = data if isinstance(data, bytes) else data.encode('utf-8')
+    data_len = len(data_bytes)
+
+    # If fits in single packet, return as is (base64 encoded)
+    if data_len <= CHUNK_SIZE:
+        encoded = base64.b64encode(data_bytes).decode('ascii')
+        return [{"SinglePacket": encoded}]
+
+    # Calculate number of chunks
+    total_chunks = (data_len + CHUNK_SIZE - 1) // CHUNK_SIZE
+    chunk_id = str(uuid.uuid4())
+
+    print(f"📦 Fragmenting message: {data_len} bytes into {total_chunks} chunks")
+
+    # Create chunks
+    chunks = []
+    for chunk_index in range(total_chunks):
+        start = chunk_index * CHUNK_SIZE
+        end = min(start + CHUNK_SIZE, data_len)
+        chunk_data = data_bytes[start:end]
+
+        # Base64 encode the chunk data
+        encoded_data = base64.b64encode(chunk_data).decode('ascii')
+
+        chunks.append({
+            "MultiPacket": {
+                "chunk_id": chunk_id,
+                "chunk_index": chunk_index,
+                "total_chunks": total_chunks,
+                "data": encoded_data
+            }
+        })
+
+    return chunks
+
+def reassemble_chunks(sock, timeout=30.0):
+    """Receive and reassemble chunked messages with base64 decoding"""
+    sock.settimeout(timeout)
+
+    incomplete = {}
+
+    while True:
+        # Receive chunk
+        chunk_data, _ = sock.recvfrom(65535)
+        chunk_msg = json.loads(chunk_data.decode('utf-8'))
+
+        # Check if single packet
+        if "SinglePacket" in chunk_msg:
+            encoded = chunk_msg["SinglePacket"]
+            decoded = base64.b64decode(encoded)
+            print(f"📥 Received single packet: {len(decoded)} bytes")
+            return decoded
+
+        # Multi-packet
+        if "MultiPacket" in chunk_msg:
+            mp = chunk_msg["MultiPacket"]
+            chunk_id = mp["chunk_id"]
+            chunk_index = mp["chunk_index"]
+            total_chunks = mp["total_chunks"]
+
+            # Base64 decode the chunk data
+            encoded_data = mp["data"]
+            data = base64.b64decode(encoded_data)
+
+            print(f"📥 Received chunk {chunk_index + 1}/{total_chunks} for {chunk_id[:8]}... ({len(data)} bytes)")
+
+            # Store chunk
+            if chunk_id not in incomplete:
+                incomplete[chunk_id] = {"total": total_chunks, "chunks": {}}
+
+            incomplete[chunk_id]["chunks"][chunk_index] = data
+
+            # Check if complete
+            if len(incomplete[chunk_id]["chunks"]) == total_chunks:
+                print(f"✓ All chunks received, reassembling...")
+
+                # Reassemble in order
+                complete_data = b""
+                for i in range(total_chunks):
+                    complete_data += incomplete[chunk_id]["chunks"][i]
+
+                print(f"✓ Reassembly complete: {len(complete_data)} bytes")
+                return complete_data
 
 class ImageTestClient:
     def __init__(self, server_address, image_path):
@@ -52,30 +145,14 @@ class ImageTestClient:
         return image_data
     
     def send_to_server(self, image_data):
-        """Send image to server for encryption"""
+        """Send image to server for encryption using chunking protocol"""
         print(f"\n{'='*70}")
         print(f"STEP 2: Sending to Server for Encryption")
         print(f"{'='*70}")
-        
-        # Check image size first
-        if len(image_data) > 40000:  # 40KB limit for safety
-            print(f"⚠ Image is {len(image_data)/1024:.2f} KB - resizing to fit UDP limit...")
-            # Resize image to fit
-            img = Image.open(io.BytesIO(image_data))
-            # Calculate scale to get under 40KB
-            scale = 0.7  # Start with 70% size
-            while True:
-                new_width = int(img.size[0] * scale)
-                new_height = int(img.size[1] * scale)
-                resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                output = io.BytesIO()
-                resized.save(output, format='JPEG', quality=75)
-                image_data = output.getvalue()
-                if len(image_data) <= 40000 or scale <= 0.3:
-                    break
-                scale -= 0.1
-            print(f"✓ Resized to {new_width}x{new_height}, size: {len(image_data)/1024:.2f} KB")
-        
+
+        # NO SIZE RESTRICTIONS - chunking handles large images!
+        print(f"✓ Image size: {len(image_data)/1024:.2f} KB ({len(image_data)/1024/1024:.2f} MB)")
+
         # Create encryption request
         request_id = f"test_img_{int(time.time())}"
         message = {
@@ -88,42 +165,42 @@ class ImageTestClient:
                 "forwarded": False
             }
         }
-        
+
         message_bytes = json.dumps(message).encode('utf-8')
-        
-        # Check final message size
-        if len(message_bytes) > 65000:
-            raise ValueError(f"Message still too large: {len(message_bytes)/1024:.2f} KB. Try a smaller image.")
-        
+
         print(f"✓ Request ID: {request_id}")
         print(f"✓ Target users: {message['EncryptionRequest']['usernames']}")
         print(f"✓ Quota: {message['EncryptionRequest']['quota']}")
-        print(f"✓ Image data: {len(image_data)} bytes ({len(image_data)/1024:.2f} KB)")
-        print(f"✓ JSON message size: {len(message_bytes)} bytes ({len(message_bytes)/1024:.2f} KB)")
-        
+        print(f"✓ JSON message size: {len(message_bytes)/1024:.2f} KB ({len(message_bytes)/1024/1024:.2f} MB)")
+
+        # Fragment message into chunks
+        chunks = fragment_message(message_bytes)
+
         # Parse server address
         host, port = self.server_address.split(':')
         port = int(port)
-        
-        # Send to server
-        print(f"\n📤 Sending to server {self.server_address}...")
-        
+
+        # Send all chunks
+        print(f"\n📤 Sending {len(chunks)} chunk(s) to server {self.server_address}...")
+
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(15.0)  # 15 second timeout
-        
+
         start_time = time.time()
-        sock.sendto(message_bytes, (host, port))
-        print(f"✓ Request sent, waiting for response...")
-        
-        # Wait for response
-        response_data, _ = sock.recvfrom(65535)
+        for i, chunk in enumerate(chunks):
+            chunk_bytes = json.dumps(chunk).encode('utf-8')
+            sock.sendto(chunk_bytes, (host, port))
+            print(f"   Sent chunk {i+1}/{len(chunks)}: {len(chunk_bytes)} bytes")
+
+        print(f"✓ All chunks sent, waiting for response...")
+
+        # Receive and reassemble response
+        response_data = reassemble_chunks(sock, timeout=30.0)
         elapsed = time.time() - start_time
-        
-        print(f"✓ Response received in {elapsed:.2f}s")
-        print(f"✓ Response size: {len(response_data)} bytes ({len(response_data)/1024:.2f} KB)")
-        
+
+        print(f"✓ Complete response received in {elapsed:.2f}s ({len(response_data)/1024:.2f} KB)")
+
         sock.close()
-        
+
         response = json.loads(response_data.decode('utf-8'))
         return response, elapsed
     
@@ -230,14 +307,16 @@ class ImageTestClient:
                 print(f"TEST COMPLETE - SUMMARY")
                 print(f"{'='*70}")
                 print(f"✓ Original image loaded and displayed")
-                print(f"✓ Image sent to server ({len(image_data)/1024:.2f} KB)")
-                print(f"✓ Encrypted image received ({len(encrypted_data)/1024:.2f} KB)")
+                print(f"✓ Image sent to server ({len(image_data)/1024:.2f} KB) via chunked UDP")
+                print(f"✓ Encrypted image received ({len(encrypted_data)/1024:.2f} KB) via chunked UDP")
                 print(f"✓ Processing time: {elapsed:.2f}s")
                 print(f"✓ Encrypted image displayed (scrambled)")
+                print(f"✓ Multi-packet transmission working!")
                 print(f"✓ Files saved to: {self.output_dir}/")
                 print(f"\n📁 Output files:")
-                print(f"   - encrypted_image.jpg (scrambled, has hidden metadata)")
+                print(f"   - encrypted_image.png (scrambled, has hidden metadata)")
                 print(f"   - decryption_note.txt (how to decrypt)")
+                print(f"\n💡 Now supports large images (720p and beyond)!")
                 print(f"\n{'='*70}\n")
                 
                 return True
@@ -262,6 +341,7 @@ def main():
     if len(sys.argv) < 3:
         print("Usage: python3 test_client.py <server_address> <image_path>")
         print("Example: python3 test_client.py 10.40.59.43:8001 test_image.jpg")
+        print("\n💡 Now supports large images (720p and beyond) via multi-packet UDP!")
         sys.exit(1)
     
     server_address = sys.argv[1]

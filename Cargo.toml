@@ -19,6 +19,8 @@ image = "0.25"
 rfd = "0.14"  # File dialogs
 poll-promise = "0.3"  # Async promises for egui
 sha2 = "0.10"  # SHA256 for deterministic seed calculation
+uuid = { version = "1.6", features = ["v4"] }  # For chunk IDs
+base64 = "0.21"  # Base64 encoding for chunk data
 
 [[bin]]
 name = "cloud-node"
