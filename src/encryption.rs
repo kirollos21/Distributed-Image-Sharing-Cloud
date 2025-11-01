@@ -37,13 +37,13 @@ pub async fn encrypt_image(
     let img = image::load_from_memory(&image_data)
         .map_err(|e| format!("Failed to decode image: {}", e))?;
 
-    // Convert to RGBA for pixel manipulation
-    let mut rgba_img = img.to_rgba8();
-    let (width, height) = rgba_img.dimensions();
+    // Convert to RGB for pixel manipulation (no alpha channel needed - saves 25% space)
+    let mut rgb_img = img.to_rgb8();
+    let (width, height) = rgb_img.dimensions();
     info!("Image dimensions: {}x{}", width, height);
 
     // Get mutable pixel data
-    let pixels = rgba_img.as_mut();
+    let pixels = rgb_img.as_mut();
 
     let metadata = ImageMetadata { usernames, quota };
     let metadata_json = serde_json::to_string(&metadata).map_err(|e| e.to_string())?;
@@ -101,7 +101,7 @@ pub async fn encrypt_image(
     debug!("Metadata embedded: {} bytes (AFTER scrambling, in fixed positions)", metadata_bytes.len());
 
     // Convert to DynamicImage for encoding
-    let final_img = DynamicImage::ImageRgba8(rgba_img);
+    let final_img = DynamicImage::ImageRgb8(rgb_img);
 
     // CRITICAL: Use PNG (lossless) to preserve LSB metadata!
     // JPEG compression would destroy the LSB-encoded metadata
@@ -142,7 +142,7 @@ fn calculate_seed(metadata: &ImageMetadata) -> u64 {
 
 /// Scramble pixels using Fisher-Yates shuffle with a seed
 fn scramble_pixels(pixels: &mut [u8], seed: u64) {
-    let len = pixels.len() / 4; // Number of RGBA pixels
+    let len = pixels.len() / 3; // Number of RGB pixels (3 bytes each)
 
     // Create a simple LCG (Linear Congruential Generator) for deterministic randomness
     let mut rng_state = seed;
@@ -152,11 +152,11 @@ fn scramble_pixels(pixels: &mut [u8], seed: u64) {
         rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         let j = (rng_state % (i as u64 + 1)) as usize;
 
-        // Swap pixels (4 bytes each: RGBA)
-        let idx_i = i * 4;
-        let idx_j = j * 4;
+        // Swap pixels (3 bytes each: RGB)
+        let idx_i = i * 3;
+        let idx_j = j * 3;
 
-        for k in 0..4 {
+        for k in 0..3 {
             pixels.swap(idx_i + k, idx_j + k);
         }
     }
@@ -164,7 +164,7 @@ fn scramble_pixels(pixels: &mut [u8], seed: u64) {
 
 /// Unscramble pixels using the reverse of Fisher-Yates
 fn unscramble_pixels(pixels: &mut [u8], seed: u64) {
-    let len = pixels.len() / 4; // Number of RGBA pixels
+    let len = pixels.len() / 3; // Number of RGB pixels (3 bytes each)
 
     // Store all the swap indices
     let mut swap_indices = Vec::with_capacity(len);
