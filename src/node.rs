@@ -187,10 +187,10 @@ impl CloudNode {
                     socket.send_to(&chunk_bytes, addr).await?;
 
                     // Delay between chunks to prevent overwhelming receiver's socket buffer
-                    // 2ms gives receiver time to process and prevents OS buffer exhaustion (error 105)
+                    // 5ms gives receiver time to process and prevents OS buffer exhaustion and packet loss
                     // Only delay if not the last chunk
                     if i < chunks.len() - 1 {
-                        tokio::time::sleep(Duration::from_millis(2)).await;
+                        tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                 }
 

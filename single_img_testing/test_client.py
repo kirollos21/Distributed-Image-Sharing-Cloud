@@ -95,9 +95,22 @@ def reassemble_chunks(sock, timeout=30.0):
             incomplete[chunk_id]["chunks"][chunk_index] = data
 
             # Check if complete
-            if len(incomplete[chunk_id]["chunks"]) == total_chunks:
+            chunks_received = len(incomplete[chunk_id]["chunks"])
+            print(f"   [{chunks_received}/{total_chunks}] Checking completion... (just received index {chunk_index})")
+            
+            if chunks_received == total_chunks:
                 print(f"✓ All chunks received, reassembling...")
 
+                # Verify all indices present
+                missing = []
+                for i in range(total_chunks):
+                    if i not in incomplete[chunk_id]["chunks"]:
+                        missing.append(i)
+                
+                if missing:
+                    print(f"❌ ERROR: Missing chunk indices: {missing[:10]}...")  # Show first 10
+                    continue  # Wait for missing chunks
+                
                 # Reassemble in order
                 complete_data = b""
                 for i in range(total_chunks):
@@ -105,6 +118,10 @@ def reassemble_chunks(sock, timeout=30.0):
 
                 print(f"✓ Reassembly complete: {len(complete_data)} bytes")
                 return complete_data
+            
+            # Show progress periodically
+            if chunks_received % 50 == 0 or chunks_received == total_chunks - 1:
+                print(f"   Progress: {chunks_received}/{total_chunks} unique chunks stored")
 
 class ImageTestClient:
     def __init__(self, server_address, image_path):
@@ -184,6 +201,10 @@ class ImageTestClient:
         print(f"\n📤 Sending {len(chunks)} chunk(s) to server {self.server_address}...")
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        
+        # Increase receive buffer size to handle large burst of chunks (default is ~200KB, we need more)
+        # Set to 8MB to handle 196 chunks * ~65KB each without dropping packets
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
 
         start_time = time.time()
         for i, chunk in enumerate(chunks):

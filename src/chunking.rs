@@ -136,6 +136,7 @@ impl ChunkReassembler {
                 // Check if we have all chunks
                 if chunks.len() == total_chunks as usize {
                     debug!("All chunks received for message {}, reassembling", chunk_id);
+                    
 
                     // Verify we have all indices
                     let mut missing_indices = Vec::new();
