@@ -226,10 +226,10 @@ impl CloudNode {
                     socket.send_to(&chunk_bytes, addr).await?;
 
                         // Delay between chunks to prevent overwhelming receiver's socket buffer
-                        // Reduced to 5ms to improve throughput while relying on retransmission for reliability
+                        // 10ms provides good balance between throughput and reliability
                         // Only delay if not the last chunk
                         if i < chunks.len() - 1 {
-                            tokio::time::sleep(Duration::from_millis(5)).await;
+                            tokio::time::sleep(Duration::from_millis(10)).await;
                         }
                 }
 
@@ -458,6 +458,11 @@ impl CloudNode {
                 {
                     let mut in_flight = self.in_flight_requests.write().await;
                     in_flight.remove(&request_id);
+                    
+                    // Update current_load after removing from in_flight
+                    let queue = *self.queue_length.read().await;
+                    let mut load = self.current_load.write().await;
+                    *load = queue as f64 + in_flight.len() as f64;
                 }
 
                 response
