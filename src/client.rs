@@ -126,7 +126,7 @@ impl Client {
         Err("All nodes failed to respond".to_string())
     }
 
-    /// Send message to a specific node
+    /// Send message to a specific node with intelligent retransmission
     async fn send_to_node(
         client_id: usize,
         address: &str,
@@ -161,16 +161,78 @@ impl Client {
         let mut reassembler = ChunkReassembler::new();
         let mut buffer = vec![0u8; 65535]; // Max UDP packet size
 
-        // Loop to receive all chunks
+        // Track multi-packet reception for intelligent retransmission
+        let mut chunk_id: Option<String> = None;
+        let mut expected_total: Option<u32> = None;
+        let mut received_indices: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut last_receive_time = Instant::now();
+        let mut retransmit_attempts = 0;
+        const MAX_RETRANSMIT_ATTEMPTS: u32 = 3;
+
+        // Adaptive timeout based on expected response size (larger for encryption/decryption)
+        let base_timeout = match message {
+            Message::EncryptionRequest { .. } | Message::DecryptionRequest { .. } => Duration::from_secs(20),
+            _ => Duration::from_secs(10),
+        };
+
+        // Loop to receive all chunks with intelligent retransmission
         loop {
-            // Read response with timeout
-            let n = match tokio::time::timeout(Duration::from_secs(10), socket.recv_from(&mut buffer)).await
+            // Calculate remaining timeout
+            let elapsed = last_receive_time.elapsed();
+            let remaining_timeout = base_timeout.saturating_sub(elapsed);
+
+            // If we're expecting more chunks and haven't received any recently, request retransmission
+            if let (Some(ref id), Some(total)) = (&chunk_id, expected_total) {
+                if received_indices.len() < total as usize && elapsed > Duration::from_secs(3) {
+                    if retransmit_attempts < MAX_RETRANSMIT_ATTEMPTS {
+                        // Find missing chunk indices
+                        let mut missing: Vec<u32> = (0..total)
+                            .filter(|i| !received_indices.contains(i))
+                            .collect();
+
+                        if !missing.is_empty() {
+                            warn!("[Client {}] Missing {} chunks after {:?}, requesting retransmission (attempt {}/{})",
+                                  client_id, missing.len(), elapsed, retransmit_attempts + 1, MAX_RETRANSMIT_ATTEMPTS);
+
+                            // Limit retransmission request to first 50 missing chunks to avoid oversized packets
+                            missing.truncate(50);
+
+                            let retransmit_msg = ChunkedMessage::RetransmitRequest {
+                                chunk_id: id.clone(),
+                                missing_indices: missing,
+                            };
+
+                            if let Ok(retransmit_bytes) = serde_json::to_vec(&retransmit_msg) {
+                                let _ = socket.send_to(&retransmit_bytes, address).await;
+                                retransmit_attempts += 1;
+                                last_receive_time = Instant::now();
+                            }
+                        }
+                    } else {
+                        return Err(format!("Failed after {} retransmit attempts - still missing {} chunks",
+                                         MAX_RETRANSMIT_ATTEMPTS, total as usize - received_indices.len()));
+                    }
+                }
+            }
+
+            // Read response with remaining timeout
+            let n = match tokio::time::timeout(remaining_timeout, socket.recv_from(&mut buffer)).await
             {
-                Ok(Ok((n, _))) => n,
+                Ok(Ok((n, _))) => {
+                    last_receive_time = Instant::now(); // Reset timer on successful receive
+                    n
+                },
                 Ok(Err(e)) => {
                     return Err(format!("Receive error: {}", e));
                 }
                 Err(_) => {
+                    // Check if we're waiting for chunks
+                    if let (Some(total), Some(_)) = (expected_total, &chunk_id) {
+                        if received_indices.len() < total as usize {
+                            return Err(format!("Timeout after receiving {}/{} chunks",
+                                             received_indices.len(), total));
+                        }
+                    }
                     return Err("Timeout waiting for response".to_string());
                 }
             };
@@ -182,11 +244,24 @@ impl Client {
             // Try to parse as ChunkedMessage first
             match serde_json::from_slice::<ChunkedMessage>(&buffer[..n]) {
                 Ok(chunked_message) => {
-                    debug!("[Client {}] Received chunk from {}", client_id, address);
+                    // Track multi-packet metadata for retransmission
+                    if let ChunkedMessage::MultiPacket {
+                        ref chunk_id: cid,
+                        chunk_index,
+                        total_chunks,
+                        ..
+                    } = chunked_message {
+                        chunk_id = Some(cid.clone());
+                        expected_total = Some(total_chunks);
+                        received_indices.insert(chunk_index);
+
+                        debug!("[Client {}] Received chunk {}/{} (ID: {})",
+                               client_id, received_indices.len(), total_chunks, &cid[..8]);
+                    }
 
                     // Process chunk through reassembler
                     if let Some(complete_data) = reassembler.process_chunk(chunked_message) {
-                        debug!("[Client {}] All chunks received, reassembled {} bytes", client_id, complete_data.len());
+                        info!("[Client {}] All chunks received, reassembled {} bytes", client_id, complete_data.len());
 
                         // Parse complete message
                         let response: Message = serde_json::from_slice(&complete_data)
@@ -196,7 +271,6 @@ impl Client {
                         return Ok(response);
                     } else {
                         // Need more chunks, continue loop
-                        debug!("[Client {}] Waiting for more chunks...", client_id);
                         continue;
                     }
                 }
@@ -208,7 +282,8 @@ impl Client {
                             return Ok(response);
                         }
                         Err(e) => {
-                            return Err(format!("Failed to parse response: {}", e));
+                            warn!("[Client {}] Failed to parse packet: {}", client_id, e);
+                            continue; // Ignore malformed packets
                         }
                     }
                 }

@@ -66,7 +66,43 @@ impl CloudNode {
         info!("[Node {}] Starting on {}", self.id, self.address);
 
         let socket = UdpSocket::bind(&self.address).await?;
-        info!("[Node {}] Listening on {} (UDP)", self.id, self.address);
+
+        // Increase UDP socket buffers to prevent packet loss under high load
+        // Set both send and receive buffers to 8MB (default is usually 208KB)
+        let socket = {
+            use std::os::unix::io::{AsRawFd, FromRawFd};
+            let std_socket = socket.into_std()?;
+            let fd = std_socket.as_raw_fd();
+
+            // Set SO_RCVBUF (receive buffer)
+            let recv_buf_size: libc::c_int = 8 * 1024 * 1024; // 8MB
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    &recv_buf_size as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&recv_buf_size) as libc::socklen_t,
+                );
+            }
+
+            // Set SO_SNDBUF (send buffer)
+            let send_buf_size: libc::c_int = 8 * 1024 * 1024; // 8MB
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    &send_buf_size as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&send_buf_size) as libc::socklen_t,
+                );
+            }
+
+            // Convert back to tokio socket
+            unsafe { UdpSocket::from_std(std_socket)? }
+        };
+
+        info!("[Node {}] Listening on {} (UDP) with 8MB buffers", self.id, self.address);
 
         // Start background tasks
         // PRODUCTION MODE: Failure simulation disabled for controlled testing
@@ -226,10 +262,10 @@ impl CloudNode {
                     socket.send_to(&chunk_bytes, addr).await?;
 
                         // Delay between chunks to prevent overwhelming receiver's socket buffer
-                        // 10ms provides good balance between throughput and reliability
+                        // 15ms provides better reliability under high load (increased from 10ms)
                         // Only delay if not the last chunk
                         if i < chunks.len() - 1 {
-                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            tokio::time::sleep(Duration::from_millis(15)).await;
                         }
                 }
 
@@ -819,22 +855,22 @@ impl CloudNode {
             // Use longer timeout for encryption/decryption requests (30 seconds)
             let timeout_duration = match message {
                 Message::EncryptionRequest { .. } | Message::DecryptionRequest { .. } => Duration::from_secs(30),
-                _ => Duration::from_millis(500),
+                _ => Duration::from_secs(2), // Increased from 500ms to 2s for reliability
             };
 
             if needs_chunking && message_bytes.len() > 45000 {
                 // Use chunking for large messages
                 let chunks = ChunkedMessage::fragment(message_bytes);
 
-                // Send all chunks
+                // Send all chunks with increased spacing
                 for (i, chunk) in chunks.iter().enumerate() {
                     let chunk_bytes = serde_json::to_vec(&chunk)?;
                     socket.send_to(&chunk_bytes, address).await?;
 
                     // Delay between chunks to prevent buffer exhaustion and packet loss
-                    // 2ms prevents "No buffer space available" errors (OS error 105)
+                    // Increased to 5ms for better reliability under stress
                     if i < chunks.len() - 1 {
-                        tokio::time::sleep(Duration::from_millis(2)).await;
+                        tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                 }
 
