@@ -115,26 +115,46 @@ impl CloudNode {
         }
         drop(state);
 
-        // Parse as ChunkedMessage
-        let chunked_message: ChunkedMessage = serde_json::from_slice(&data)?;
+        // Try to parse as ChunkedMessage first (for client communication)
+        // If that fails, parse as direct Message (for node-to-node communication)
+        let message: Message = match serde_json::from_slice::<ChunkedMessage>(&data) {
+            Ok(chunked_message) => {
+                // It's a chunked message from a client
+                debug!("[Node {}] Received chunked message from {}", self.id, addr);
 
-        // Try to reassemble
-        let complete_data = {
-            let mut reassembler = self.chunk_reassembler.lock().await;
-            reassembler.process_chunk(chunked_message)
-        };
+                // Try to reassemble
+                let complete_data = {
+                    let mut reassembler = self.chunk_reassembler.lock().await;
+                    reassembler.process_chunk(chunked_message)
+                };
 
-        // If not complete yet, wait for more chunks
-        let complete_data = match complete_data {
-            Some(data) => data,
-            None => {
-                debug!("[Node {}] Waiting for more chunks from {}", self.id, addr);
-                return Ok(());
+                // If not complete yet, wait for more chunks
+                let complete_data = match complete_data {
+                    Some(data) => data,
+                    None => {
+                        debug!("[Node {}] Waiting for more chunks from {}", self.id, addr);
+                        return Ok(());
+                    }
+                };
+
+                // Parse complete message
+                serde_json::from_slice(&complete_data)?
+            }
+            Err(_) => {
+                // Not a chunked message, try parsing as direct Message (node-to-node)
+                match serde_json::from_slice::<Message>(&data) {
+                    Ok(msg) => {
+                        debug!("[Node {}] Received direct message from peer", self.id);
+                        msg
+                    }
+                    Err(e) => {
+                        error!("[Node {}] Failed to parse message: {}", self.id, e);
+                        return Err(e.into());
+                    }
+                }
             }
         };
 
-        // Parse complete message
-        let message: Message = serde_json::from_slice(&complete_data)?;
         debug!("[Node {}] Received from {}: {}", self.id, addr, message);
 
         // Process message based on type
@@ -146,24 +166,37 @@ impl CloudNode {
 
             debug!("[Node {}] Sending response: {} bytes", self.id, response_bytes.len());
 
-            // Fragment response if needed
-            let chunks = ChunkedMessage::fragment(response_bytes);
+            // Only use chunking for large responses (client messages with image data)
+            // Node-to-node messages are small and sent directly
+            let needs_chunking = matches!(
+                response,
+                Message::EncryptionResponse { .. } | Message::ViewImageResponse { .. }
+            );
 
-            debug!("[Node {}] Sending {} chunks to {}", self.id, chunks.len(), addr);
+            if needs_chunking {
+                // Fragment response for client
+                let chunks = ChunkedMessage::fragment(response_bytes);
 
-            // Send all chunks with small delay to prevent UDP packet loss
-            for (i, chunk) in chunks.iter().enumerate() {
-                let chunk_bytes = serde_json::to_vec(&chunk)?;
-                socket.send_to(&chunk_bytes, addr).await?;
+                debug!("[Node {}] Sending {} chunks to {}", self.id, chunks.len(), addr);
 
-                // Small delay between chunks to prevent overwhelming receiver's socket buffer
-                // Only delay if not the last chunk
-                if i < chunks.len() - 1 {
-                    tokio::time::sleep(Duration::from_micros(100)).await;
+                // Send all chunks with small delay to prevent UDP packet loss
+                for (i, chunk) in chunks.iter().enumerate() {
+                    let chunk_bytes = serde_json::to_vec(&chunk)?;
+                    socket.send_to(&chunk_bytes, addr).await?;
+
+                    // Small delay between chunks to prevent overwhelming receiver's socket buffer
+                    // Only delay if not the last chunk
+                    if i < chunks.len() - 1 {
+                        tokio::time::sleep(Duration::from_micros(100)).await;
+                    }
                 }
-            }
 
-            debug!("[Node {}] Sent {} chunks to {}", self.id, chunks.len(), addr);
+                debug!("[Node {}] Sent {} chunks to {}", self.id, chunks.len(), addr);
+            } else {
+                // Send directly for node-to-node communication
+                socket.send_to(&response_bytes, addr).await?;
+                debug!("[Node {}] Sent direct response to {}", self.id, addr);
+            }
         }
 
         Ok(())
