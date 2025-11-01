@@ -1,7 +1,7 @@
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
-use tokio::time::sleep;
+// use std::time::Duration;  // Commented out - no longer using artificial delays
+// use tokio::time::sleep;   // Commented out - no longer using artificial delays
 use image::{DynamicImage, ImageFormat};
 
 /// Embedded metadata in the image
@@ -25,9 +25,10 @@ pub async fn encrypt_image(
         quota
     );
 
-    // Simulate heavy computational load (critical for load testing)
-    let processing_delay = Duration::from_millis(500 + (image_data.len() / 100) as u64);
-    sleep(processing_delay).await;
+    // Minimal delay for realistic async behavior (was 500ms+ which was too slow)
+    // Comment out for maximum throughput testing
+    // let processing_delay = Duration::from_millis(10);
+    // sleep(processing_delay).await;
 
     // Detect image format
     let format = image::guess_format(&image_data).map_err(|e| format!("Cannot detect image format: {}", e))?;
@@ -194,9 +195,10 @@ pub async fn decrypt_image(encrypted_image: Vec<u8>) -> Result<(Vec<u8>, ImageMe
     info!("Starting decryption of scrambled image");
     eprintln!("[DEBUG DECRYPT] Step 1: Starting decryption");
 
-    // Simulate processing delay
-    sleep(Duration::from_millis(200)).await;
-    eprintln!("[DEBUG DECRYPT] Step 2: Sleep complete");
+    // Minimal delay for realistic async behavior (was 200ms which was too slow)
+    // Comment out for maximum throughput testing
+    // sleep(Duration::from_millis(10)).await;
+    // eprintln!("[DEBUG DECRYPT] Step 2: Sleep complete");
 
     // Detect format
     let format = image::guess_format(&encrypted_image).map_err(|e| format!("Cannot detect image format: {}", e))?;

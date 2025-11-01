@@ -202,7 +202,9 @@ impl CloudNode {
             // Node-to-node messages are small and sent directly
             let needs_chunking = matches!(
                 response,
-                Message::EncryptionResponse { .. } | Message::ViewImageResponse { .. }
+                Message::EncryptionResponse { .. } | 
+                Message::DecryptionResponse { .. } | 
+                Message::ViewImageResponse { .. }
             );
 
             if needs_chunking {
