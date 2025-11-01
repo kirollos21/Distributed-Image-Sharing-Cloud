@@ -125,7 +125,7 @@ impl CloudNode {
                 debug!("[Node {}] Received chunked message from {}", self.id, addr);
 
                 // Try to reassemble
-                let complete_data = {
+                let (complete_data, _response) = {
                     let mut reassembler = self.chunk_reassembler.lock().await;
                     reassembler.process_chunk(chunked_message)
                 };
@@ -792,7 +792,8 @@ impl CloudNode {
                         Ok(Ok((n, _))) => {
                             // Try to parse as chunked message
                             if let Ok(chunk_msg) = serde_json::from_slice::<ChunkedMessage>(&chunk_buffer[..n]) {
-                                if let Some(complete_data) = reassembler.process_chunk(chunk_msg) {
+                                let (complete_data, _response) = reassembler.process_chunk(chunk_msg);
+                                if let Some(complete_data) = complete_data {
                                     // Got complete message
                                     let response: Message = serde_json::from_slice(&complete_data)?;
                                     return Ok(Some(response));
@@ -825,7 +826,8 @@ impl CloudNode {
                         Ok(Ok((n, _))) => {
                             // Try to parse as chunked message first
                             if let Ok(chunk_msg) = serde_json::from_slice::<ChunkedMessage>(&chunk_buffer[..n]) {
-                                if let Some(complete_data) = reassembler.process_chunk(chunk_msg) {
+                                let (complete_data, _response) = reassembler.process_chunk(chunk_msg);
+                                if let Some(complete_data) = complete_data {
                                     // Got complete message
                                     let response: Message = serde_json::from_slice(&complete_data)?;
                                     return Ok(Some(response));

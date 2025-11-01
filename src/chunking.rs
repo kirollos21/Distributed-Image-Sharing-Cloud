@@ -24,6 +24,19 @@ pub enum ChunkedMessage {
         total_chunks: u32,     // Total number of chunks
         data: String,          // Chunk data (base64 encoded)
     },
+
+    /// Acknowledgment for received chunks
+    Ack {
+        chunk_id: String,           // ID of the message being acknowledged
+        received_indices: Vec<u32>, // List of chunk indices successfully received
+        total_chunks: u32,          // Total expected chunks
+    },
+
+    /// Request for missing chunks
+    RequestRetransmit {
+        chunk_id: String,           // ID of the message
+        missing_indices: Vec<u32>,  // List of missing chunk indices
+    },
 }
 
 impl ChunkedMessage {
@@ -81,18 +94,19 @@ impl ChunkReassembler {
     }
 
     /// Process a chunk and return complete message if all chunks received
-    pub fn process_chunk(&mut self, chunk: ChunkedMessage) -> Option<Vec<u8>> {
+    /// Returns (Option<complete_data>, Option<response_message>)
+    pub fn process_chunk(&mut self, chunk: ChunkedMessage) -> (Option<Vec<u8>>, Option<ChunkedMessage>) {
         match chunk {
             ChunkedMessage::SinglePacket(encoded_data) => {
                 // Base64 decode and return
                 match general_purpose::STANDARD.decode(&encoded_data) {
                     Ok(data) => {
                         debug!("Received single packet: {} bytes", data.len());
-                        Some(data)
+                        (Some(data), None)
                     }
                     Err(e) => {
                         warn!("Failed to decode base64 single packet: {}", e);
-                        None
+                        (None, None)
                     }
                 }
             }
@@ -108,7 +122,7 @@ impl ChunkReassembler {
                     Ok(d) => d,
                     Err(e) => {
                         warn!("Failed to decode base64 chunk data: {}", e);
-                        return None;
+                        return (None, None);
                     }
                 };
 
@@ -124,7 +138,7 @@ impl ChunkReassembler {
                 if *expected_total != total_chunks {
                     warn!("Chunk total mismatch for {}: expected {}, got {}",
                           chunk_id, expected_total, total_chunks);
-                    return None;
+                    return (None, None);
                 }
 
                 // Store this chunk
@@ -136,7 +150,6 @@ impl ChunkReassembler {
                 // Check if we have all chunks
                 if chunks.len() == total_chunks as usize {
                     debug!("All chunks received for message {}, reassembling", chunk_id);
-                    
 
                     // Verify we have all indices
                     let mut missing_indices = Vec::new();
@@ -148,7 +161,7 @@ impl ChunkReassembler {
 
                     if !missing_indices.is_empty() {
                         warn!("Missing chunks for {}: {:?}", chunk_id, missing_indices);
-                        return None;
+                        return (None, None);
                     }
 
                     // Reassemble in order
@@ -158,7 +171,7 @@ impl ChunkReassembler {
                             complete_data.extend_from_slice(chunk_data);
                         } else {
                             warn!("Missing chunk {} for message {}", i, chunk_id);
-                            return None;
+                            return (None, None);
                         }
                     }
 
@@ -166,10 +179,16 @@ impl ChunkReassembler {
                     self.incomplete.remove(&chunk_id);
 
                     debug!("Reassembly complete: {} bytes", complete_data.len());
-                    return Some(complete_data);
+                    return (Some(complete_data), None);
                 }
 
-                None
+                (None, None)
+            }
+
+            ChunkedMessage::Ack { .. } | ChunkedMessage::RequestRetransmit { .. } => {
+                // These are control messages, not handled here
+                // They should be handled at a higher level (in node.rs or client.rs)
+                (None, None)
             }
         }
     }

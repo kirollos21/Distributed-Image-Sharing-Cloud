@@ -185,7 +185,9 @@ impl Client {
                     debug!("[Client {}] Received chunk from {}", client_id, address);
 
                     // Process chunk through reassembler
-                    if let Some(complete_data) = reassembler.process_chunk(chunked_message) {
+                    let (complete_data, _response) = reassembler.process_chunk(chunked_message);
+                    
+                    if let Some(complete_data) = complete_data {
                         debug!("[Client {}] All chunks received, reassembled {} bytes", client_id, complete_data.len());
 
                         // Parse complete message

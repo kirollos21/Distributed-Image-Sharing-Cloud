@@ -58,70 +58,113 @@ def fragment_message(data):
     return chunks
 
 def reassemble_chunks(sock, timeout=30.0):
-    """Receive and reassemble chunked messages with base64 decoding"""
-    sock.settimeout(timeout)
+    """Receive and reassemble chunked messages with base64 decoding and retransmission support"""
+    sock.settimeout(5.0)  # 5 second timeout per packet
 
     incomplete = {}
+    start_time = time.time()
 
     while True:
-        # Receive chunk
-        chunk_data, _ = sock.recvfrom(65535)
-        chunk_msg = json.loads(chunk_data.decode('utf-8'))
+        # Check overall timeout
+        if time.time() - start_time > timeout:
+            print(f"❌ Timeout - Overall timeout of {timeout}s exceeded")
+            return None
 
-        # Check if single packet
-        if "SinglePacket" in chunk_msg:
-            encoded = chunk_msg["SinglePacket"]
-            decoded = base64.b64decode(encoded)
-            print(f"📥 Received single packet: {len(decoded)} bytes")
-            return decoded
+        try:
+            # Receive chunk
+            chunk_data, server_addr = sock.recvfrom(65535)
+            chunk_msg = json.loads(chunk_data.decode('utf-8'))
 
-        # Multi-packet
-        if "MultiPacket" in chunk_msg:
-            mp = chunk_msg["MultiPacket"]
-            chunk_id = mp["chunk_id"]
-            chunk_index = mp["chunk_index"]
-            total_chunks = mp["total_chunks"]
+            # Check if single packet
+            if "SinglePacket" in chunk_msg:
+                encoded = chunk_msg["SinglePacket"]
+                decoded = base64.b64decode(encoded)
+                print(f"📥 Received single packet: {len(decoded)} bytes")
+                return decoded
 
-            # Base64 decode the chunk data
-            encoded_data = mp["data"]
-            data = base64.b64decode(encoded_data)
+            # Multi-packet
+            if "MultiPacket" in chunk_msg:
+                mp = chunk_msg["MultiPacket"]
+                chunk_id = mp["chunk_id"]
+                chunk_index = mp["chunk_index"]
+                total_chunks = mp["total_chunks"]
 
-            print(f"📥 Received chunk {chunk_index + 1}/{total_chunks} for {chunk_id[:8]}... ({len(data)} bytes)")
+                # Base64 decode the chunk data
+                encoded_data = mp["data"]
+                data = base64.b64decode(encoded_data)
 
-            # Store chunk
-            if chunk_id not in incomplete:
-                incomplete[chunk_id] = {"total": total_chunks, "chunks": {}}
+                print(f"📥 Received chunk {chunk_index + 1}/{total_chunks} for {chunk_id[:8]}... ({len(data)} bytes)")
 
-            incomplete[chunk_id]["chunks"][chunk_index] = data
+                # Store chunk
+                if chunk_id not in incomplete:
+                    incomplete[chunk_id] = {"total": total_chunks, "chunks": {}, "server_addr": server_addr}
 
-            # Check if complete
-            chunks_received = len(incomplete[chunk_id]["chunks"])
-            print(f"   [{chunks_received}/{total_chunks}] Checking completion... (just received index {chunk_index})")
-            
-            if chunks_received == total_chunks:
-                print(f"✓ All chunks received, reassembling...")
+                incomplete[chunk_id]["chunks"][chunk_index] = data
 
-                # Verify all indices present
-                missing = []
-                for i in range(total_chunks):
-                    if i not in incomplete[chunk_id]["chunks"]:
-                        missing.append(i)
+                # Check if complete
+                chunks_received = len(incomplete[chunk_id]["chunks"])
                 
-                if missing:
-                    print(f"❌ ERROR: Missing chunk indices: {missing[:10]}...")  # Show first 10
-                    continue  # Wait for missing chunks
-                
-                # Reassemble in order
-                complete_data = b""
-                for i in range(total_chunks):
-                    complete_data += incomplete[chunk_id]["chunks"][i]
+                if chunks_received == total_chunks:
+                    print(f"✓ All chunks received, reassembling...")
 
-                print(f"✓ Reassembly complete: {len(complete_data)} bytes")
-                return complete_data
+                    # Verify all indices present
+                    missing = []
+                    for i in range(total_chunks):
+                        if i not in incomplete[chunk_id]["chunks"]:
+                            missing.append(i)
+                    
+                    if missing:
+                        print(f"❌ ERROR: Missing chunk indices: {missing[:10]}...")  # Show first 10
+                        continue  # Wait for missing chunks
+                    
+                    # Reassemble in order
+                    complete_data = b""
+                    for i in range(total_chunks):
+                        complete_data += incomplete[chunk_id]["chunks"][i]
+
+                    print(f"✓ Reassembly complete: {len(complete_data)} bytes")
+                    return complete_data
+                
+                # Show progress periodically
+                if chunks_received % 50 == 0 or chunks_received == total_chunks - 1:
+                    print(f"   Progress: {chunks_received}/{total_chunks} unique chunks stored")
+
+        except socket.timeout:
+            # Timeout waiting for next chunk - check if we have incomplete messages
+            if incomplete:
+                for chunk_id, info in incomplete.items():
+                    chunks_received = len(info["chunks"])
+                    total_chunks = info["total"]
+                    server_addr = info["server_addr"]
+                    
+                    if chunks_received < total_chunks:
+                        # Find missing chunks
+                        missing_indices = []
+                        for i in range(total_chunks):
+                            if i not in info["chunks"]:
+                                missing_indices.append(i)
+                        
+                        print(f"⚠️  Timeout! Received {chunks_received}/{total_chunks} chunks, {len(missing_indices)} missing")
+                        print(f"   Missing indices: {missing_indices[:20]}...")  # Show first 20
+                        
+                        # Request retransmission of missing chunks
+                        retransmit_request = {
+                            "RequestRetransmit": {
+                                "chunk_id": chunk_id,
+                                "missing_indices": missing_indices
+                            }
+                        }
+                        
+                        request_bytes = json.dumps(retransmit_request).encode('utf-8')
+                        sock.sendto(request_bytes, server_addr)
+                        print(f"📤 Sent retransmission request for {len(missing_indices)} chunks")
+                        
+                        # Continue waiting
+                        continue
             
-            # Show progress periodically
-            if chunks_received % 50 == 0 or chunks_received == total_chunks - 1:
-                print(f"   Progress: {chunks_received}/{total_chunks} unique chunks stored")
+            # No incomplete messages, give up
+            print(f"❌ Timeout - No data received")
+            return None
 
 class ImageTestClient:
     def __init__(self, server_address, image_path):
