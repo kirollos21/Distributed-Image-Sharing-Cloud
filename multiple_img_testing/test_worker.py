@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""
+Test Worker - Handles sending images from a single process
+"""
+
+import json
+import socket
+import time
+import random
+import sys
+import os
+from pathlib import Path
+import base64
+import uuid
+
+# Import image generator from same directory
+from generate_test_image import generate_test_image
+
+
+# Chunking functions (same as single_img_testing)
+CHUNK_SIZE = 45000
+
+def fragment_message(data):
+    """Fragment a large message into chunks using base64 encoding"""
+    data_bytes = data if isinstance(data, bytes) else data.encode('utf-8')
+    data_len = len(data_bytes)
+
+    if data_len <= CHUNK_SIZE:
+        encoded = base64.b64encode(data_bytes).decode('ascii')
+        return [{"SinglePacket": encoded}]
+
+    total_chunks = (data_len + CHUNK_SIZE - 1) // CHUNK_SIZE
+    chunk_id = str(uuid.uuid4())
+
+    chunks = []
+    for chunk_index in range(total_chunks):
+        start = chunk_index * CHUNK_SIZE
+        end = min(start + CHUNK_SIZE, data_len)
+        chunk_data = data_bytes[start:end]
+        encoded_data = base64.b64encode(chunk_data).decode('ascii')
+
+        chunks.append({
+            "MultiPacket": {
+                "chunk_id": chunk_id,
+                "chunk_index": chunk_index,
+                "total_chunks": total_chunks,
+                "data": encoded_data
+            }
+        })
+
+    return chunks
+
+
+def reassemble_chunks(sock, timeout=30.0):
+    """Receive and reassemble chunked messages with base64 decoding"""
+    sock.settimeout(timeout)
+    incomplete = {}
+
+    while True:
+        chunk_data, _ = sock.recvfrom(65535)
+        chunk_msg = json.loads(chunk_data.decode('utf-8'))
+
+        if "SinglePacket" in chunk_msg:
+            encoded = chunk_msg["SinglePacket"]
+            decoded = base64.b64decode(encoded)
+            return decoded
+
+        if "MultiPacket" in chunk_msg:
+            mp = chunk_msg["MultiPacket"]
+            chunk_id = mp["chunk_id"]
+            chunk_index = mp["chunk_index"]
+            total_chunks = mp["total_chunks"]
+            encoded_data = mp["data"]
+            data = base64.b64decode(encoded_data)
+
+            if chunk_id not in incomplete:
+                incomplete[chunk_id] = {"total": total_chunks, "chunks": {}}
+
+            incomplete[chunk_id]["chunks"][chunk_index] = data
+
+            if len(incomplete[chunk_id]["chunks"]) == total_chunks:
+                complete_data = b""
+                for i in range(total_chunks):
+                    complete_data += incomplete[chunk_id]["chunks"][i]
+                return complete_data
+
+
+class TestWorker:
+    def __init__(self, process_id, config):
+        self.process_id = process_id
+        self.config = config
+        self.servers = config['server_config']['servers']
+        self.timeout = config['server_config']['request_timeout']
+        self.retry_attempts = config['server_config']['retry_attempts']
+
+        self.results = []
+
+    def send_image_to_server(self, image_data, image_id, server_address):
+        """Send image to server and get encrypted version"""
+        request_id = f"P{self.process_id:02d}_I{image_id:03d}_{int(time.time())}"
+
+        message = {
+            "EncryptionRequest": {
+                "request_id": request_id,
+                "client_username": f"worker_{self.process_id}",
+                "image_data": list(image_data),
+                "usernames": self.config['encryption_config']['usernames'],
+                "quota": self.config['encryption_config']['quota'],
+                "forwarded": False
+            }
+        }
+
+        message_bytes = json.dumps(message).encode('utf-8')
+        chunks = fragment_message(message_bytes)
+
+        host, port = server_address.split(':')
+        port = int(port)
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        start_time = time.time()
+
+        try:
+            # Send all chunks
+            for chunk in chunks:
+                chunk_bytes = json.dumps(chunk).encode('utf-8')
+                sock.sendto(chunk_bytes, (host, port))
+
+            # Receive response
+            response_data = reassemble_chunks(sock, timeout=self.timeout)
+            elapsed = time.time() - start_time
+
+            response = json.loads(response_data.decode('utf-8'))
+
+            if response.get('EncryptionResponse', {}).get('success'):
+                encrypted_data = bytes(response['EncryptionResponse']['encrypted_image'])
+                return {
+                    'success': True,
+                    'encrypted_data': encrypted_data,
+                    'latency': elapsed,
+                    'server': server_address,
+                    'request_id': request_id
+                }
+            else:
+                error = response.get('EncryptionResponse', {}).get('error', 'Unknown')
+                return {
+                    'success': False,
+                    'error': error,
+                    'latency': elapsed,
+                    'server': server_address,
+                    'request_id': request_id
+                }
+
+        except socket.timeout:
+            return {
+                'success': False,
+                'error': 'Timeout',
+                'latency': time.time() - start_time,
+                'server': server_address,
+                'request_id': request_id
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e),
+                'latency': time.time() - start_time,
+                'server': server_address,
+                'request_id': request_id
+            }
+        finally:
+            sock.close()
+
+    def run(self):
+        """Run the worker process"""
+        print(f"[Process {self.process_id}] Starting...")
+
+        images_per_process = self.config['test_config']['images_per_process']
+        width = self.config['test_config']['image_width']
+        height = self.config['test_config']['image_height']
+        quality = self.config['test_config']['image_quality']
+
+        output_dir = Path(self.config['output_config']['output_dir'])
+        test_images_dir = Path(self.config['output_config']['test_images_dir'])
+        encrypted_dir = Path(self.config['output_config']['encrypted_dir'])
+
+        process_start = time.time()
+
+        for img_id in range(1, images_per_process + 1):
+            img_start = time.time()
+
+            # Generate unique test image
+            print(f"[Process {self.process_id}] Generating image {img_id}/{images_per_process}...")
+            image_data = generate_test_image(self.process_id, img_id, width, height, quality)
+
+            # Save test image if configured
+            if self.config['output_config']['save_test_images']:
+                test_img_path = test_images_dir / f"test_image_{self.process_id}_{img_id}.jpg"
+                with open(test_img_path, 'wb') as f:
+                    f.write(image_data)
+
+            # Select random server
+            server = random.choice(self.servers)
+
+            # Send with retries
+            result = None
+            for attempt in range(1, self.retry_attempts + 1):
+                print(f"[Process {self.process_id}] Sending image {img_id} to {server} (attempt {attempt})...")
+
+                result = self.send_image_to_server(image_data, img_id, server)
+
+                if result['success']:
+                    print(f"[Process {self.process_id}] ✓ Image {img_id} encrypted successfully ({result['latency']:.2f}s)")
+
+                    # Save encrypted image
+                    if self.config['output_config']['save_encrypted_images']:
+                        enc_path = encrypted_dir / f"encrypted_{self.process_id}_{img_id}.png"
+                        with open(enc_path, 'wb') as f:
+                            f.write(result['encrypted_data'])
+
+                    break
+                else:
+                    print(f"[Process {self.process_id}] ✗ Image {img_id} failed: {result['error']}")
+                    if attempt < self.retry_attempts:
+                        time.sleep(1)  # Wait before retry
+
+            # Record result
+            result['process_id'] = self.process_id
+            result['image_id'] = img_id
+            result['image_size'] = len(image_data)
+            result['total_time'] = time.time() - img_start
+            self.results.append(result)
+
+        process_elapsed = time.time() - process_start
+
+        # Calculate process statistics
+        successes = sum(1 for r in self.results if r['success'])
+        failures = len(self.results) - successes
+
+        print(f"\n[Process {self.process_id}] COMPLETE")
+        print(f"  Total time: {process_elapsed:.2f}s")
+        print(f"  Success: {successes}/{images_per_process}")
+        print(f"  Failure: {failures}/{images_per_process}")
+        print(f"  Success rate: {(successes/images_per_process*100):.1f}%")
+
+        return {
+            'process_id': self.process_id,
+            'results': self.results,
+            'total_time': process_elapsed,
+            'success_count': successes,
+            'failure_count': failures
+        }
+
+
+if __name__ == '__main__':
+    if len(sys.argv) < 2:
+        print("Usage: python3 test_worker.py <process_id>")
+        sys.exit(1)
+
+    process_id = int(sys.argv[1])
+
+    # Load config
+    with open('config.json', 'r') as f:
+        config = json.load(f)
+
+    worker = TestWorker(process_id, config)
+    result = worker.run()
+
+    # Save results
+    output_dir = Path(config['output_config']['metrics_dir'])
+    result_file = output_dir / f"process_{process_id}_results.json"
+    with open(result_file, 'w') as f:
+        json.dump(result, f, indent=2)
+
+    print(f"[Process {process_id}] Results saved to {result_file}")

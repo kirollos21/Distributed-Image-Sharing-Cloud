@@ -1,0 +1,42 @@
+{
+  "test_config": {
+    "num_processes": 10,
+    "images_per_process": 10,
+    "total_images": 100,
+    "image_width": 1280,
+    "image_height": 720,
+    "image_format": "JPEG",
+    "image_quality": 85
+  },
+  "server_config": {
+    "servers": [
+      "10.40.59.43:8001",
+      "10.40.61.206:8003",
+      "10.40.44.230:8002"
+    ],
+    "request_timeout": 30.0,
+    "retry_attempts": 3
+  },
+  "encryption_config": {
+    "usernames": ["alice", "bob", "charlie"],
+    "quota": 5
+  },
+  "output_config": {
+    "output_dir": "output",
+    "test_images_dir": "output/test_images",
+    "encrypted_dir": "output/encrypted",
+    "decrypted_dir": "output/decrypted",
+    "metrics_dir": "output/metrics",
+    "save_test_images": true,
+    "save_encrypted_images": true,
+    "save_decrypted_images": true
+  },
+  "metrics_config": {
+    "track_latency": true,
+    "track_throughput": true,
+    "track_success_rate": true,
+    "track_failure_rate": true,
+    "track_per_server_metrics": true,
+    "generate_plots": true
+  }
+}
