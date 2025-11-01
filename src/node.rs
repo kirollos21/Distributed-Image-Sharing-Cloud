@@ -656,7 +656,7 @@ impl CloudNode {
             // Parse the address string to SocketAddr
             let address: SocketAddr = address_str.parse()
                 .map_err(|e| format!("Invalid address '{}': {}", address_str, e))?;
-            
+
             // Create a temporary UDP socket bound to a specific port (node's port + 1000)
             // This avoids using random ephemeral ports that might be blocked
             let bind_addr = format!("0.0.0.0:{}", 9000 + self.id);
@@ -670,28 +670,90 @@ impl CloudNode {
 
             let message_bytes = serde_json::to_vec(&message)?;
 
-            // Check message size
-            if message_bytes.len() > 65507 {
-                return Err("Message exceeds UDP packet size limit".into());
-            }
+            // Determine if message needs chunking
+            let needs_chunking = matches!(message, Message::EncryptionRequest { .. } | Message::EncryptionResponse { .. });
 
-            // Send the message
-            socket.send_to(&message_bytes, address).await?;
-
-            // Try to read response with timeout
-            // Use longer timeout for encryption requests (10 seconds)
+            // Use longer timeout for encryption requests (30 seconds)
             let timeout_duration = match message {
-                Message::EncryptionRequest { .. } => Duration::from_secs(10),
+                Message::EncryptionRequest { .. } => Duration::from_secs(30),
                 _ => Duration::from_millis(500),
             };
-            
-            let mut buffer = vec![0u8; 65535];
-            match tokio::time::timeout(timeout_duration, socket.recv_from(&mut buffer)).await {
-                Ok(Ok((n, _))) => {
-                    let response: Message = serde_json::from_slice(&buffer[..n])?;
-                    Ok(Some(response))
+
+            if needs_chunking && message_bytes.len() > 45000 {
+                // Use chunking for large messages
+                let chunks = ChunkedMessage::fragment(message_bytes);
+
+                // Send all chunks
+                for (i, chunk) in chunks.iter().enumerate() {
+                    let chunk_bytes = serde_json::to_vec(&chunk)?;
+                    socket.send_to(&chunk_bytes, address).await?;
+
+                    // Small delay between chunks to avoid overwhelming the receiver
+                    if i < chunks.len() - 1 {
+                        tokio::time::sleep(Duration::from_micros(50)).await;
+                    }
                 }
-                _ => Ok(None),
+
+                // Receive and reassemble chunked response
+                let mut chunk_buffer = vec![0u8; 65535];
+                let mut reassembler = ChunkReassembler::new();
+
+                loop {
+                    match tokio::time::timeout(timeout_duration, socket.recv_from(&mut chunk_buffer)).await {
+                        Ok(Ok((n, _))) => {
+                            // Try to parse as chunked message
+                            if let Ok(chunk_msg) = serde_json::from_slice::<ChunkedMessage>(&chunk_buffer[..n]) {
+                                if let Some(complete_data) = reassembler.process_chunk(chunk_msg) {
+                                    // Got complete message
+                                    let response: Message = serde_json::from_slice(&complete_data)?;
+                                    return Ok(Some(response));
+                                }
+                                // Continue receiving more chunks
+                            } else {
+                                // Not a chunked message, try parsing directly
+                                if let Ok(response) = serde_json::from_slice::<Message>(&chunk_buffer[..n]) {
+                                    return Ok(Some(response));
+                                }
+                            }
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+            } else {
+                // Small message - send directly without chunking
+                if message_bytes.len() > 65507 {
+                    return Err("Message exceeds UDP packet size limit".into());
+                }
+
+                socket.send_to(&message_bytes, address).await?;
+
+                // Receive response (might be chunked)
+                let mut chunk_buffer = vec![0u8; 65535];
+                let mut reassembler = ChunkReassembler::new();
+
+                loop {
+                    match tokio::time::timeout(timeout_duration, socket.recv_from(&mut chunk_buffer)).await {
+                        Ok(Ok((n, _))) => {
+                            // Try to parse as chunked message first
+                            if let Ok(chunk_msg) = serde_json::from_slice::<ChunkedMessage>(&chunk_buffer[..n]) {
+                                if let Some(complete_data) = reassembler.process_chunk(chunk_msg) {
+                                    // Got complete message
+                                    let response: Message = serde_json::from_slice(&complete_data)?;
+                                    return Ok(Some(response));
+                                }
+                                // Continue receiving more chunks
+                            } else {
+                                // Not a chunked message, try parsing directly
+                                if let Ok(response) = serde_json::from_slice::<Message>(&chunk_buffer[..n]) {
+                                    return Ok(Some(response));
+                                } else {
+                                    // Invalid message, continue or timeout
+                                }
+                            }
+                        }
+                        _ => return Ok(None),
+                    }
+                }
             }
         } else {
             Err(format!("Unknown node ID: {}", node_id).into())
