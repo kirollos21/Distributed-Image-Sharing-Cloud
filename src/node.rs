@@ -721,11 +721,17 @@ impl CloudNode {
     }
 
     /// Find the node with the lowest load (including self)
+    /// Uses hybrid scoring: 70% current load + 30% historical work percentage
+    /// This ensures fair distribution over time while still being responsive to current load
     async fn find_lowest_load_node(&self) -> NodeId {
-        let mut lowest_load = *self.current_load.read().await;
-        let mut lowest_node = self.id;
+        let my_load = *self.current_load.read().await;
+        let my_processed = *self.processed_requests.read().await;
         
-        info!("[Node {}] Current load: {:.2}", self.id, lowest_load);
+        info!("[Node {}] Current load: {:.2}, processed: {}", self.id, my_load, my_processed);
+        
+        // Collect data from all nodes (including self)
+        let mut node_data: HashMap<NodeId, (f64, usize)> = HashMap::new();
+        node_data.insert(self.id, (my_load, my_processed));
         
         // Query all peer nodes for their load SEQUENTIALLY (more stable)
         for (peer_id, _) in &self.peer_addresses {
@@ -735,11 +741,7 @@ impl CloudNode {
                 Ok(Some(Message::LoadResponse { node_id, load, queue_length, processed_count })) => {
                     info!("[Node {}] Node {} load: {:.2} (queue: {}, processed: {})", 
                           self.id, node_id, load, queue_length, processed_count);
-                    
-                    if load < lowest_load {
-                        lowest_load = load;
-                        lowest_node = node_id;
-                    }
+                    node_data.insert(node_id, (load, processed_count));
                 }
                 Ok(Some(other_msg)) => {
                     warn!("[Node {}] Unexpected response from Node {}: {:?}", 
@@ -754,8 +756,36 @@ impl CloudNode {
             }
         }
         
-        info!("[Node {}] Lowest load node: {} (load: {:.2})", self.id, lowest_node, lowest_load);
-        lowest_node
+        // Calculate total processed requests across all nodes
+        let total_processed: usize = node_data.values().map(|(_, p)| p).sum();
+        
+        // Find node with best score (lowest combined metric)
+        let mut best_node = self.id;
+        let mut best_score = f64::MAX;
+        
+        for (node_id, (load, processed)) in &node_data {
+            // Calculate historical work percentage (0.0 to 1.0)
+            let work_percentage = if total_processed > 0 {
+                *processed as f64 / total_processed as f64
+            } else {
+                0.0 // All nodes at 0%, treat equally
+            };
+            
+            // Hybrid score: 70% current load + 30% historical work percentage
+            // This balances immediate responsiveness with long-term fairness
+            let score = (0.7 * load) + (0.3 * work_percentage * 100.0);
+            
+            info!("[Node {}] Node {} score: {:.2} (load: {:.2}, work%: {:.1}%)", 
+                  self.id, node_id, score, load, work_percentage * 100.0);
+            
+            if score < best_score {
+                best_score = score;
+                best_node = *node_id;
+            }
+        }
+        
+        info!("[Node {}] Selected node: {} (score: {:.2})", self.id, best_node, best_score);
+        best_node
     }
 
     /// Send message to another node

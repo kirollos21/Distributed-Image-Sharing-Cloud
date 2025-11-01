@@ -1,8 +1,8 @@
 {
   "test_config": {
-    "num_processes": 10,
-    "images_per_process": 10,
-    "total_images": 100,
+    "num_processes": 3,
+    "images_per_process": 3,
+    "total_images": 9,
     "image_width": 400,
     "image_height": 400,
     "image_format": "JPEG",
@@ -11,7 +11,8 @@
   "server_config": {
     "servers": [
       "10.40.59.43:8001",
-      "10.40.44.230:8002"
+      "10.40.44.230:8002",
+      "10.40.61.206:8003"
     ],
     "request_timeout": 30.0,
     "retry_attempts": 3
