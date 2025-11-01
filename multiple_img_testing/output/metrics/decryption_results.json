@@ -1,0 +1,433 @@
+{
+  "total": 25,
+  "successes": 25,
+  "failures": 0,
+  "success_rate": 100.0,
+  "results": [
+    {
+      "file": "encrypted_1_1.png",
+      "success": true,
+      "metadata": {
+        "usernames": [
+          "alice",
+          "bob",
+          "charlie"
+        ],
+        "quota": 5
+      },
+      "dimensions": [
+        431,
+        436
+      ],
+      "output": "output/decrypted/decrypted_1_1.png"
+    },
+    {
+      "file": "encrypted_1_2.png",
+      "success": true,
+      "metadata": {
+        "usernames": [
+          "alice",
+          "bob",
+          "charlie"
+        ],
+        "quota": 5
+      },
+      "dimensions": [
+        488,
+        472
+      ],
+      "output": "output/decrypted/decrypted_1_2.png"
+    },
+    {
+      "file": "encrypted_1_3.png",
+      "success": true,
+      "metadata": {
+        "usernames": [
+          "alice",
+          "bob",
+          "charlie"
+        ],
+        "quota": 5
+      },
+      "dimensions": [
+        573,
+        482
+      ],
+      "output": "output/decrypted/decrypted_1_3.png"
+    },
+    {
+      "file": "encrypted_1_4.png",
+      "success": true,
+      "metadata": {
+        "usernames": [
+          "alice",
+          "bob",
+          "charlie"
+        ],
+        "quota": 5
+      },
+      "dimensions": [
+        368,
+        449
+      ],
+      "output": "output/decrypted/decrypted_1_4.png"
+    },
+    {
+      "file": "encrypted_1_5.png",
+      "success": true,
+      "metadata": {
+        "usernames": [
+          "alice",
+          "bob",
+          "charlie"
+        ],
+        "quota": 5
+      },
+      "dimensions": [
+        419,
+        488
+      ],
+      "output": "output/decrypted/decrypted_1_5.png"
+    },
+    {
+      "file": "encrypted_2_1.png",
+      "success": true,
+      "metadata": {
+        "usernames": [
+          "alice",
+          "bob",
+          "charlie"
+        ],
+        "quota": 5
+      },
+      "dimensions": [
+        401,
+        546
+      ],
+      "output": "output/decrypted/decrypted_2_1.png"
+    },
+    {
+      "file": "encrypted_2_2.png",
+      "success": true,
+      "metadata": {
+        "usernames": [
+          "alice",
+          "bob",
+          "charlie"
+        ],
+        "quota": 5
+      },
+      "dimensions": [
+        561,
+        535
+      ],
+      "output": "output/decrypted/decrypted_2_2.png"
+    },
+    {
+      "file": "encrypted_2_3.png",
+      "success": true,
+      "metadata": {
+        "usernames": [
+          "alice",
+          "bob",
+          "charlie"
+        ],
+        "quota": 5
+      },
+      "dimensions": [
+        538,
+        315
+      ],
+      "output": "output/decrypted/decrypted_2_3.png"
+    },
+    {
+      "file": "encrypted_2_4.png",
+      "success": true,
+      "metadata": {
+        "usernames": [
+          "alice",
+          "bob",
+          "charlie"
+        ],
+        "quota": 5
+      },
+      "dimensions": [
+        551,
+        492
+      ],
+      "output": "output/decrypted/decrypted_2_4.png"
+    },
+    {
+      "file": "encrypted_2_5.png",
+      "success": true,
+      "metadata": {
+        "usernames": [
+          "alice",
+          "bob",
+          "charlie"
+        ],
+        "quota": 5
+      },
+      "dimensions": [
+        377,
+        353
+      ],
+      "output": "output/decrypted/decrypted_2_5.png"
+    },
+    {
+      "file": "encrypted_3_1.png",
+      "success": true,
+      "metadata": {
+        "usernames": [
+          "alice",
+          "bob",
+          "charlie"
+        ],
+        "quota": 5
+      },
+      "dimensions": [
+        599,
+        480
+      ],
+      "output": "output/decrypted/decrypted_3_1.png"
+    },
+    {
+      "file": "encrypted_3_2.png",
+      "success": true,
+      "metadata": {
+        "usernames": [
+          "alice",
+          "bob",
+          "charlie"
+        ],
+        "quota": 5
+      },
+      "dimensions": [
+        486,
+        307
+      ],
+      "output": "output/decrypted/decrypted_3_2.png"
+    },
+    {
+      "file": "encrypted_3_3.png",
+      "success": true,
+      "metadata": {
+        "usernames": [
+          "alice",
+          "bob",
+          "charlie"
+        ],
+        "quota": 5
+      },
+      "dimensions": [
+        527,
+        422
+      ],
+      "output": "output/decrypted/decrypted_3_3.png"
+    },
+    {
+      "file": "encrypted_3_4.png",
+      "success": true,
+      "metadata": {
+        "usernames": [
+          "alice",
+          "bob",
+          "charlie"
+        ],
+        "quota": 5
+      },
+      "dimensions": [
+        472,
+        590
+      ],
+      "output": "output/decrypted/decrypted_3_4.png"
+    },
+    {
+      "file": "encrypted_3_5.png",
+      "success": true,
+      "metadata": {
+        "usernames": [
+          "alice",
+          "bob",
+          "charlie"
+        ],
+        "quota": 5
+      },
+      "dimensions": [
+        429,
+        395
+      ],
+      "output": "output/decrypted/decrypted_3_5.png"
+    },
+    {
+      "file": "encrypted_4_1.png",
+      "success": true,
+      "metadata": {
+        "usernames": [
+          "alice",
+          "bob",
+          "charlie"
+        ],
+        "quota": 5
+      },
+      "dimensions": [
+        309,
+        355
+      ],
+      "output": "output/decrypted/decrypted_4_1.png"
+    },
+    {
+      "file": "encrypted_4_2.png",
+      "success": true,
+      "metadata": {
+        "usernames": [
+          "alice",
+          "bob",
+          "charlie"
+        ],
+        "quota": 5
+      },
+      "dimensions": [
+        547,
+        387
+      ],
+      "output": "output/decrypted/decrypted_4_2.png"
+    },
+    {
+      "file": "encrypted_4_3.png",
+      "success": true,
+      "metadata": {
+        "usernames": [
+          "alice",
+          "bob",
+          "charlie"
+        ],
+        "quota": 5
+      },
+      "dimensions": [
+        524,
+        466
+      ],
+      "output": "output/decrypted/decrypted_4_3.png"
+    },
+    {
+      "file": "encrypted_4_4.png",
+      "success": true,
+      "metadata": {
+        "usernames": [
+          "alice",
+          "bob",
+          "charlie"
+        ],
+        "quota": 5
+      },
+      "dimensions": [
+        335,
+        309
+      ],
+      "output": "output/decrypted/decrypted_4_4.png"
+    },
+    {
+      "file": "encrypted_4_5.png",
+      "success": true,
+      "metadata": {
+        "usernames": [
+          "alice",
+          "bob",
+          "charlie"
+        ],
+        "quota": 5
+      },
+      "dimensions": [
+        325,
+        337
+      ],
+      "output": "output/decrypted/decrypted_4_5.png"
+    },
+    {
+      "file": "encrypted_5_1.png",
+      "success": true,
+      "metadata": {
+        "usernames": [
+          "alice",
+          "bob",
+          "charlie"
+        ],
+        "quota": 5
+      },
+      "dimensions": [
+        548,
+        514
+      ],
+      "output": "output/decrypted/decrypted_5_1.png"
+    },
+    {
+      "file": "encrypted_5_2.png",
+      "success": true,
+      "metadata": {
+        "usernames": [
+          "alice",
+          "bob",
+          "charlie"
+        ],
+        "quota": 5
+      },
+      "dimensions": [
+        323,
+        389
+      ],
+      "output": "output/decrypted/decrypted_5_2.png"
+    },
+    {
+      "file": "encrypted_5_3.png",
+      "success": true,
+      "metadata": {
+        "usernames": [
+          "alice",
+          "bob",
+          "charlie"
+        ],
+        "quota": 5
+      },
+      "dimensions": [
+        335,
+        484
+      ],
+      "output": "output/decrypted/decrypted_5_3.png"
+    },
+    {
+      "file": "encrypted_5_4.png",
+      "success": true,
+      "metadata": {
+        "usernames": [
+          "alice",
+          "bob",
+          "charlie"
+        ],
+        "quota": 5
+      },
+      "dimensions": [
+        405,
+        486
+      ],
+      "output": "output/decrypted/decrypted_5_4.png"
+    },
+    {
+      "file": "encrypted_5_5.png",
+      "success": true,
+      "metadata": {
+        "usernames": [
+          "alice",
+          "bob",
+          "charlie"
+        ],
+        "quota": 5
+      },
+      "dimensions": [
+        318,
+        424
+      ],
+      "output": "output/decrypted/decrypted_5_5.png"
+    }
+  ]
+}

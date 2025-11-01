@@ -30,8 +30,8 @@ cat > config_temp.json <<EOF
     "num_processes": $NUM_PROCESSES,
     "images_per_process": $IMAGES_PER_PROCESS,
     "total_images": $((NUM_PROCESSES * IMAGES_PER_PROCESS)),
-    "image_width": 1280,
-    "image_height": 720,
+    "image_width": 400,
+    "image_height": 400,
     "image_format": "JPEG",
     "image_quality": 85
   },

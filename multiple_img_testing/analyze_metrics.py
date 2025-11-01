@@ -99,9 +99,17 @@ def main():
     report_lines.append("PER-SERVER STATISTICS:")
     report_lines.append("-" * 80)
     for server, stats in metrics['per_server'].items():
-        total = stats['success'] + stats['failure']
-        success_rate = (stats['success'] / total * 100) if total > 0 else 0
-        avg_latency = (sum(stats['latency']) / len(stats['latency'])) if stats['latency'] else 0
+        # Handle both old format (with latency list) and new format (with avg_latency)
+        if 'total_requests' in stats:
+            # New cleaned format
+            total = stats['total_requests']
+            success_rate = stats['success_rate']
+            avg_latency = stats['avg_latency']
+        else:
+            # Old format (fallback)
+            total = stats['success'] + stats['failure']
+            success_rate = (stats['success'] / total * 100) if total > 0 else 0
+            avg_latency = (sum(stats.get('latency', [])) / len(stats.get('latency', []))) if stats.get('latency') else 0
 
         report_lines.append(f"  Server: {server}")
         report_lines.append(f"    Total requests:       {total}")
