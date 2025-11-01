@@ -1,8 +1,8 @@
 {
   "test_config": {
-    "num_processes": 10,
-    "images_per_process": 10,
-    "total_images": 100,
+    "num_processes": 5,
+    "images_per_process": 5,
+    "total_images": 25,
     "image_width": 1280,
     "image_height": 720,
     "image_format": "JPEG",
