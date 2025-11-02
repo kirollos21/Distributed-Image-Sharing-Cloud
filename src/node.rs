@@ -118,6 +118,13 @@ impl CloudNode {
                     let self_clone = self.clone();
                     let socket_clone = socket.clone();
 
+                    // Log active request count when new request arrives
+                    let active_count = *self.active_requests.read().await;
+                    if active_count > 0 {
+                        debug!("[Node {}] Received new datagram ({} bytes) while {} requests active - spawning concurrent handler",
+                               self.id, n, active_count);
+                    }
+
                     tokio::spawn(async move {
                         if let Err(e) = self_clone.handle_datagram(socket_clone, data, addr).await {
                             error!("[Node {}] Error handling datagram: {}", self_clone.id, e);
@@ -375,6 +382,17 @@ impl CloudNode {
                     }
                 }
 
+                // Increment active requests at the START of handling (whether processing or forwarding)
+                // This tracks all active tasks on this node
+                {
+                    let mut active = self.active_requests.write().await;
+                    *active += 1;
+                    let mut load = self.current_load.write().await;
+                    *load = *active as f64;
+                    info!("[Node {}] Handling request {} (active requests now: {})",
+                          self.id, request_id, *active);
+                }
+
                 // Process request and ensure cleanup happens regardless of outcome
                 let response = if forwarded {
                     // Request forwarded by coordinator - MUST process locally
@@ -553,10 +571,19 @@ impl CloudNode {
                 };
 
                 // Remove request from in-flight set now that it's complete
-                // Note: load is already updated in process_encryption_request when it decrements active_requests
                 {
                     let mut in_flight = self.in_flight_requests.write().await;
                     in_flight.remove(&request_id);
+                }
+
+                // Decrement active requests now that handling is complete
+                {
+                    let mut active = self.active_requests.write().await;
+                    *active = active.saturating_sub(1);
+                    let mut load = self.current_load.write().await;
+                    *load = *active as f64;
+                    info!("[Node {}] Finished handling request {} (active requests now: {})",
+                          self.id, request_id, *active);
                 }
 
                 response
@@ -787,18 +814,15 @@ impl CloudNode {
         usernames: Vec<String>,
         quota: u32,
     ) -> Message {
-        info!(
-            "[Node {}] Processing encryption request: {}",
-            self.id, request_id
-        );
+        let start_time = Instant::now();
 
-        // Increment active requests and update load
-        {
-            let mut active = self.active_requests.write().await;
-            *active += 1;
-            let mut load = self.current_load.write().await;
-            *load = *active as f64;
-        }
+        // Get current active count for logging (active_requests already incremented by caller)
+        let active_count = *self.active_requests.read().await;
+
+        info!(
+            "[Node {}] START encrypting request {} (current active: {})",
+            self.id, request_id, active_count
+        );
 
         // Perform encryption
         let result = match encryption::encrypt_image(image_data, usernames, quota).await {
@@ -833,13 +857,11 @@ impl CloudNode {
             }
         };
 
-        // Decrement active requests and update load
-        {
-            let mut active = self.active_requests.write().await;
-            *active = active.saturating_sub(1);
-            let mut load = self.current_load.write().await;
-            *load = *active as f64;
-        }
+        let elapsed = start_time.elapsed();
+        info!(
+            "[Node {}] FINISH encrypting request {} in {:.2}s",
+            self.id, request_id, elapsed.as_secs_f64()
+        );
 
         result
     }
@@ -964,8 +986,46 @@ impl CloudNode {
         best_node
     }
 
-    /// Send message to another node
+    /// Send message to another node with retry logic
     async fn send_message_to_node(&self, node_id: NodeId, message: Message) -> Result<Option<Message>, Box<dyn std::error::Error>> {
+        // Determine if this message type should be retried
+        let should_retry = matches!(message,
+            Message::LoadQuery { .. } |
+            Message::Election { .. } |
+            Message::Coordinator { .. }
+        );
+
+        let max_attempts = if should_retry { 3 } else { 1 };
+
+        for attempt in 1..=max_attempts {
+            match self.send_message_to_node_once(node_id, message.clone()).await {
+                Ok(Some(response)) => return Ok(Some(response)),
+                Ok(None) if attempt < max_attempts => {
+                    debug!("[Node {}] No response from Node {} on attempt {}/{}, retrying...",
+                           self.id, node_id, attempt, max_attempts);
+                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await; // Exponential backoff
+                    continue;
+                }
+                Ok(None) => {
+                    debug!("[Node {}] No response from Node {} after {} attempts",
+                           self.id, node_id, max_attempts);
+                    return Ok(None);
+                }
+                Err(e) if attempt < max_attempts => {
+                    debug!("[Node {}] Error communicating with Node {} on attempt {}/{}: {}, retrying...",
+                           self.id, node_id, attempt, max_attempts, e);
+                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Send message to another node (single attempt)
+    async fn send_message_to_node_once(&self, node_id: NodeId, message: Message) -> Result<Option<Message>, Box<dyn std::error::Error>> {
         if let Some(address_str) = self.peer_addresses.get(&node_id) {
             // Parse the address string to SocketAddr
             let address: SocketAddr = address_str.parse()
@@ -992,10 +1052,12 @@ impl CloudNode {
                 Message::DecryptionResponse { .. }
             );
 
-            // Use longer timeout for encryption/decryption requests (30 seconds)
+            // Use appropriate timeouts based on message type
             let timeout_duration = match message {
                 Message::EncryptionRequest { .. } | Message::DecryptionRequest { .. } => Duration::from_secs(30),
-                _ => Duration::from_millis(500),
+                Message::LoadQuery { .. } => Duration::from_secs(3), // Increased from 500ms - nodes may be busy
+                Message::Election { .. } | Message::Coordinator { .. } => Duration::from_secs(2), // Critical messages
+                _ => Duration::from_secs(1), // Default 1 second for other messages
             };
 
             if needs_chunking && message_bytes.len() > 45000 {
@@ -1026,17 +1088,29 @@ impl CloudNode {
                                 if let Some(complete_data) = reassembler.process_chunk(chunk_msg) {
                                     // Got complete message
                                     let response: Message = serde_json::from_slice(&complete_data)?;
+                                    debug!("[Node {}] Received response from Node {}: {}", self.id, node_id, response);
                                     return Ok(Some(response));
                                 }
                                 // Continue receiving more chunks
                             } else {
                                 // Not a chunked message, try parsing directly
                                 if let Ok(response) = serde_json::from_slice::<Message>(&chunk_buffer[..n]) {
+                                    debug!("[Node {}] Received response from Node {}: {}", self.id, node_id, response);
                                     return Ok(Some(response));
+                                } else {
+                                    debug!("[Node {}] Received invalid message from Node {} ({} bytes)", self.id, node_id, n);
                                 }
                             }
                         }
-                        _ => return Ok(None),
+                        Ok(Err(e)) => {
+                            debug!("[Node {}] Socket error waiting for response from Node {}: {}", self.id, node_id, e);
+                            return Ok(None);
+                        }
+                        Err(_) => {
+                            debug!("[Node {}] Timeout waiting for response from Node {} after {:?}",
+                                   self.id, node_id, timeout_duration);
+                            return Ok(None);
+                        }
                     }
                 }
             } else {
@@ -1059,19 +1133,29 @@ impl CloudNode {
                                 if let Some(complete_data) = reassembler.process_chunk(chunk_msg) {
                                     // Got complete message
                                     let response: Message = serde_json::from_slice(&complete_data)?;
+                                    debug!("[Node {}] Received response from Node {}: {}", self.id, node_id, response);
                                     return Ok(Some(response));
                                 }
                                 // Continue receiving more chunks
                             } else {
                                 // Not a chunked message, try parsing directly
                                 if let Ok(response) = serde_json::from_slice::<Message>(&chunk_buffer[..n]) {
+                                    debug!("[Node {}] Received response from Node {}: {}", self.id, node_id, response);
                                     return Ok(Some(response));
                                 } else {
-                                    // Invalid message, continue or timeout
+                                    debug!("[Node {}] Received invalid message from Node {} ({} bytes)", self.id, node_id, n);
                                 }
                             }
                         }
-                        _ => return Ok(None),
+                        Ok(Err(e)) => {
+                            debug!("[Node {}] Socket error waiting for response from Node {}: {}", self.id, node_id, e);
+                            return Ok(None);
+                        }
+                        Err(_) => {
+                            debug!("[Node {}] Timeout waiting for response from Node {} after {:?}",
+                                   self.id, node_id, timeout_duration);
+                            return Ok(None);
+                        }
                     }
                 }
             }
@@ -1339,13 +1423,13 @@ impl CloudNode {
                                         Ok::<Message, Box<dyn std::error::Error>>(response)
                                     }
                                 ).await {
-                                    Ok(Ok(Message::LoadResponse { node_id, load, processed_count, .. })) => {
+                                    Ok(Ok(Message::LoadResponse { node_id, load, queue_length, processed_count })) => {
                                         let status = if coordinator_id == Some(node_id) {
                                             "COORDINATOR"
                                         } else {
                                             "Worker"
                                         };
-                                        load_info.push((node_id, load, processed_count, 0, status.to_string()));
+                                        load_info.push((node_id, load, processed_count, queue_length, status.to_string()));
                                     }
                                     _ => {
                                         // Query failed or timed out
@@ -1496,7 +1580,7 @@ impl CloudNode {
 
             if should_change {
                 if lowest_node == self.id {
-                    // This node should be coordinator
+                    // This node should be coordinator - announce to all
                     let send_fn = |node: NodeId, msg: Message| {
                         let self_clone = self.clone();
                         tokio::spawn(async move {
@@ -1506,8 +1590,24 @@ impl CloudNode {
                     };
                     manager.announce_coordinator(current_load, send_fn);
                 } else {
-                    // Update coordinator
+                    // Another node should be coordinator - update locally AND broadcast to all nodes
                     manager.update_coordinator(lowest_node, lowest_load);
+
+                    info!("[Node {}] Broadcasting coordinator decision: Node {} with load {:.2}",
+                          self.id, lowest_node, lowest_load);
+
+                    // Broadcast coordinator message to ALL nodes (including the winner and this node)
+                    // This ensures everyone has the same view
+                    for (&peer_id, _) in &self.peer_addresses {
+                        let message = Message::Coordinator {
+                            node_id: lowest_node,
+                            load: lowest_load,
+                        };
+                        let self_clone = self.clone();
+                        tokio::spawn(async move {
+                            let _ = self_clone.send_message_to_node(peer_id, message).await;
+                        });
+                    }
                 }
             }
         }

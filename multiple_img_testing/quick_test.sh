@@ -30,10 +30,10 @@ cat > config_temp.json <<EOF
     "num_processes": $NUM_PROCESSES,
     "images_per_process": $IMAGES_PER_PROCESS,
     "total_images": $((NUM_PROCESSES * IMAGES_PER_PROCESS)),
-    "image_width": 400,
-    "image_height": 400,
+    "image_width": 200,
+    "image_height": 200,
     "image_format": "JPEG",
-    "image_quality": 85
+    "image_quality": 45
   },
   "server_config": {
     "servers": [
@@ -63,9 +63,9 @@ cat >> config_temp.json <<EOF
     "encrypted_dir": "output/encrypted",
     "decrypted_dir": "output/decrypted",
     "metrics_dir": "output/metrics",
-    "save_test_images": true,
-    "save_encrypted_images": true,
-    "save_decrypted_images": true
+    "save_test_images": false,
+    "save_encrypted_images": false,
+    "save_decrypted_images": false
   },
   "metrics_config": {
     "track_latency": true,

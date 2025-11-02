@@ -1,12 +1,12 @@
 {
   "test_config": {
-    "num_processes": 3,
-    "images_per_process": 3,
-    "total_images": 9,
-    "image_width": 400,
-    "image_height": 400,
+    "num_processes": 20,
+    "images_per_process": 700,
+    "total_images": 14000,
+    "image_width": 200,
+    "image_height": 200,
     "image_format": "JPEG",
-    "image_quality": 85
+    "image_quality": 45
   },
   "server_config": {
     "servers": [
