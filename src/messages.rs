@@ -90,9 +90,17 @@ pub enum Message {
         coordinator_address: String,
     },
 
-    // Heartbeat
-    Heartbeat { from_node: NodeId },
-    HeartbeatAck { from_node: NodeId },
+    // Heartbeat (includes load info to reduce overhead)
+    Heartbeat {
+        from_node: NodeId,
+        load: f64,
+        processed_count: usize,
+    },
+    HeartbeatAck {
+        from_node: NodeId,
+        load: f64,
+        processed_count: usize,
+    },
 
     // Image sending/receiving messages
     SendImage {
@@ -174,8 +182,12 @@ impl fmt::Display for Message {
             Message::CoordinatorQueryResponse { coordinator_address } => {
                 write!(f, "COORDINATOR_QUERY_RESPONSE (address: {})", coordinator_address)
             }
-            Message::Heartbeat { from_node } => write!(f, "HEARTBEAT from Node {}", from_node),
-            Message::HeartbeatAck { from_node } => write!(f, "HEARTBEAT_ACK from Node {}", from_node),
+            Message::Heartbeat { from_node, load, processed_count } => {
+                write!(f, "HEARTBEAT from Node {} (load: {:.2}, processed: {})", from_node, load, processed_count)
+            }
+            Message::HeartbeatAck { from_node, load, processed_count } => {
+                write!(f, "HEARTBEAT_ACK from Node {} (load: {:.2}, processed: {})", from_node, load, processed_count)
+            }
             Message::SendImage { from_username, to_usernames, image_id, .. } => {
                 write!(f, "SEND_IMAGE {} from {} to {:?}", image_id, from_username, to_usernames)
             }

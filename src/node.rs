@@ -23,6 +23,14 @@ pub struct StoredImage {
     pub timestamp: i64,
 }
 
+/// Cached load information for a peer node
+#[derive(Clone, Debug)]
+pub struct CachedLoadInfo {
+    pub load: f64,
+    pub processed_count: usize,
+    pub timestamp: Instant,
+}
+
 /// Cloud Node that participates in the distributed system
 pub struct CloudNode {
     pub id: NodeId,
@@ -40,6 +48,7 @@ pub struct CloudNode {
     pub chunk_cache: Arc<RwLock<HashMap<String, Vec<ChunkedMessage>>>>, // Cache sent chunks for retransmission
     pub last_heartbeat: Arc<RwLock<HashMap<NodeId, Instant>>>, // Track last heartbeat from each peer
     pub failed_nodes: Arc<RwLock<HashSet<NodeId>>>, // Nodes detected as failed
+    pub peer_load_cache: Arc<RwLock<HashMap<NodeId, CachedLoadInfo>>>, // Cached load info from heartbeats
 }
 
 impl CloudNode {
@@ -62,6 +71,7 @@ impl CloudNode {
             chunk_cache: Arc::new(RwLock::new(HashMap::new())),
             last_heartbeat: Arc::new(RwLock::new(HashMap::new())),
             failed_nodes: Arc::new(RwLock::new(HashSet::new())),
+            peer_load_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -666,11 +676,20 @@ impl CloudNode {
                 })
             }
 
-            Message::Heartbeat { from_node } => {
+            Message::Heartbeat { from_node, load, processed_count } => {
                 // Record that we received a heartbeat from this node
                 {
+                    let now = Instant::now();
                     let mut heartbeats = self.last_heartbeat.write().await;
-                    heartbeats.insert(from_node, Instant::now());
+                    heartbeats.insert(from_node, now);
+
+                    // Cache the load information
+                    let mut load_cache = self.peer_load_cache.write().await;
+                    load_cache.insert(from_node, CachedLoadInfo {
+                        load,
+                        processed_count,
+                        timestamp: now,
+                    });
 
                     // If this node was marked as failed, remove it from failed set
                     let mut failed = self.failed_nodes.write().await;
@@ -679,15 +698,30 @@ impl CloudNode {
                     }
                 }
 
-                // Send acknowledgment
-                Some(Message::HeartbeatAck { from_node: self.id })
+                // Send acknowledgment with our current load
+                let my_load = *self.current_load.read().await;
+                let my_processed = *self.processed_requests.read().await;
+                Some(Message::HeartbeatAck {
+                    from_node: self.id,
+                    load: my_load,
+                    processed_count: my_processed,
+                })
             }
 
-            Message::HeartbeatAck { from_node } => {
+            Message::HeartbeatAck { from_node, load, processed_count } => {
                 // Update last heartbeat time for this node
                 {
+                    let now = Instant::now();
                     let mut heartbeats = self.last_heartbeat.write().await;
-                    heartbeats.insert(from_node, Instant::now());
+                    heartbeats.insert(from_node, now);
+
+                    // Cache the load information
+                    let mut load_cache = self.peer_load_cache.write().await;
+                    load_cache.insert(from_node, CachedLoadInfo {
+                        load,
+                        processed_count,
+                        timestamp: now,
+                    });
 
                     // If this node was marked as failed, remove it from failed set
                     let mut failed = self.failed_nodes.write().await;
@@ -910,57 +944,69 @@ impl CloudNode {
     /// Find the node with the lowest load (including self)
     /// Uses hybrid scoring: 70% current load + 30% historical work percentage
     /// This ensures fair distribution over time while still being responsive to current load
+    ///
+    /// OPTIMIZED: Uses cached load data from heartbeats instead of querying every node
+    /// This dramatically reduces network overhead (from N queries per request to 0)
     async fn find_lowest_load_node(&self) -> NodeId {
         let my_load = *self.current_load.read().await;
         let my_processed = *self.processed_requests.read().await;
-        
-        info!("[Node {}] Current load: {:.2}, processed: {}", self.id, my_load, my_processed);
-        
+
+        debug!("[Node {}] Finding lowest load node (my load: {:.2}, processed: {})",
+               self.id, my_load, my_processed);
+
         // Collect data from all nodes (including self)
         let mut node_data: HashMap<NodeId, (f64, usize)> = HashMap::new();
         node_data.insert(self.id, (my_load, my_processed));
-        
-        // Get list of failed nodes to skip them
-        let failed = self.failed_nodes.read().await;
 
-        // Query all peer nodes for their load SEQUENTIALLY (more stable)
+        // Get list of failed nodes to skip them
+        let failed = self.failed_nodes.read().await.clone();
+
+        // Get cached load data from heartbeats
+        let load_cache = self.peer_load_cache.read().await;
+        let now = Instant::now();
+        const CACHE_TTL: Duration = Duration::from_secs(5); // Consider cache stale after 5 seconds
+
         for (peer_id, _) in &self.peer_addresses {
-            // Skip failed nodes - don't even try to query them
+            // Skip failed nodes
             if failed.contains(peer_id) {
-                info!("[Node {}] Skipping failed Node {} in load balancing", self.id, peer_id);
+                debug!("[Node {}] Skipping failed Node {} in load balancing", self.id, peer_id);
                 continue;
             }
 
-            let load_query = Message::LoadQuery { from_node: self.id };
+            // Try to use cached data first
+            if let Some(cached) = load_cache.get(peer_id) {
+                let age = now.duration_since(cached.timestamp);
 
-            match self.send_message_to_node(*peer_id, load_query).await {
-                Ok(Some(Message::LoadResponse { node_id, load, queue_length, processed_count })) => {
-                    info!("[Node {}] Node {} load: {:.2} (queue: {}, processed: {})",
-                          self.id, node_id, load, queue_length, processed_count);
-                    node_data.insert(node_id, (load, processed_count));
+                if age < CACHE_TTL {
+                    // Cache is fresh - use it!
+                    debug!("[Node {}] Using cached load for Node {} (age: {:.1}s, load: {:.2})",
+                           self.id, peer_id, age.as_secs_f64(), cached.load);
+                    node_data.insert(*peer_id, (cached.load, cached.processed_count));
+                } else {
+                    // Cache is stale - log it but still use it as fallback
+                    debug!("[Node {}] Stale cache for Node {} (age: {:.1}s), using anyway",
+                           self.id, peer_id, age.as_secs_f64());
+                    node_data.insert(*peer_id, (cached.load, cached.processed_count));
                 }
-                Ok(Some(other_msg)) => {
-                    warn!("[Node {}] Unexpected response from Node {}: {:?}",
-                          self.id, peer_id, other_msg);
-                }
-                Ok(None) => {
-                    warn!("[Node {}] No response from Node {} (timeout)", self.id, peer_id);
-                }
-                Err(e) => {
-                    warn!("[Node {}] Failed to query load from Node {}: {}", self.id, peer_id, e);
-                }
+            } else {
+                // No cached data - this node might not have sent heartbeat yet
+                // Use conservative estimate (assume moderate load)
+                debug!("[Node {}] No cached data for Node {}, assuming moderate load",
+                       self.id, peer_id);
+                node_data.insert(*peer_id, (my_load, 0)); // Assume similar load to self
             }
         }
 
-        drop(failed); // Release read lock
-        
+        drop(load_cache);
+        drop(failed);
+
         // Calculate total processed requests across all nodes
         let total_processed: usize = node_data.values().map(|(_, p)| p).sum();
-        
+
         // Find node with best score (lowest combined metric)
         let mut best_node = self.id;
         let mut best_score = f64::MAX;
-        
+
         for (node_id, (load, processed)) in &node_data {
             // Calculate historical work percentage (0.0 to 1.0)
             let work_percentage = if total_processed > 0 {
@@ -968,21 +1014,21 @@ impl CloudNode {
             } else {
                 0.0 // All nodes at 0%, treat equally
             };
-            
+
             // Hybrid score: 70% current load + 30% historical work percentage
             // This balances immediate responsiveness with long-term fairness
             let score = (0.7 * load) + (0.3 * work_percentage * 100.0);
-            
-            info!("[Node {}] Node {} score: {:.2} (load: {:.2}, work%: {:.1}%)", 
-                  self.id, node_id, score, load, work_percentage * 100.0);
-            
+
+            debug!("[Node {}] Node {} score: {:.2} (load: {:.2}, work%: {:.1}%)",
+                   self.id, node_id, score, load, work_percentage * 100.0);
+
             if score < best_score {
                 best_score = score;
                 best_node = *node_id;
             }
         }
-        
-        info!("[Node {}] Selected node: {} (score: {:.2})", self.id, best_node, best_score);
+
+        info!("[Node {}] Selected node: {} (score: {:.2}) [CACHED]", self.id, best_node, best_score);
         best_node
     }
 
@@ -1264,9 +1310,17 @@ impl CloudNode {
         loop {
             interval.tick().await;
 
+            // Get current load and processed count to include in heartbeat
+            let current_load = *self.current_load.read().await;
+            let current_processed = *self.processed_requests.read().await;
+
             // Send heartbeat to all peers
             for (peer_id, peer_addr) in &self.peer_addresses {
-                let message = Message::Heartbeat { from_node: self.id };
+                let message = Message::Heartbeat {
+                    from_node: self.id,
+                    load: current_load,
+                    processed_count: current_processed,
+                };
 
                 match serde_json::to_vec(&message) {
                     Ok(message_bytes) => {
@@ -1652,6 +1706,7 @@ impl Clone for CloudNode {
             chunk_cache: Arc::clone(&self.chunk_cache),
             last_heartbeat: Arc::clone(&self.last_heartbeat),
             failed_nodes: Arc::clone(&self.failed_nodes),
+            peer_load_cache: Arc::clone(&self.peer_load_cache),
         }
     }
 }
