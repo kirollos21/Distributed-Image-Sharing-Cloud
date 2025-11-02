@@ -836,7 +836,7 @@ impl CloudNode {
                 );
 
                 Message::EncryptionResponse {
-                    request_id,
+                    request_id: request_id.clone(),
                     encrypted_image,
                     success: true,
                     error: None,
@@ -849,7 +849,7 @@ impl CloudNode {
                 );
 
                 Message::EncryptionResponse {
-                    request_id,
+                    request_id: request_id.clone(),
                     encrypted_image: vec![],
                     success: false,
                     error: Some(e),
@@ -998,26 +998,34 @@ impl CloudNode {
         let max_attempts = if should_retry { 3 } else { 1 };
 
         for attempt in 1..=max_attempts {
-            match self.send_message_to_node_once(node_id, message.clone()).await {
-                Ok(Some(response)) => return Ok(Some(response)),
-                Ok(None) if attempt < max_attempts => {
-                    debug!("[Node {}] No response from Node {} on attempt {}/{}, retrying...",
-                           self.id, node_id, attempt, max_attempts);
-                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await; // Exponential backoff
-                    continue;
+            let should_retry = {
+                let result = self.send_message_to_node_once(node_id, message.clone()).await;
+
+                match result {
+                    Ok(Some(response)) => return Ok(Some(response)),
+                    Ok(None) if attempt < max_attempts => {
+                        debug!("[Node {}] No response from Node {} on attempt {}/{}, retrying...",
+                               self.id, node_id, attempt, max_attempts);
+                        true // Should retry
+                    }
+                    Ok(None) => {
+                        debug!("[Node {}] No response from Node {} after {} attempts",
+                               self.id, node_id, max_attempts);
+                        return Ok(None);
+                    }
+                    Err(e) if attempt < max_attempts => {
+                        debug!("[Node {}] Error communicating with Node {} on attempt {}/{}: {}, retrying...",
+                               self.id, node_id, attempt, max_attempts, e);
+                        true // Should retry
+                    }
+                    Err(e) => return Err(e),
                 }
-                Ok(None) => {
-                    debug!("[Node {}] No response from Node {} after {} attempts",
-                           self.id, node_id, max_attempts);
-                    return Ok(None);
-                }
-                Err(e) if attempt < max_attempts => {
-                    debug!("[Node {}] Error communicating with Node {} on attempt {}/{}: {}, retrying...",
-                           self.id, node_id, attempt, max_attempts, e);
-                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
-                    continue;
-                }
-                Err(e) => return Err(e),
+                // result is dropped here at the end of the block
+            };
+
+            // Sleep only if we determined we should retry (result is already dropped)
+            if should_retry {
+                tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
             }
         }
 
