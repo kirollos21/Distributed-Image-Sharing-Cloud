@@ -964,7 +964,7 @@ impl CloudNode {
         // Get cached load data from heartbeats
         let load_cache = self.peer_load_cache.read().await;
         let now = Instant::now();
-        const CACHE_TTL: Duration = Duration::from_secs(5); // Consider cache stale after 5 seconds
+        const CACHE_TTL: Duration = Duration::from_secs(10); // Consider cache stale after 10 seconds (2x heartbeat interval)
 
         for (peer_id, _) in &self.peer_addresses {
             // Skip failed nodes
@@ -1284,7 +1284,7 @@ impl CloudNode {
         sleep(Duration::from_millis(500)).await;
     }
 
-    /// Heartbeat sender task - sends heartbeat to all peers every 2 seconds
+    /// Heartbeat sender task - sends heartbeat to all peers every 5 seconds
     async fn heartbeat_sender_task(&self) {
         // Wait a bit for other nodes to start
         sleep(Duration::from_secs(3)).await;
@@ -1305,7 +1305,7 @@ impl CloudNode {
             }
         };
 
-        let mut interval = interval(Duration::from_secs(2));
+        let mut interval = interval(Duration::from_secs(5));
 
         loop {
             interval.tick().await;
@@ -1343,14 +1343,14 @@ impl CloudNode {
         }
     }
 
-    /// Failure detector task - checks for failed nodes every 3 seconds
+    /// Failure detector task - checks for failed nodes every 5 seconds
     async fn failure_detector_task(&self) {
         // Wait longer for heartbeats to start flowing and all nodes to be ready
         // This prevents false-positive failure detection at startup
         sleep(Duration::from_secs(15)).await;
 
-        let mut interval = interval(Duration::from_secs(3));
-        const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10); // Increased from 6s to 10s for more forgiveness
+        let mut interval = interval(Duration::from_secs(5));
+        const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(20); // Increased to 20s since heartbeats are every 5s
 
         loop {
             interval.tick().await;
@@ -1414,6 +1414,7 @@ impl CloudNode {
     }
 
     /// Load monitoring task - logs load distribution every 10 seconds
+    /// OPTIMIZED: Uses cached load data from heartbeats instead of querying nodes
     async fn load_monitoring_task(&self) {
         // Wait for system to stabilize before starting monitoring
         sleep(Duration::from_secs(20)).await;
@@ -1429,89 +1430,63 @@ impl CloudNode {
             drop(manager);
 
             // Get failed nodes
-            let failed = self.failed_nodes.read().await;
+            let failed = self.failed_nodes.read().await.clone();
+
+            // Get cached load data
+            let load_cache = self.peer_load_cache.read().await;
+            let now = Instant::now();
 
             // Collect load information from all nodes
             let mut load_info = Vec::new();
 
             // Add this node's info
-            let self_load = self.current_load.read().await;
-            let self_processed = self.processed_requests.read().await;
-            let self_active = self.active_requests.read().await;
+            let self_load = *self.current_load.read().await;
+            let self_processed = *self.processed_requests.read().await;
+            let self_active = *self.active_requests.read().await;
 
             let is_coordinator = coordinator_id == Some(self.id);
             let status = if is_coordinator { "COORDINATOR" } else { "Worker" };
 
             load_info.push((
                 self.id,
-                *self_load,
-                *self_processed,
-                *self_active,
+                self_load,
+                self_processed,
+                self_active,
                 status.to_string(),
             ));
 
-            drop(self_load);
-            drop(self_processed);
-            drop(self_active);
-
-            // Query all peer nodes for their load
-            for (&peer_id, peer_addr) in &self.peer_addresses {
+            // Use cached data for peer nodes
+            for (&peer_id, _) in &self.peer_addresses {
                 // Skip failed nodes
                 if failed.contains(&peer_id) {
                     load_info.push((peer_id, 0.0, 0, 0, "FAILED".to_string()));
                     continue;
                 }
 
-                // Send load query
-                let message = Message::LoadQuery { from_node: self.id };
+                // Try to use cached data
+                if let Some(cached) = load_cache.get(&peer_id) {
+                    let age = now.duration_since(cached.timestamp);
 
-                match serde_json::to_vec(&message) {
-                    Ok(message_bytes) => {
-                        // Create temporary socket for query
-                        match UdpSocket::bind("0.0.0.0:0").await {
-                            Ok(query_socket) => {
-                                // Set short timeout for monitoring query
-                                match tokio::time::timeout(
-                                    Duration::from_secs(2),
-                                    async {
-                                        // Send query
-                                        query_socket.send_to(&message_bytes, peer_addr).await?;
+                    // Determine status
+                    let status = if coordinator_id == Some(peer_id) {
+                        "COORDINATOR"
+                    } else if age.as_secs() > 15 {
+                        "STALE" // Haven't heard from this node in 15+ seconds (3x heartbeat interval)
+                    } else {
+                        "Worker"
+                    };
 
-                                        // Wait for response
-                                        let mut buf = vec![0u8; 65535];
-                                        let (n, _) = query_socket.recv_from(&mut buf).await?;
-                                        let response: Message = serde_json::from_slice(&buf[..n])?;
+                    // Assume active_requests = load (since load is based on active requests)
+                    let active = cached.load as usize;
 
-                                        Ok::<Message, Box<dyn std::error::Error>>(response)
-                                    }
-                                ).await {
-                                    Ok(Ok(Message::LoadResponse { node_id, load, queue_length, processed_count })) => {
-                                        let status = if coordinator_id == Some(node_id) {
-                                            "COORDINATOR"
-                                        } else {
-                                            "Worker"
-                                        };
-                                        load_info.push((node_id, load, processed_count, queue_length, status.to_string()));
-                                    }
-                                    _ => {
-                                        // Query failed or timed out
-                                        load_info.push((peer_id, 0.0, 0, 0, "NO_RESPONSE".to_string()));
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                // Socket creation failed
-                                load_info.push((peer_id, 0.0, 0, 0, "ERROR".to_string()));
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        // Serialization failed
-                        load_info.push((peer_id, 0.0, 0, 0, "ERROR".to_string()));
-                    }
+                    load_info.push((peer_id, cached.load, cached.processed_count, active, status.to_string()));
+                } else {
+                    // No cached data - node hasn't sent heartbeat yet
+                    load_info.push((peer_id, 0.0, 0, 0, "NO_HEARTBEAT".to_string()));
                 }
             }
 
+            drop(load_cache);
             drop(failed);
 
             // Sort by node ID for consistent display
