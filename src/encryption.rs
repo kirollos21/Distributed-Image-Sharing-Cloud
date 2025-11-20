@@ -1,8 +1,8 @@
-use log::{debug, info};
+use log::info;
 use serde::{Deserialize, Serialize};
 // use std::time::Duration;  // Commented out - no longer using artificial delays
 // use tokio::time::sleep;   // Commented out - no longer using artificial delays
-use image::{DynamicImage, ImageFormat};
+use image::{DynamicImage, GenericImageView};
 
 /// Embedded metadata in the image
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,12 +31,11 @@ pub async fn encrypt_image(
     let (orig_width, orig_height) = original_img.dimensions();
     info!("Original image dimensions: {}x{}", orig_width, orig_height);
 
-    // Generate or load a cover image (encryption key image)
-    // For now, we'll create a simple pattern image as the cover
-    let cover_width = orig_width.max(800);
-    let cover_height = orig_height.max(600);
-    let mut cover_img = generate_cover_image(cover_width, cover_height);
-    info!("Generated cover image (encryption key): {}x{}", cover_width, cover_height);
+    // Load the encryption key image as the cover
+    let cover_img = load_cover_image()?;
+    let (cover_width, cover_height) = (cover_img.width(), cover_img.height());
+    info!("Loaded cover image (encryption key): {}x{}", cover_width, cover_height);
+    let mut cover_img = cover_img;
 
     // Get mutable pixel data from cover image
     let pixels = cover_img.as_mut();
@@ -93,23 +92,25 @@ pub async fn encrypt_image(
     Ok(output_bytes)
 }
 
-/// Generate a cover image (encryption key) with a simple pattern
-fn generate_cover_image(width: u32, height: u32) -> image::RgbImage {
-    use image::Rgb;
+/// Load the encryption key image from disk
+fn load_cover_image() -> Result<image::RgbImage, String> {
+    use std::fs;
 
-    let mut img = image::RgbImage::new(width, height);
+    // Try to load encrypction_key.jpg (note the typo in the filename)
+    let key_path = "encrypction_key.jpg";
 
-    // Create a gradient pattern for the cover image
-    for y in 0..height {
-        for x in 0..width {
-            let r = ((x as f32 / width as f32) * 255.0) as u8;
-            let g = ((y as f32 / height as f32) * 255.0) as u8;
-            let b = ((x as f32 + y as f32) / (width + height) as f32 * 255.0) as u8;
-            img.put_pixel(x, y, Rgb([r, g, b]));
-        }
+    if !std::path::Path::new(key_path).exists() {
+        return Err(format!("Encryption key image not found: {}", key_path));
     }
 
-    img
+    let key_data = fs::read(key_path)
+        .map_err(|e| format!("Failed to read encryption key image: {}", e))?;
+
+    let key_img = image::load_from_memory(&key_data)
+        .map_err(|e| format!("Failed to decode encryption key image: {}", e))?;
+
+    // Convert to RGB image
+    Ok(key_img.to_rgb8())
 }
 
 /// Embed a u32 value into LSBs
