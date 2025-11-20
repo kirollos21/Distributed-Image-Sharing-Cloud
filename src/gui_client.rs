@@ -89,19 +89,24 @@ struct RequestHistoryItem {
 }
 
 impl ClientApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>, client_id: String) -> Self {
+    pub fn new(_cc: &eframe::CreationContext<'_>, client_id: String, node_addresses: Option<Vec<String>>) -> Self {
         // Create tokio runtime
         let runtime = Arc::new(
             tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"),
         );
 
+        // Use provided addresses or default to localhost
+        let cloud_addresses = node_addresses.unwrap_or_else(|| vec![
+            "127.0.0.1:8001".to_string(),
+            "127.0.0.1:8002".to_string(),
+            "127.0.0.1:8003".to_string(),
+        ]);
+
+        println!("Client will connect to nodes: {:?}", cloud_addresses);
+
         Self {
             client_id,
-            cloud_addresses: vec![
-                "10.32.39.236:8001".to_string(),
-                "10.32.39.24:8002".to_string(),
-                "10.32.39.210:8003".to_string(),
-            ],
+            cloud_addresses,
             runtime: Some(runtime),
             viewing_quota: 5,
             available_usernames: vec![],

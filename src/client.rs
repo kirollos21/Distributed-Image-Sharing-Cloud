@@ -35,29 +35,39 @@ impl Client {
         };
 
         info!("[Client {}] Registering username: {}", self.id, username);
+        info!("[Client {}] Trying {} cloud nodes...", self.id, self.cloud_addresses.len());
 
         // Try to register with any available node
-        for address in &self.cloud_addresses {
+        let mut last_error = String::new();
+        for (i, address) in self.cloud_addresses.iter().enumerate() {
+            info!("[Client {}] Attempting connection to node {}/{}: {}", self.id, i + 1, self.cloud_addresses.len(), address);
+
             match Self::send_to_node(self.id, address, message.clone()).await {
                 Ok(Message::SessionRegisterResponse { success, error }) => {
                     if success {
                         info!("[Client {}] Successfully registered username: {}", self.id, username);
                         return Ok(());
                     } else {
-                        return Err(error.unwrap_or_else(|| "Registration failed".to_string()));
+                        let err_msg = error.unwrap_or_else(|| "Registration failed".to_string());
+                        error!("[Client {}] Node {} rejected registration: {}", self.id, address, err_msg);
+                        return Err(err_msg);
                     }
                 }
                 Ok(_) => {
-                    return Err("Unexpected response from server".to_string());
+                    let err_msg = "Unexpected response from server".to_string();
+                    error!("[Client {}] Node {} sent unexpected response", self.id, address);
+                    return Err(err_msg);
                 }
                 Err(e) => {
-                    warn!("[Client {}] Failed to register with {}: {}", self.id, address, e);
+                    warn!("[Client {}] Failed to connect to node {} ({}): {}", self.id, i + 1, address, e);
+                    last_error = format!("{}: {}", address, e);
                     continue;
                 }
             }
         }
 
-        Err("Failed to connect to any cloud node".to_string())
+        error!("[Client {}] Failed to connect to any cloud node. Last error: {}", self.id, last_error);
+        Err(format!("Failed to connect to any cloud node. Last error: {}", last_error))
     }
 
     /// Unregister a session
@@ -133,46 +143,67 @@ impl Client {
         address: &str,
         message: Message,
     ) -> Result<Message, String> {
+        debug!("[Client {}] send_to_node: Connecting to {}", client_id, address);
+
         // Create UDP socket
         let socket = match UdpSocket::bind("0.0.0.0:0").await {
-            Ok(s) => s,
+            Ok(s) => {
+                debug!("[Client {}] Socket created successfully", client_id);
+                s
+            }
             Err(e) => {
-                warn!("[Client {}] Failed to create socket: {}", client_id, e);
+                error!("[Client {}] Failed to create socket: {}", client_id, e);
                 return Err(format!("Socket creation failed: {}", e));
             }
         };
 
         // Serialize message
-        let message_bytes = serde_json::to_vec(&message).map_err(|e| e.to_string())?;
+        let message_bytes = serde_json::to_vec(&message).map_err(|e| {
+            error!("[Client {}] Message serialization failed: {}", client_id, e);
+            e.to_string()
+        })?;
+
+        debug!("[Client {}] Message serialized: {} bytes", client_id, message_bytes.len());
 
         // Check message size
         if message_bytes.len() > 65507 {
+            error!("[Client {}] Message too large: {} bytes", client_id, message_bytes.len());
             return Err("Message exceeds UDP packet size limit".to_string());
         }
 
         // Send message
+        debug!("[Client {}] Sending {} bytes to {}...", client_id, message_bytes.len(), address);
         socket
             .send_to(&message_bytes, address)
             .await
-            .map_err(|e| format!("Send error: {}", e))?;
+            .map_err(|e| {
+                error!("[Client {}] Send failed to {}: {}", client_id, address, e);
+                format!("Send error: {}", e)
+            })?;
 
-        debug!("[Client {}] Sent {} bytes to {}", client_id, message_bytes.len(), address);
+        debug!("[Client {}] Successfully sent {} bytes to {}", client_id, message_bytes.len(), address);
 
         // Create chunk reassembler for receiving response
         let mut reassembler = ChunkReassembler::new();
         let mut buffer = vec![0u8; 65535]; // Max UDP packet size
 
         // Loop to receive all chunks
+        debug!("[Client {}] Waiting for response from {} (10s timeout)...", client_id, address);
         loop {
             // Read response with timeout
             let n = match tokio::time::timeout(Duration::from_secs(10), socket.recv_from(&mut buffer)).await
             {
-                Ok(Ok((n, _))) => n,
+                Ok(Ok((n, _))) => {
+                    debug!("[Client {}] Received {} bytes from {}", client_id, n, address);
+                    n
+                }
                 Ok(Err(e)) => {
+                    error!("[Client {}] Receive error from {}: {}", client_id, address, e);
                     return Err(format!("Receive error: {}", e));
                 }
                 Err(_) => {
-                    return Err("Timeout waiting for response".to_string());
+                    error!("[Client {}] Timeout waiting for response from {} (waited 10s)", client_id, address);
+                    return Err(format!("Timeout waiting for response from {}", address));
                 }
             };
 
