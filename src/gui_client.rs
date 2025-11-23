@@ -268,15 +268,19 @@ impl ClientApp {
 
                     // Show file size
                     if let Ok(metadata) = std::fs::metadata(path) {
-                        let size_kb = metadata.len() / 1024;
-                        let color = if size_kb > 10 {
-                            Color32::from_rgb(255, 165, 0) // Orange warning
+                        let size_kb = metadata.len() as f64 / 1024.0;
+                        let size_mb = size_kb / 1024.0;
+
+                        let (size_text, color) = if size_mb >= 1.0 {
+                            (format!("Size: {:.2} MB", size_mb), Color32::from_rgb(255, 165, 0))
                         } else {
-                            Color32::from_rgb(0, 200, 0) // Green OK
+                            (format!("Size: {:.2} KB", size_kb), Color32::from_rgb(0, 200, 0))
                         };
-                        ui.label(RichText::new(format!("Size: {} KB", size_kb)).color(color));
-                        if size_kb > 10 {
-                            ui.label(RichText::new("⚠️ Large image - will be auto-compressed to ~10KB for UDP").color(Color32::from_rgb(255, 165, 0)).size(11.0));
+
+                        ui.label(RichText::new(size_text).color(color));
+                        if size_kb > 100.0 {
+                            let chunks = ((size_kb * 1024.0) / 45000.0).ceil() as usize;
+                            ui.label(RichText::new(format!("ℹ️ Will be transmitted as {} chunks", chunks)).color(Color32::from_rgb(100, 150, 255)).size(11.0));
                         }
                     }
                 } else {
@@ -284,7 +288,7 @@ impl ClientApp {
                 }
             });
 
-            ui.label(RichText::new("⚠️ UDP requires tiny images! Max 10KB (request + response must both fit in 65KB)").color(Color32::from_rgb(255, 100, 100)).size(11.0));
+            ui.label(RichText::new("ℹ️ Images are automatically chunked for UDP transmission (no size limit)").color(Color32::from_rgb(100, 150, 255)).size(11.0));
 
             // Show image preview
             if let Some(texture) = &self.image_preview {
@@ -639,54 +643,9 @@ impl ClientApp {
                 Err(e) => return Err(format!("Failed to read image: {}", e)),
             };
 
-            // UDP packet size limit is ~65KB, but we need room for:
-            // - JSON serialization overhead (~30% increase)
-            // - Request metadata (usernames, quota, request_id)
-            // - Response needs to fit the encrypted image back
-            // Limit to 10KB to ensure both request AND response fit
-            const MAX_IMAGE_SIZE: usize = 10 * 1024; // 10 KB
-
-            // Check if image is too large
-            if image_data.len() > MAX_IMAGE_SIZE {
-                // Try to resize/compress the image
-                match image::load_from_memory(&image_data) {
-                    Ok(img) => {
-                        // Resize to smaller dimensions
-                        let (width, height) = (img.width(), img.height());
-                        let scale = (MAX_IMAGE_SIZE as f32 / image_data.len() as f32).sqrt();
-                        let new_width = ((width as f32) * scale) as u32;
-                        let new_height = ((height as f32) * scale) as u32;
-
-                        let resized = img.resize(new_width, new_height, image::imageops::FilterType::Lanczos3);
-
-                        // Re-encode as JPEG with compression
-                        let mut compressed = Vec::new();
-                        let mut cursor = std::io::Cursor::new(&mut compressed);
-                        if let Ok(_) = resized.write_to(&mut cursor, image::ImageFormat::Jpeg) {
-                            if compressed.len() <= MAX_IMAGE_SIZE {
-                                image_data = compressed;
-                            } else {
-                                return Err(format!(
-                                    "Image too large for UDP! Original: {} KB, After compression: {} KB. Max allowed: {} KB.\n\nTip: Use a smaller image file, or resize it before uploading.",
-                                    image_data.len() / 1024,
-                                    compressed.len() / 1024,
-                                    MAX_IMAGE_SIZE / 1024
-                                ));
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        return Err(format!(
-                            "Image too large for UDP! Size: {} KB, Max allowed: {} KB.\n\nThe image cannot be automatically compressed. Please:\n1. Use a smaller image file\n2. Resize the image before uploading\n3. Use a JPEG format for better compression",
-                            image_data.len() / 1024,
-                            MAX_IMAGE_SIZE / 1024
-                        ));
-                    }
-                }
-            }
-
-            // Final check after compression
-            eprintln!("[DEBUG] Image size after processing: {} bytes ({} KB)", image_data.len(), image_data.len() / 1024);
+            // UDP chunking system handles images of any size
+            // Images are automatically fragmented into 45KB chunks and reassembled
+            eprintln!("[DEBUG] Image size: {} bytes ({:.2} KB)", image_data.len(), image_data.len() as f32 / 1024.0);
 
             // Create client and send request
             let client = Client::new(client_id, cloud_addresses);

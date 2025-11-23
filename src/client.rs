@@ -290,33 +290,48 @@ impl Client {
             image_id: image_id.clone(),
         };
 
-        info!("[Client {}] Sending image {} to {:?}", self.id, image_id, to_usernames);
+        info!("[Client {}] Sending image {} to {:?} (multicasting to ALL nodes)", self.id, image_id, to_usernames);
 
-        // Try to send to any available node
+        // Send to ALL nodes in parallel for data replication
+        let mut handles = vec![];
         for address in &self.cloud_addresses {
-            match Self::send_to_node(self.id, address, message.clone()).await {
-                Ok(Message::SendImageResponse { success, image_id, error }) => {
-                    if success {
-                        info!("[Client {}] Successfully sent image: {}", self.id, image_id);
-                        return Ok(image_id);
-                    } else {
-                        return Err(error.unwrap_or_else(|| "Send failed".to_string()));
-                    }
-                }
-                Ok(_) => {
-                    return Err("Unexpected response from server".to_string());
-                }
-                Err(e) => {
-                    warn!("[Client {}] Failed to send to {}: {}", self.id, address, e);
-                    continue;
+            let address = address.clone();
+            let message = message.clone();
+            let client_id = self.id;
+
+            let handle = tokio::spawn(async move {
+                Self::send_to_node(client_id, &address, message).await
+            });
+            handles.push(handle);
+        }
+
+        // Wait for responses from all nodes
+        let mut success_count = 0;
+        let mut last_error = String::new();
+
+        for handle in handles {
+            if let Ok(Ok(Message::SendImageResponse { success, image_id: _, error })) = handle.await {
+                if success {
+                    success_count += 1;
+                } else if let Some(e) = error {
+                    last_error = e;
                 }
             }
         }
 
-        Err("Failed to connect to any cloud node".to_string())
+        if success_count > 0 {
+            info!("[Client {}] Successfully sent image to {} nodes", self.id, success_count);
+            Ok(image_id)
+        } else if !last_error.is_empty() {
+            Err(last_error)
+        } else {
+            Err("Failed to send to any cloud node".to_string())
+        }
     }
 
     /// Query received images for a username
+    /// Queries ALL nodes and merges results to ensure we find images regardless
+    /// of which node they're stored on
     pub async fn query_received_images(
         &self,
         username: String,
@@ -325,29 +340,47 @@ impl Client {
             username: username.clone(),
         };
 
-        info!("[Client {}] Querying received images for: {}", self.id, username);
+        info!("[Client {}] Querying received images for: {} from ALL nodes", self.id, username);
 
-        // Try to query from any available node
+        // Query ALL nodes in parallel and merge results
+        let mut handles = vec![];
         for address in &self.cloud_addresses {
-            match Self::send_to_node(self.id, address, message.clone()).await {
-                Ok(Message::QueryReceivedImagesResponse { images }) => {
-                    info!("[Client {}] Found {} images for {}", self.id, images.len(), username);
-                    return Ok(images);
-                }
-                Ok(_) => {
-                    return Err("Unexpected response from server".to_string());
-                }
-                Err(e) => {
-                    warn!("[Client {}] Failed to query {}: {}", self.id, address, e);
-                    continue;
-                }
+            let address = address.clone();
+            let message = message.clone();
+            let client_id = self.id;
+
+            let handle = tokio::spawn(async move {
+                Self::send_to_node(client_id, &address, message).await
+            });
+            handles.push(handle);
+        }
+
+        // Collect results from all nodes
+        let mut all_images = Vec::new();
+        let mut found_any = false;
+
+        for handle in handles {
+            if let Ok(Ok(Message::QueryReceivedImagesResponse { images })) = handle.await {
+                info!("[Client {}] Found {} images from one node", self.id, images.len());
+                all_images.extend(images);
+                found_any = true;
             }
         }
 
-        Err("Failed to connect to any cloud node".to_string())
+        if !found_any {
+            return Err("Failed to connect to any cloud node".to_string());
+        }
+
+        // Remove duplicates based on image_id (in case same image on multiple nodes)
+        all_images.sort_by(|a, b| a.image_id.cmp(&b.image_id));
+        all_images.dedup_by(|a, b| a.image_id == b.image_id);
+
+        info!("[Client {}] Total unique images found: {}", self.id, all_images.len());
+        Ok(all_images)
     }
 
     /// View an image (decrements the view counter)
+    /// Tries ALL nodes to find the image (since it might be on any node)
     pub async fn view_image(
         &self,
         username: String,
@@ -358,9 +391,12 @@ impl Client {
             image_id: image_id.clone(),
         };
 
-        info!("[Client {}] Viewing image {} for: {}", self.id, image_id, username);
+        info!("[Client {}] Viewing image {} for: {} (trying all nodes)", self.id, image_id, username);
 
-        // Try to view from any available node
+        // Try to view from ALL available nodes until one succeeds
+        // (image might be stored on any node)
+        let mut last_error = String::new();
+
         for address in &self.cloud_addresses {
             match Self::send_to_node(self.id, address, message.clone()).await {
                 Ok(Message::ViewImageResponse {
@@ -373,7 +409,8 @@ impl Client {
                         let encrypted_data = image_data.ok_or_else(|| "No image data returned".to_string())?;
                         let remaining = remaining_views.ok_or_else(|| "No view count returned".to_string())?;
 
-                        info!("[Client {}] Received encrypted image {} ({} bytes) for viewing", self.id, image_id, encrypted_data.len());
+                        info!("[Client {}] Received encrypted image {} ({} bytes) from {}",
+                              self.id, image_id, encrypted_data.len(), address);
                         eprintln!("[DEBUG] Starting decryption for image {} ({} bytes)", image_id, encrypted_data.len());
 
                         // Decrypt the image to extract metadata and get viewable image
@@ -394,20 +431,26 @@ impl Client {
                             }
                         }
                     } else {
-                        return Err(error.unwrap_or_else(|| "View failed".to_string()));
+                        // Image not found on this node, try next
+                        last_error = error.unwrap_or_else(|| "Image not found on this node".to_string());
+                        warn!("[Client {}] Image {} not on {}: {}", self.id, image_id, address, last_error);
+                        continue;
                     }
                 }
                 Ok(_) => {
-                    return Err("Unexpected response from server".to_string());
+                    last_error = "Unexpected response from server".to_string();
+                    warn!("[Client {}] Unexpected response from {}", self.id, address);
+                    continue;
                 }
                 Err(e) => {
+                    last_error = format!("Connection failed: {}", e);
                     warn!("[Client {}] Failed to view from {}: {}", self.id, address, e);
                     continue;
                 }
             }
         }
 
-        Err("Failed to connect to any cloud node".to_string())
+        Err(format!("Image not found on any node. Last error: {}", last_error))
     }
 
     /// Generate a random test image
