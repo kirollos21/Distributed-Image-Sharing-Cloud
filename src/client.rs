@@ -165,23 +165,53 @@ impl Client {
 
         debug!("[Client {}] Message serialized: {} bytes", client_id, message_bytes.len());
 
-        // Check message size
-        if message_bytes.len() > 65507 {
-            error!("[Client {}] Message too large: {} bytes", client_id, message_bytes.len());
-            return Err("Message exceeds UDP packet size limit".to_string());
-        }
+        // Use chunking for any size message
+        let chunks = ChunkedMessage::fragment(message_bytes.clone());
 
-        // Send message
-        debug!("[Client {}] Sending {} bytes to {}...", client_id, message_bytes.len(), address);
-        socket
-            .send_to(&message_bytes, address)
-            .await
-            .map_err(|e| {
-                error!("[Client {}] Send failed to {}: {}", client_id, address, e);
-                format!("Send error: {}", e)
+        if chunks.len() == 1 {
+            // Single packet - send directly
+            let chunk_bytes = serde_json::to_vec(&chunks[0]).map_err(|e| {
+                error!("[Client {}] Chunk serialization failed: {}", client_id, e);
+                e.to_string()
             })?;
 
-        debug!("[Client {}] Successfully sent {} bytes to {}", client_id, message_bytes.len(), address);
+            debug!("[Client {}] Sending single packet: {} bytes to {}", client_id, chunk_bytes.len(), address);
+            socket
+                .send_to(&chunk_bytes, address)
+                .await
+                .map_err(|e| {
+                    error!("[Client {}] Send failed to {}: {}", client_id, address, e);
+                    format!("Send error: {}", e)
+                })?;
+        } else {
+            // Multiple chunks - send with delay to prevent packet loss
+            info!("[Client {}] Sending {} chunks ({} bytes total) to {}",
+                  client_id, chunks.len(), message_bytes.len(), address);
+
+            for (i, chunk) in chunks.iter().enumerate() {
+                let chunk_bytes = serde_json::to_vec(&chunk).map_err(|e| {
+                    error!("[Client {}] Chunk {} serialization failed: {}", client_id, i, e);
+                    e.to_string()
+                })?;
+
+                socket
+                    .send_to(&chunk_bytes, address)
+                    .await
+                    .map_err(|e| {
+                        error!("[Client {}] Chunk {} send failed to {}: {}", client_id, i, address, e);
+                        format!("Send error: {}", e)
+                    })?;
+
+                // Small delay between chunks to prevent UDP packet loss
+                if i < chunks.len() - 1 {
+                    sleep(Duration::from_millis(5)).await;
+                }
+            }
+
+            info!("[Client {}] Successfully sent all {} chunks to {}", client_id, chunks.len(), address);
+        }
+
+        debug!("[Client {}] Successfully sent message to {}", client_id, address);
 
         // Create chunk reassembler for receiving response
         let mut reassembler = ChunkReassembler::new();
@@ -274,6 +304,7 @@ impl Client {
     }
 
     /// Send an encrypted image to other users
+    /// Sends to ALL nodes for replication
     pub async fn send_image(
         &self,
         from_username: String,
@@ -290,48 +321,45 @@ impl Client {
             image_id: image_id.clone(),
         };
 
-        info!("[Client {}] Sending image {} to {:?} (multicasting to ALL nodes)", self.id, image_id, to_usernames);
+        info!("[Client {}] Sending image {} to {:?} (replicating to {} nodes)",
+              self.id, image_id, to_usernames, self.cloud_addresses.len());
 
-        // Send to ALL nodes in parallel for data replication
-        let mut handles = vec![];
-        for address in &self.cloud_addresses {
-            let address = address.clone();
-            let message = message.clone();
-            let client_id = self.id;
-
-            let handle = tokio::spawn(async move {
-                Self::send_to_node(client_id, &address, message).await
-            });
-            handles.push(handle);
-        }
-
-        // Wait for responses from all nodes
+        // Send to ALL nodes for replication (so queries can find the image on any node)
         let mut success_count = 0;
         let mut last_error = String::new();
 
-        for handle in handles {
-            if let Ok(Ok(Message::SendImageResponse { success, image_id: _, error })) = handle.await {
-                if success {
-                    success_count += 1;
-                } else if let Some(e) = error {
-                    last_error = e;
+        for address in &self.cloud_addresses {
+            match Self::send_to_node(self.id, address, message.clone()).await {
+                Ok(Message::SendImageResponse { success, image_id: _, error }) => {
+                    if success {
+                        success_count += 1;
+                        debug!("[Client {}] Image replicated to {}", self.id, address);
+                    } else {
+                        last_error = error.unwrap_or_else(|| "Send failed".to_string());
+                        warn!("[Client {}] Node {} rejected image: {}", self.id, address, last_error);
+                    }
+                }
+                Ok(_) => {
+                    last_error = "Unexpected response from server".to_string();
+                    warn!("[Client {}] Unexpected response from {}", self.id, address);
+                }
+                Err(e) => {
+                    last_error = e.clone();
+                    warn!("[Client {}] Failed to send to {}: {}", self.id, address, e);
                 }
             }
         }
 
         if success_count > 0 {
-            info!("[Client {}] Successfully sent image to {} nodes", self.id, success_count);
+            info!("[Client {}] Successfully sent image {} to {}/{} nodes",
+                  self.id, image_id, success_count, self.cloud_addresses.len());
             Ok(image_id)
-        } else if !last_error.is_empty() {
-            Err(last_error)
         } else {
-            Err("Failed to send to any cloud node".to_string())
+            Err(format!("Failed to send to any node. Last error: {}", last_error))
         }
     }
 
     /// Query received images for a username
-    /// Queries ALL nodes and merges results to ensure we find images regardless
-    /// of which node they're stored on
     pub async fn query_received_images(
         &self,
         username: String,
@@ -340,47 +368,30 @@ impl Client {
             username: username.clone(),
         };
 
-        info!("[Client {}] Querying received images for: {} from ALL nodes", self.id, username);
+        info!("[Client {}] Querying received images for: {}", self.id, username);
 
-        // Query ALL nodes in parallel and merge results
-        let mut handles = vec![];
+        // Query first available node (simple centralized approach)
         for address in &self.cloud_addresses {
-            let address = address.clone();
-            let message = message.clone();
-            let client_id = self.id;
-
-            let handle = tokio::spawn(async move {
-                Self::send_to_node(client_id, &address, message).await
-            });
-            handles.push(handle);
-        }
-
-        // Collect results from all nodes
-        let mut all_images = Vec::new();
-        let mut found_any = false;
-
-        for handle in handles {
-            if let Ok(Ok(Message::QueryReceivedImagesResponse { images })) = handle.await {
-                info!("[Client {}] Found {} images from one node", self.id, images.len());
-                all_images.extend(images);
-                found_any = true;
+            match Self::send_to_node(self.id, address, message.clone()).await {
+                Ok(Message::QueryReceivedImagesResponse { images }) => {
+                    info!("[Client {}] Found {} images", self.id, images.len());
+                    return Ok(images);
+                }
+                Ok(_) => {
+                    return Err("Unexpected response from server".to_string());
+                }
+                Err(e) => {
+                    warn!("[Client {}] Failed to query {}: {}", self.id, address, e);
+                    continue;
+                }
             }
         }
 
-        if !found_any {
-            return Err("Failed to connect to any cloud node".to_string());
-        }
-
-        // Remove duplicates based on image_id (in case same image on multiple nodes)
-        all_images.sort_by(|a, b| a.image_id.cmp(&b.image_id));
-        all_images.dedup_by(|a, b| a.image_id == b.image_id);
-
-        info!("[Client {}] Total unique images found: {}", self.id, all_images.len());
-        Ok(all_images)
+        Err("Failed to connect to any cloud node".to_string())
     }
 
     /// View an image (decrements the view counter)
-    /// Tries ALL nodes to find the image (since it might be on any node)
+    /// Tries nodes to find the image
     pub async fn view_image(
         &self,
         username: String,
@@ -391,10 +402,9 @@ impl Client {
             image_id: image_id.clone(),
         };
 
-        info!("[Client {}] Viewing image {} for: {} (trying all nodes)", self.id, image_id, username);
+        info!("[Client {}] Viewing image {} for: {}", self.id, image_id, username);
 
-        // Try to view from ALL available nodes until one succeeds
-        // (image might be stored on any node)
+        // Try nodes until one succeeds
         let mut last_error = String::new();
 
         for address in &self.cloud_addresses {

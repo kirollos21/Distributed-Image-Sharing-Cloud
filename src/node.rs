@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{interval, sleep};
+use tokio::fs::{File, OpenOptions};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::path::Path;
 
 /// Stored image data
 #[derive(Clone, Debug)]
@@ -336,30 +339,47 @@ impl CloudNode {
     async fn process_message(&self, message: Message, addr: SocketAddr) -> Option<Message> {
         match message {
             Message::SessionRegister { client_id, username } => {
-                let mut sessions = self.active_sessions.write().await;
-
-                // Check if username is already taken
-                if sessions.contains_key(&username) {
-                    info!("[Node {}] Session registration failed: username '{}' already taken", self.id, username);
+                // Check centralized users.txt file first
+                if Self::user_exists_in_file(&username).await {
+                    info!("[Node {}] Session registration failed: username '{}' already taken (in users.txt)", self.id, username);
                     Some(Message::SessionRegisterResponse {
                         success: false,
                         error: Some(format!("Username '{}' is already in use", username)),
                     })
                 } else {
-                    // Register the session
-                    sessions.insert(username.clone(), client_id.clone());
-                    info!("[Node {}] Session registered: username '{}' for client '{}'", self.id, username, client_id);
-                    Some(Message::SessionRegisterResponse {
-                        success: true,
-                        error: None,
-                    })
+                    // Add to centralized users.txt file
+                    match Self::add_user_to_file(&username).await {
+                        Ok(_) => {
+                            // Also add to local in-memory session tracking
+                            let mut sessions = self.active_sessions.write().await;
+                            sessions.insert(username.clone(), client_id.clone());
+                            info!("[Node {}] Session registered: username '{}' for client '{}' (added to users.txt)", self.id, username, client_id);
+                            Some(Message::SessionRegisterResponse {
+                                success: true,
+                                error: None,
+                            })
+                        }
+                        Err(e) => {
+                            error!("[Node {}] Failed to add user '{}' to users.txt: {}", self.id, username, e);
+                            Some(Message::SessionRegisterResponse {
+                                success: false,
+                                error: Some(format!("Failed to register user: {}", e)),
+                            })
+                        }
+                    }
                 }
             }
 
             Message::SessionUnregister { client_id: _, username } => {
+                // Remove from centralized users.txt file
+                if let Err(e) = Self::remove_user_from_file(&username).await {
+                    error!("[Node {}] Failed to remove user '{}' from users.txt: {}", self.id, username, e);
+                }
+
+                // Also remove from local in-memory session tracking
                 let mut sessions = self.active_sessions.write().await;
                 sessions.remove(&username);
-                info!("[Node {}] Session unregistered: username '{}'", self.id, username);
+                info!("[Node {}] Session unregistered: username '{}' (removed from users.txt)", self.id, username);
                 None
             }
 
@@ -785,8 +805,8 @@ impl CloudNode {
             }
 
             Message::CheckUsernameAvailable { username } => {
-                let sessions = self.active_sessions.read().await;
-                let is_available = !sessions.contains_key(&username);
+                // Check centralized users.txt file
+                let is_available = !Self::user_exists_in_file(&username).await;
                 Some(Message::CheckUsernameAvailableResponse {
                     username,
                     is_available,
@@ -1649,6 +1669,80 @@ impl CloudNode {
             }
         }
     }
+
+    // ============================================================
+    // Centralized User Tracking (users.txt file)
+    // ============================================================
+
+    /// Read all users from the centralized users.txt file
+    async fn read_users_file() -> Result<HashSet<String>, std::io::Error> {
+        let users_file = "users.txt";
+
+        if !Path::new(users_file).exists() {
+            // File doesn't exist yet, return empty set
+            return Ok(HashSet::new());
+        }
+
+        let file = File::open(users_file).await?;
+        let reader = BufReader::new(file);
+        let mut lines = reader.lines();
+        let mut users = HashSet::new();
+
+        while let Some(line) = lines.next_line().await? {
+            let username = line.trim();
+            if !username.is_empty() {
+                users.insert(username.to_string());
+            }
+        }
+
+        Ok(users)
+    }
+
+    /// Write all users to the centralized users.txt file
+    async fn write_users_file(users: &HashSet<String>) -> Result<(), std::io::Error> {
+        let users_file = "users.txt";
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(users_file)
+            .await?;
+
+        let mut sorted_users: Vec<_> = users.iter().collect();
+        sorted_users.sort();
+
+        for username in sorted_users {
+            file.write_all(format!("{}\n", username).as_bytes()).await?;
+        }
+
+        file.flush().await?;
+        Ok(())
+    }
+
+    /// Add a user to the centralized users.txt file
+    async fn add_user_to_file(username: &str) -> Result<(), std::io::Error> {
+        let mut users = Self::read_users_file().await.unwrap_or_else(|_| HashSet::new());
+        users.insert(username.to_string());
+        Self::write_users_file(&users).await
+    }
+
+    /// Remove a user from the centralized users.txt file
+    async fn remove_user_from_file(username: &str) -> Result<(), std::io::Error> {
+        let mut users = Self::read_users_file().await.unwrap_or_else(|_| HashSet::new());
+        users.remove(username);
+        Self::write_users_file(&users).await
+    }
+
+    /// Check if username exists in the centralized users.txt file
+    async fn user_exists_in_file(username: &str) -> bool {
+        match Self::read_users_file().await {
+            Ok(users) => users.contains(username),
+            Err(_) => false,
+        }
+    }
+
+    // ============================================================
 
     /// Get current node statistics
     pub async fn get_stats(&self) -> NodeStats {
