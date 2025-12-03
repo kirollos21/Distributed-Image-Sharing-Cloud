@@ -431,7 +431,7 @@ impl Client {
                                     self.id, image_id, metadata.usernames, metadata.quota
                                 );
                                 eprintln!("[DEBUG] Decryption successful! Image size: {} bytes", decrypted_image.len());
-                                // Return the decrypted image (original unscrambled)
+                                // Return the decrypted image (original image extracted from LSB steganography)
                                 return Ok((decrypted_image, remaining));
                             }
                             Err(e) => {
