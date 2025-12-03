@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    let node_id: u32 = args[1].parse().expect("Invalid node ID");
+    let node_id: u8 = args[1].parse().expect("Invalid node ID");
     let my_address = args[2].clone();
 
     // Parse peer addresses from comma-separated list
@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for (idx, peer_addr) in peers_str.split(',').enumerate() {
             // Assign peer IDs based on position (not ideal but works)
             // For 3 nodes: if we're node 1, peers are 2,3; if node 2, peers are 1,3; if node 3, peers are 1,2
-            let mut peer_id = idx as u32 + 1;
+            let mut peer_id = idx as u8 + 1;
             if peer_id >= node_id {
                 peer_id += 1;
             }

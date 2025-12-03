@@ -132,17 +132,17 @@ impl ChunkReassembler {
                 // Get or create entry for this message
                 let (chunks, expected_total, _timestamp) = self.incomplete
                     .entry(chunk_id.clone())
-                    .or_insert_with(|| (HashMap::new(), total_chunks, Instant::now()));
+                    .or_insert_with(|| (HashMap::new(), total_chunks as u32, Instant::now()));
 
                 // Verify total_chunks matches
-                if *expected_total != total_chunks {
+                if *expected_total != total_chunks as u32 {
                     warn!("Chunk total mismatch for {}: expected {}, got {}",
                           chunk_id, expected_total, total_chunks);
                     return None;
                 }
 
                 // Store this chunk
-                chunks.insert(chunk_index, data.clone());
+                chunks.insert(chunk_index as u32, data.clone());
 
                 debug!("Stored chunk {} for message {}, total stored: {}/{}",
                        chunk_index, chunk_id, chunks.len(), total_chunks);
@@ -153,7 +153,7 @@ impl ChunkReassembler {
 
                     // Verify we have all indices
                     let mut missing_indices = Vec::new();
-                    for i in 0..total_chunks {
+                    for i in 0..total_chunks as u32 {
                         if !chunks.contains_key(&i) {
                             missing_indices.push(i);
                         }
@@ -166,7 +166,7 @@ impl ChunkReassembler {
 
                     // Reassemble in order
                     let mut complete_data = Vec::new();
-                    for i in 0..total_chunks {
+                    for i in 0..total_chunks as u32 {
                         if let Some(chunk_data) = chunks.get(&i) {
                             complete_data.extend_from_slice(chunk_data);
                         } else {

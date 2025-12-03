@@ -21,8 +21,8 @@ pub struct StoredImage {
     pub image_id: String,
     pub from_username: String,
     pub encrypted_data: Vec<u8>,
-    pub remaining_views: u32,
-    pub max_views: u32,
+    pub remaining_views: u8,
+    pub max_views: u8,
     pub timestamp: i64,
 }
 
@@ -100,6 +100,12 @@ impl CloudNode {
         tokio::spawn(async move {
             sleep(Duration::from_secs(5)).await; // Wait for all nodes to start
             self_clone.trigger_election().await;
+        });
+
+        // Start periodic re-election task (every 60 seconds)
+        let self_clone = self.clone();
+        tokio::spawn(async move {
+            self_clone.periodic_election_task().await;
         });
 
         // Start heartbeat sender (ping all peers every 2 seconds)
@@ -411,7 +417,7 @@ impl CloudNode {
 
                 let response = if coordinator_id != self.id {
                     // NOT coordinator - forward ALL requests to coordinator
-                    info!("[Node {}] Forwarding request {} to coordinator Node {}",
+                    info!("[Node {}] 📤 Forwarding request {} to coordinator Node {} (I am worker node)",
                           self.id, request_id, coordinator_id);
 
                     // Capture client address if not already set (original request from client)
@@ -470,7 +476,7 @@ impl CloudNode {
                     }
                 } else {
                     // This node IS the coordinator - process ALL requests locally
-                    info!("[Node {}] Coordinator processing request {} locally", self.id, request_id);
+                    info!("[Node {}] 👑 Coordinator processing request {} locally", self.id, request_id);
 
                     // Process encryption locally
                     let self_clone = Arc::new(self.clone());
@@ -778,7 +784,7 @@ impl CloudNode {
         request_id: String,
         image_data: Vec<u8>,
         usernames: Vec<String>,
-        quota: u32,
+        quota: u8,
     ) -> Message {
         let start_time = Instant::now();
 
@@ -1017,7 +1023,7 @@ impl CloudNode {
 
             // Create a temporary UDP socket bound to a specific port (node's port + 1000)
             // This avoids using random ephemeral ports that might be blocked
-            let bind_addr = format!("0.0.0.0:{}", 9000 + self.id);
+            let bind_addr = format!("0.0.0.0:{}", 9000 + self.id as u16);
             let socket = match UdpSocket::bind(&bind_addr).await {
                 Ok(s) => s,
                 Err(_) => {
@@ -1220,7 +1226,7 @@ impl CloudNode {
         sleep(Duration::from_secs(3)).await;
 
         // Create a dedicated socket for heartbeats (reuse it instead of creating new ones)
-        let bind_addr = format!("0.0.0.0:{}", 10000 + self.id);
+        let bind_addr = format!("0.0.0.0:{}", 10000 + self.id as u16);
         let heartbeat_socket = match UdpSocket::bind(&bind_addr).await {
             Ok(s) => s,
             Err(_) => {
@@ -1437,14 +1443,13 @@ impl CloudNode {
         }
     }
 
-    /// Periodic election task (DEPRECATED - now only used for initial election)
-    /// Elections are now triggered only on coordinator failure
-    #[allow(dead_code)]
+    /// Periodic election task - re-elects coordinator every 60 seconds
+    /// The coordinator handles ALL requests during its 60-second term
     async fn periodic_election_task(&self) {
-        // Wait a bit before starting elections
-        sleep(Duration::from_secs(5)).await;
+        // Wait for initial election to complete and system to stabilize
+        sleep(Duration::from_secs(65)).await; // 5s initial election + 60s first term
 
-        // Increased from 15s to 60s to reduce coordinator churn
+        // Re-elect coordinator every 60 seconds
         let mut interval = interval(Duration::from_secs(60));
 
         loop {
@@ -1456,6 +1461,7 @@ impl CloudNode {
             }
             drop(state);
 
+            info!("[Node {}] ⏰ PERIODIC RE-ELECTION: 60-second term expired", self.id);
             // Trigger election
             self.trigger_election().await;
         }
@@ -1517,35 +1523,22 @@ impl CloudNode {
                 info!("=========================");
             }
 
-            // Add hysteresis: only change coordinator if load difference is significant
-            // This prevents rapid coordinator changes due to minor load fluctuations
+            // Always elect the lowest-load node as coordinator
+            // No hysteresis - coordinator changes every 60 seconds based purely on load
             let current_coordinator = manager.get_coordinator();
-            let should_change = if let Some(current_coord) = current_coordinator {
-                if current_coord == lowest_node {
-                    // Already the right coordinator
-                    false
-                } else if let Some(&current_coord_load) = all_loads.get(&current_coord) {
-                    // Only change if the new coordinator has significantly lower load (>20% difference)
-                    let load_diff_ratio = (current_coord_load - lowest_load) / current_coord_load.max(0.01);
-                    if load_diff_ratio > 0.20 {
-                        info!("[Node {}] Coordinator change justified: current load {:.2}, new load {:.2} ({:.1}% improvement)",
-                              self.id, current_coord_load, lowest_load, load_diff_ratio * 100.0);
-                        true
-                    } else {
-                        info!("[Node {}] Skipping coordinator change: load difference {:.1}% is below 20% threshold",
-                              self.id, load_diff_ratio * 100.0);
-                        false
-                    }
-                } else {
-                    // Current coordinator not in load list (may have failed), change
-                    true
-                }
+            
+            info!("[Node {}] 🗳️  ELECTION RESULT: Node {} selected as coordinator (load: {:.2})",
+                  self.id, lowest_node, lowest_load);
+            
+            if current_coordinator != Some(lowest_node) {
+                info!("[Node {}] 👑 COORDINATOR CHANGE: {:?} → Node {}",
+                      self.id, current_coordinator, lowest_node);
             } else {
-                // No coordinator yet, elect one
-                true
-            };
+                info!("[Node {}] ✅ COORDINATOR RETAINED: Node {} continues for next 60 seconds",
+                      self.id, lowest_node);
+            }
 
-            if should_change {
+            if true {
                 if lowest_node == self.id {
                     // This node should be coordinator - announce to all
                     let send_fn = |node: NodeId, msg: Message| {

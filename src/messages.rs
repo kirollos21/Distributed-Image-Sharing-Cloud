@@ -9,7 +9,7 @@ pub type NodeId = u8;
 pub struct ReceivedImageInfo {
     pub image_id: String,
     pub from_username: String,
-    pub remaining_views: u32,
+    pub remaining_views: u8,
     pub timestamp: i64,
 }
 

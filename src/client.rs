@@ -98,7 +98,7 @@ impl Client {
         client_username: String,
         image_data: Vec<u8>,
         usernames: Vec<String>,
-        quota: u32,
+        quota: u8,
     ) -> Result<Message, String> {
         let message = Message::EncryptionRequest {
             request_id: request_id.clone(),
@@ -310,7 +310,7 @@ impl Client {
         from_username: String,
         to_usernames: Vec<String>,
         encrypted_image: Vec<u8>,
-        max_views: u32,
+        max_views: u8,
         image_id: String,
     ) -> Result<String, String> {
         let message = Message::SendImage {
@@ -396,7 +396,7 @@ impl Client {
         &self,
         username: String,
         image_id: String,
-    ) -> Result<(Vec<u8>, u32), String> {
+    ) -> Result<(Vec<u8>, u8), String> {
         let message = Message::ViewImage {
             username: username.clone(),
             image_id: image_id.clone(),

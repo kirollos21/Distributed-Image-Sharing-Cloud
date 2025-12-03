@@ -25,7 +25,7 @@ pub struct ClientApp {
     image_preview: Option<egui::TextureHandle>,
 
     // Encryption parameters
-    viewing_quota: u32,
+    viewing_quota: u8,
     available_usernames: Vec<String>,
     selected_usernames: Vec<bool>,
     new_username_input: String,
@@ -43,8 +43,8 @@ pub struct ClientApp {
     // Received images state
     received_images: Vec<crate::messages::ReceivedImageInfo>,
     received_images_loading: Option<Promise<Result<Vec<crate::messages::ReceivedImageInfo>, String>>>,
-    view_image_in_progress: Option<Promise<Result<(Vec<u8>, u32), String>>>,
-    viewing_image: Option<(Vec<u8>, String, u32)>, // (image_data, image_id, remaining_views)
+    view_image_in_progress: Option<Promise<Result<(Vec<u8>, u8), String>>>,
+    viewing_image: Option<(Vec<u8>, String, u8)>, // (image_data, image_id, remaining_views)
     viewing_image_texture: Option<egui::TextureHandle>,
 
     // Tokio runtime
@@ -616,7 +616,7 @@ impl ClientApp {
             })
             .collect();
 
-        let quota: u32 = self.viewing_quota;
+        let quota: u8 = self.viewing_quota;
         let client_id: usize = self.client_id.parse().unwrap_or(1);
         let client_username = self.username.clone();
         let cloud_addresses = self.cloud_addresses.clone();
