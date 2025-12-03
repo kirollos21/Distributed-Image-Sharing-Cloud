@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{interval, sleep};
+use tokio::fs::{File, OpenOptions};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::path::Path;
 
 /// Stored image data
 #[derive(Clone, Debug)]
@@ -21,6 +24,14 @@ pub struct StoredImage {
     pub remaining_views: u32,
     pub max_views: u32,
     pub timestamp: i64,
+}
+
+/// Cached load information for a peer node
+#[derive(Clone, Debug)]
+pub struct CachedLoadInfo {
+    pub load: f64,
+    pub processed_count: usize,
+    pub timestamp: Instant,
 }
 
 /// Cloud Node that participates in the distributed system
@@ -40,6 +51,7 @@ pub struct CloudNode {
     pub chunk_cache: Arc<RwLock<HashMap<String, Vec<ChunkedMessage>>>>, // Cache sent chunks for retransmission
     pub last_heartbeat: Arc<RwLock<HashMap<NodeId, Instant>>>, // Track last heartbeat from each peer
     pub failed_nodes: Arc<RwLock<HashSet<NodeId>>>, // Nodes detected as failed
+    pub peer_load_cache: Arc<RwLock<HashMap<NodeId, CachedLoadInfo>>>, // Cached load info from heartbeats
 }
 
 impl CloudNode {
@@ -62,6 +74,7 @@ impl CloudNode {
             chunk_cache: Arc::new(RwLock::new(HashMap::new())),
             last_heartbeat: Arc::new(RwLock::new(HashMap::new())),
             failed_nodes: Arc::new(RwLock::new(HashSet::new())),
+            peer_load_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -117,6 +130,13 @@ impl CloudNode {
                     let data = buffer[..n].to_vec();
                     let self_clone = self.clone();
                     let socket_clone = socket.clone();
+
+                    // Log active request count when new request arrives
+                    let active_count = *self.active_requests.read().await;
+                    if active_count > 0 {
+                        debug!("[Node {}] Received new datagram ({} bytes) while {} requests active - spawning concurrent handler",
+                               self.id, n, active_count);
+                    }
 
                     tokio::spawn(async move {
                         if let Err(e) = self_clone.handle_datagram(socket_clone, data, addr).await {
@@ -319,30 +339,47 @@ impl CloudNode {
     async fn process_message(&self, message: Message, addr: SocketAddr) -> Option<Message> {
         match message {
             Message::SessionRegister { client_id, username } => {
-                let mut sessions = self.active_sessions.write().await;
-
-                // Check if username is already taken
-                if sessions.contains_key(&username) {
-                    info!("[Node {}] Session registration failed: username '{}' already taken", self.id, username);
+                // Check centralized users.txt file first
+                if Self::user_exists_in_file(&username).await {
+                    info!("[Node {}] Session registration failed: username '{}' already taken (in users.txt)", self.id, username);
                     Some(Message::SessionRegisterResponse {
                         success: false,
                         error: Some(format!("Username '{}' is already in use", username)),
                     })
                 } else {
-                    // Register the session
-                    sessions.insert(username.clone(), client_id.clone());
-                    info!("[Node {}] Session registered: username '{}' for client '{}'", self.id, username, client_id);
-                    Some(Message::SessionRegisterResponse {
-                        success: true,
-                        error: None,
-                    })
+                    // Add to centralized users.txt file
+                    match Self::add_user_to_file(&username).await {
+                        Ok(_) => {
+                            // Also add to local in-memory session tracking
+                            let mut sessions = self.active_sessions.write().await;
+                            sessions.insert(username.clone(), client_id.clone());
+                            info!("[Node {}] Session registered: username '{}' for client '{}' (added to users.txt)", self.id, username, client_id);
+                            Some(Message::SessionRegisterResponse {
+                                success: true,
+                                error: None,
+                            })
+                        }
+                        Err(e) => {
+                            error!("[Node {}] Failed to add user '{}' to users.txt: {}", self.id, username, e);
+                            Some(Message::SessionRegisterResponse {
+                                success: false,
+                                error: Some(format!("Failed to register user: {}", e)),
+                            })
+                        }
+                    }
                 }
             }
 
             Message::SessionUnregister { client_id: _, username } => {
+                // Remove from centralized users.txt file
+                if let Err(e) = Self::remove_user_from_file(&username).await {
+                    error!("[Node {}] Failed to remove user '{}' from users.txt: {}", self.id, username, e);
+                }
+
+                // Also remove from local in-memory session tracking
                 let mut sessions = self.active_sessions.write().await;
                 sessions.remove(&username);
-                info!("[Node {}] Session unregistered: username '{}'", self.id, username);
+                info!("[Node {}] Session unregistered: username '{}' (removed from users.txt)", self.id, username);
                 None
             }
 
@@ -481,6 +518,16 @@ impl CloudNode {
                     in_flight.remove(&request_id);
                 }
 
+                // Decrement active requests now that handling is complete
+                {
+                    let mut active = self.active_requests.write().await;
+                    *active = active.saturating_sub(1);
+                    let mut load = self.current_load.write().await;
+                    *load = *active as f64;
+                    info!("[Node {}] Finished handling request {} (active requests now: {})",
+                          self.id, request_id, *active);
+                }
+
                 response
             }
 
@@ -561,11 +608,20 @@ impl CloudNode {
                 })
             }
 
-            Message::Heartbeat { from_node } => {
+            Message::Heartbeat { from_node, load, processed_count } => {
                 // Record that we received a heartbeat from this node
                 {
+                    let now = Instant::now();
                     let mut heartbeats = self.last_heartbeat.write().await;
-                    heartbeats.insert(from_node, Instant::now());
+                    heartbeats.insert(from_node, now);
+
+                    // Cache the load information
+                    let mut load_cache = self.peer_load_cache.write().await;
+                    load_cache.insert(from_node, CachedLoadInfo {
+                        load,
+                        processed_count,
+                        timestamp: now,
+                    });
 
                     // If this node was marked as failed, remove it from failed set
                     let mut failed = self.failed_nodes.write().await;
@@ -574,15 +630,30 @@ impl CloudNode {
                     }
                 }
 
-                // Send acknowledgment
-                Some(Message::HeartbeatAck { from_node: self.id })
+                // Send acknowledgment with our current load
+                let my_load = *self.current_load.read().await;
+                let my_processed = *self.processed_requests.read().await;
+                Some(Message::HeartbeatAck {
+                    from_node: self.id,
+                    load: my_load,
+                    processed_count: my_processed,
+                })
             }
 
-            Message::HeartbeatAck { from_node } => {
+            Message::HeartbeatAck { from_node, load, processed_count } => {
                 // Update last heartbeat time for this node
                 {
+                    let now = Instant::now();
                     let mut heartbeats = self.last_heartbeat.write().await;
-                    heartbeats.insert(from_node, Instant::now());
+                    heartbeats.insert(from_node, now);
+
+                    // Cache the load information
+                    let mut load_cache = self.peer_load_cache.write().await;
+                    load_cache.insert(from_node, CachedLoadInfo {
+                        load,
+                        processed_count,
+                        timestamp: now,
+                    });
 
                     // If this node was marked as failed, remove it from failed set
                     let mut failed = self.failed_nodes.write().await;
@@ -646,8 +717,8 @@ impl CloudNode {
             }
 
             Message::CheckUsernameAvailable { username } => {
-                let sessions = self.active_sessions.read().await;
-                let is_available = !sessions.contains_key(&username);
+                // Check centralized users.txt file
+                let is_available = !Self::user_exists_in_file(&username).await;
                 Some(Message::CheckUsernameAvailableResponse {
                     username,
                     is_available,
@@ -709,18 +780,15 @@ impl CloudNode {
         usernames: Vec<String>,
         quota: u32,
     ) -> Message {
-        info!(
-            "[Node {}] Processing encryption request: {}",
-            self.id, request_id
-        );
+        let start_time = Instant::now();
 
-        // Increment active requests and update load
-        {
-            let mut active = self.active_requests.write().await;
-            *active += 1;
-            let mut load = self.current_load.write().await;
-            *load = *active as f64;
-        }
+        // Get current active count for logging (active_requests already incremented by caller)
+        let active_count = *self.active_requests.read().await;
+
+        info!(
+            "[Node {}] START encrypting request {} (current active: {})",
+            self.id, request_id, active_count
+        );
 
         // Perform encryption
         let result = match encryption::encrypt_image(image_data, usernames, quota).await {
@@ -734,7 +802,7 @@ impl CloudNode {
                 );
 
                 Message::EncryptionResponse {
-                    request_id,
+                    request_id: request_id.clone(),
                     encrypted_image,
                     success: true,
                     error: None,
@@ -747,7 +815,7 @@ impl CloudNode {
                 );
 
                 Message::EncryptionResponse {
-                    request_id,
+                    request_id: request_id.clone(),
                     encrypted_image: vec![],
                     success: false,
                     error: Some(e),
@@ -755,13 +823,11 @@ impl CloudNode {
             }
         };
 
-        // Decrement active requests and update load
-        {
-            let mut active = self.active_requests.write().await;
-            *active = active.saturating_sub(1);
-            let mut load = self.current_load.write().await;
-            *load = *active as f64;
-        }
+        let elapsed = start_time.elapsed();
+        info!(
+            "[Node {}] FINISH encrypting request {} in {:.2}s",
+            self.id, request_id, elapsed.as_secs_f64()
+        );
 
         result
     }
@@ -814,54 +880,63 @@ impl CloudNode {
     async fn find_lowest_load_node(&self) -> NodeId {
         let my_load = *self.current_load.read().await;
         let my_processed = *self.processed_requests.read().await;
-        
-        info!("[Node {}] Current load: {:.2}, processed: {}", self.id, my_load, my_processed);
-        
+
+        debug!("[Node {}] Finding lowest load node (my load: {:.2}, processed: {})",
+               self.id, my_load, my_processed);
+
         // Collect data from all nodes (including self)
         let mut node_data: HashMap<NodeId, (f64, usize)> = HashMap::new();
         node_data.insert(self.id, (my_load, my_processed));
-        
-        // Get list of failed nodes to skip them
-        let failed = self.failed_nodes.read().await;
 
-        // Query all peer nodes for their load SEQUENTIALLY (more stable)
+        // Get list of failed nodes to skip them
+        let failed = self.failed_nodes.read().await.clone();
+
+        // Get cached load data from heartbeats
+        let load_cache = self.peer_load_cache.read().await;
+        let now = Instant::now();
+        const CACHE_TTL: Duration = Duration::from_secs(10); // Consider cache stale after 10 seconds (2x heartbeat interval)
+
         for (peer_id, _) in &self.peer_addresses {
-            // Skip failed nodes - don't even try to query them
+            // Skip failed nodes
             if failed.contains(peer_id) {
-                info!("[Node {}] Skipping failed Node {} in load balancing", self.id, peer_id);
+                debug!("[Node {}] Skipping failed Node {} in load balancing", self.id, peer_id);
                 continue;
             }
 
-            let load_query = Message::LoadQuery { from_node: self.id };
+            // Try to use cached data first
+            if let Some(cached) = load_cache.get(peer_id) {
+                let age = now.duration_since(cached.timestamp);
 
-            match self.send_message_to_node(*peer_id, load_query).await {
-                Ok(Some(Message::LoadResponse { node_id, load, queue_length, processed_count })) => {
-                    info!("[Node {}] Node {} load: {:.2} (queue: {}, processed: {})",
-                          self.id, node_id, load, queue_length, processed_count);
-                    node_data.insert(node_id, (load, processed_count));
+                if age < CACHE_TTL {
+                    // Cache is fresh - use it!
+                    debug!("[Node {}] Using cached load for Node {} (age: {:.1}s, load: {:.2})",
+                           self.id, peer_id, age.as_secs_f64(), cached.load);
+                    node_data.insert(*peer_id, (cached.load, cached.processed_count));
+                } else {
+                    // Cache is stale - log it but still use it as fallback
+                    debug!("[Node {}] Stale cache for Node {} (age: {:.1}s), using anyway",
+                           self.id, peer_id, age.as_secs_f64());
+                    node_data.insert(*peer_id, (cached.load, cached.processed_count));
                 }
-                Ok(Some(other_msg)) => {
-                    warn!("[Node {}] Unexpected response from Node {}: {:?}",
-                          self.id, peer_id, other_msg);
-                }
-                Ok(None) => {
-                    warn!("[Node {}] No response from Node {} (timeout)", self.id, peer_id);
-                }
-                Err(e) => {
-                    warn!("[Node {}] Failed to query load from Node {}: {}", self.id, peer_id, e);
-                }
+            } else {
+                // No cached data - this node might not have sent heartbeat yet
+                // Use conservative estimate (assume moderate load)
+                debug!("[Node {}] No cached data for Node {}, assuming moderate load",
+                       self.id, peer_id);
+                node_data.insert(*peer_id, (my_load, 0)); // Assume similar load to self
             }
         }
 
-        drop(failed); // Release read lock
-        
+        drop(load_cache);
+        drop(failed);
+
         // Calculate total processed requests across all nodes
         let total_processed: usize = node_data.values().map(|(_, p)| p).sum();
-        
+
         // Find node with best score (lowest combined metric)
         let mut best_node = self.id;
         let mut best_score = f64::MAX;
-        
+
         for (node_id, (load, processed)) in &node_data {
             // Calculate historical work percentage (0.0 to 1.0)
             let work_percentage = if total_processed > 0 {
@@ -869,26 +944,72 @@ impl CloudNode {
             } else {
                 0.0 // All nodes at 0%, treat equally
             };
-            
+
             // Hybrid score: 70% current load + 30% historical work percentage
             // This balances immediate responsiveness with long-term fairness
             let score = (0.7 * load) + (0.3 * work_percentage * 100.0);
-            
-            info!("[Node {}] Node {} score: {:.2} (load: {:.2}, work%: {:.1}%)", 
-                  self.id, node_id, score, load, work_percentage * 100.0);
-            
+
+            debug!("[Node {}] Node {} score: {:.2} (load: {:.2}, work%: {:.1}%)",
+                   self.id, node_id, score, load, work_percentage * 100.0);
+
             if score < best_score {
                 best_score = score;
                 best_node = *node_id;
             }
         }
-        
-        info!("[Node {}] Selected node: {} (score: {:.2})", self.id, best_node, best_score);
+
+        info!("[Node {}] Selected node: {} (score: {:.2}) [CACHED]", self.id, best_node, best_score);
         best_node
     }
 
-    /// Send message to another node
+    /// Send message to another node with retry logic
     async fn send_message_to_node(&self, node_id: NodeId, message: Message) -> Result<Option<Message>, Box<dyn std::error::Error>> {
+        // Determine if this message type should be retried
+        let should_retry = matches!(message,
+            Message::LoadQuery { .. } |
+            Message::Election { .. } |
+            Message::Coordinator { .. }
+        );
+
+        let max_attempts = if should_retry { 3 } else { 1 };
+
+        for attempt in 1..=max_attempts {
+            let should_retry = {
+                let result = self.send_message_to_node_once(node_id, message.clone()).await;
+
+                match result {
+                    Ok(Some(response)) => return Ok(Some(response)),
+                    Ok(None) if attempt < max_attempts => {
+                        debug!("[Node {}] No response from Node {} on attempt {}/{}, retrying...",
+                               self.id, node_id, attempt, max_attempts);
+                        true // Should retry
+                    }
+                    Ok(None) => {
+                        debug!("[Node {}] No response from Node {} after {} attempts",
+                               self.id, node_id, max_attempts);
+                        return Ok(None);
+                    }
+                    Err(e) if attempt < max_attempts => {
+                        debug!("[Node {}] Error communicating with Node {} on attempt {}/{}: {}, retrying...",
+                               self.id, node_id, attempt, max_attempts, e);
+                        true // Should retry
+                    }
+                    Err(e) => return Err(e),
+                }
+                // result is dropped here at the end of the block
+            };
+
+            // Sleep only if we determined we should retry (result is already dropped)
+            if should_retry {
+                tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Send message to another node (single attempt)
+    async fn send_message_to_node_once(&self, node_id: NodeId, message: Message) -> Result<Option<Message>, Box<dyn std::error::Error>> {
         if let Some(address_str) = self.peer_addresses.get(&node_id) {
             // Parse the address string to SocketAddr
             let address: SocketAddr = address_str.parse()
@@ -915,10 +1036,12 @@ impl CloudNode {
                 Message::DecryptionResponse { .. }
             );
 
-            // Use longer timeout for encryption/decryption requests (30 seconds)
+            // Use appropriate timeouts based on message type
             let timeout_duration = match message {
                 Message::EncryptionRequest { .. } | Message::DecryptionRequest { .. } => Duration::from_secs(30),
-                _ => Duration::from_millis(500),
+                Message::LoadQuery { .. } => Duration::from_secs(3), // Increased from 500ms - nodes may be busy
+                Message::Election { .. } | Message::Coordinator { .. } => Duration::from_secs(2), // Critical messages
+                _ => Duration::from_secs(1), // Default 1 second for other messages
             };
 
             if needs_chunking && message_bytes.len() > 45000 {
@@ -949,17 +1072,29 @@ impl CloudNode {
                                 if let Some(complete_data) = reassembler.process_chunk(chunk_msg) {
                                     // Got complete message
                                     let response: Message = serde_json::from_slice(&complete_data)?;
+                                    debug!("[Node {}] Received response from Node {}: {}", self.id, node_id, response);
                                     return Ok(Some(response));
                                 }
                                 // Continue receiving more chunks
                             } else {
                                 // Not a chunked message, try parsing directly
                                 if let Ok(response) = serde_json::from_slice::<Message>(&chunk_buffer[..n]) {
+                                    debug!("[Node {}] Received response from Node {}: {}", self.id, node_id, response);
                                     return Ok(Some(response));
+                                } else {
+                                    debug!("[Node {}] Received invalid message from Node {} ({} bytes)", self.id, node_id, n);
                                 }
                             }
                         }
-                        _ => return Ok(None),
+                        Ok(Err(e)) => {
+                            debug!("[Node {}] Socket error waiting for response from Node {}: {}", self.id, node_id, e);
+                            return Ok(None);
+                        }
+                        Err(_) => {
+                            debug!("[Node {}] Timeout waiting for response from Node {} after {:?}",
+                                   self.id, node_id, timeout_duration);
+                            return Ok(None);
+                        }
                     }
                 }
             } else {
@@ -982,19 +1117,29 @@ impl CloudNode {
                                 if let Some(complete_data) = reassembler.process_chunk(chunk_msg) {
                                     // Got complete message
                                     let response: Message = serde_json::from_slice(&complete_data)?;
+                                    debug!("[Node {}] Received response from Node {}: {}", self.id, node_id, response);
                                     return Ok(Some(response));
                                 }
                                 // Continue receiving more chunks
                             } else {
                                 // Not a chunked message, try parsing directly
                                 if let Ok(response) = serde_json::from_slice::<Message>(&chunk_buffer[..n]) {
+                                    debug!("[Node {}] Received response from Node {}: {}", self.id, node_id, response);
                                     return Ok(Some(response));
                                 } else {
-                                    // Invalid message, continue or timeout
+                                    debug!("[Node {}] Received invalid message from Node {} ({} bytes)", self.id, node_id, n);
                                 }
                             }
                         }
-                        _ => return Ok(None),
+                        Ok(Err(e)) => {
+                            debug!("[Node {}] Socket error waiting for response from Node {}: {}", self.id, node_id, e);
+                            return Ok(None);
+                        }
+                        Err(_) => {
+                            debug!("[Node {}] Timeout waiting for response from Node {} after {:?}",
+                                   self.id, node_id, timeout_duration);
+                            return Ok(None);
+                        }
                     }
                 }
             }
@@ -1069,7 +1214,7 @@ impl CloudNode {
         sleep(Duration::from_millis(500)).await;
     }
 
-    /// Heartbeat sender task - sends heartbeat to all peers every 2 seconds
+    /// Heartbeat sender task - sends heartbeat to all peers every 5 seconds
     async fn heartbeat_sender_task(&self) {
         // Wait a bit for other nodes to start
         sleep(Duration::from_secs(3)).await;
@@ -1090,14 +1235,22 @@ impl CloudNode {
             }
         };
 
-        let mut interval = interval(Duration::from_secs(2));
+        let mut interval = interval(Duration::from_secs(5));
 
         loop {
             interval.tick().await;
 
+            // Get current load and processed count to include in heartbeat
+            let current_load = *self.current_load.read().await;
+            let current_processed = *self.processed_requests.read().await;
+
             // Send heartbeat to all peers
             for (peer_id, peer_addr) in &self.peer_addresses {
-                let message = Message::Heartbeat { from_node: self.id };
+                let message = Message::Heartbeat {
+                    from_node: self.id,
+                    load: current_load,
+                    processed_count: current_processed,
+                };
 
                 match serde_json::to_vec(&message) {
                     Ok(message_bytes) => {
@@ -1120,14 +1273,14 @@ impl CloudNode {
         }
     }
 
-    /// Failure detector task - checks for failed nodes every 3 seconds
+    /// Failure detector task - checks for failed nodes every 5 seconds
     async fn failure_detector_task(&self) {
         // Wait longer for heartbeats to start flowing and all nodes to be ready
         // This prevents false-positive failure detection at startup
         sleep(Duration::from_secs(15)).await;
 
-        let mut interval = interval(Duration::from_secs(3));
-        const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10); // Increased from 6s to 10s for more forgiveness
+        let mut interval = interval(Duration::from_secs(5));
+        const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(20); // Increased to 20s since heartbeats are every 5s
 
         loop {
             interval.tick().await;
@@ -1191,6 +1344,7 @@ impl CloudNode {
     }
 
     /// Load monitoring task - logs load distribution every 10 seconds
+    /// OPTIMIZED: Uses cached load data from heartbeats instead of querying nodes
     async fn load_monitoring_task(&self) {
         // Wait for system to stabilize before starting monitoring
         sleep(Duration::from_secs(20)).await;
@@ -1206,89 +1360,63 @@ impl CloudNode {
             drop(manager);
 
             // Get failed nodes
-            let failed = self.failed_nodes.read().await;
+            let failed = self.failed_nodes.read().await.clone();
+
+            // Get cached load data
+            let load_cache = self.peer_load_cache.read().await;
+            let now = Instant::now();
 
             // Collect load information from all nodes
             let mut load_info = Vec::new();
 
             // Add this node's info
-            let self_load = self.current_load.read().await;
-            let self_processed = self.processed_requests.read().await;
-            let self_active = self.active_requests.read().await;
+            let self_load = *self.current_load.read().await;
+            let self_processed = *self.processed_requests.read().await;
+            let self_active = *self.active_requests.read().await;
 
             let is_coordinator = coordinator_id == Some(self.id);
             let status = if is_coordinator { "COORDINATOR" } else { "Worker" };
 
             load_info.push((
                 self.id,
-                *self_load,
-                *self_processed,
-                *self_active,
+                self_load,
+                self_processed,
+                self_active,
                 status.to_string(),
             ));
 
-            drop(self_load);
-            drop(self_processed);
-            drop(self_active);
-
-            // Query all peer nodes for their load
-            for (&peer_id, peer_addr) in &self.peer_addresses {
+            // Use cached data for peer nodes
+            for (&peer_id, _) in &self.peer_addresses {
                 // Skip failed nodes
                 if failed.contains(&peer_id) {
                     load_info.push((peer_id, 0.0, 0, 0, "FAILED".to_string()));
                     continue;
                 }
 
-                // Send load query
-                let message = Message::LoadQuery { from_node: self.id };
+                // Try to use cached data
+                if let Some(cached) = load_cache.get(&peer_id) {
+                    let age = now.duration_since(cached.timestamp);
 
-                match serde_json::to_vec(&message) {
-                    Ok(message_bytes) => {
-                        // Create temporary socket for query
-                        match UdpSocket::bind("0.0.0.0:0").await {
-                            Ok(query_socket) => {
-                                // Set short timeout for monitoring query
-                                match tokio::time::timeout(
-                                    Duration::from_secs(2),
-                                    async {
-                                        // Send query
-                                        query_socket.send_to(&message_bytes, peer_addr).await?;
+                    // Determine status
+                    let status = if coordinator_id == Some(peer_id) {
+                        "COORDINATOR"
+                    } else if age.as_secs() > 15 {
+                        "STALE" // Haven't heard from this node in 15+ seconds (3x heartbeat interval)
+                    } else {
+                        "Worker"
+                    };
 
-                                        // Wait for response
-                                        let mut buf = vec![0u8; 65535];
-                                        let (n, _) = query_socket.recv_from(&mut buf).await?;
-                                        let response: Message = serde_json::from_slice(&buf[..n])?;
+                    // Assume active_requests = load (since load is based on active requests)
+                    let active = cached.load as usize;
 
-                                        Ok::<Message, Box<dyn std::error::Error>>(response)
-                                    }
-                                ).await {
-                                    Ok(Ok(Message::LoadResponse { node_id, load, processed_count, .. })) => {
-                                        let status = if coordinator_id == Some(node_id) {
-                                            "COORDINATOR"
-                                        } else {
-                                            "Worker"
-                                        };
-                                        load_info.push((node_id, load, processed_count, 0, status.to_string()));
-                                    }
-                                    _ => {
-                                        // Query failed or timed out
-                                        load_info.push((peer_id, 0.0, 0, 0, "NO_RESPONSE".to_string()));
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                // Socket creation failed
-                                load_info.push((peer_id, 0.0, 0, 0, "ERROR".to_string()));
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        // Serialization failed
-                        load_info.push((peer_id, 0.0, 0, 0, "ERROR".to_string()));
-                    }
+                    load_info.push((peer_id, cached.load, cached.processed_count, active, status.to_string()));
+                } else {
+                    // No cached data - node hasn't sent heartbeat yet
+                    load_info.push((peer_id, 0.0, 0, 0, "NO_HEARTBEAT".to_string()));
                 }
             }
 
+            drop(load_cache);
             drop(failed);
 
             // Sort by node ID for consistent display
@@ -1419,7 +1547,7 @@ impl CloudNode {
 
             if should_change {
                 if lowest_node == self.id {
-                    // This node should be coordinator
+                    // This node should be coordinator - announce to all
                     let send_fn = |node: NodeId, msg: Message| {
                         let self_clone = self.clone();
                         tokio::spawn(async move {
@@ -1429,12 +1557,102 @@ impl CloudNode {
                     };
                     manager.announce_coordinator(current_load, send_fn);
                 } else {
-                    // Update coordinator
+                    // Another node should be coordinator - update locally AND broadcast to all nodes
                     manager.update_coordinator(lowest_node, lowest_load);
+
+                    info!("[Node {}] Broadcasting coordinator decision: Node {} with load {:.2}",
+                          self.id, lowest_node, lowest_load);
+
+                    // Broadcast coordinator message to ALL nodes (including the winner and this node)
+                    // This ensures everyone has the same view
+                    for (&peer_id, _) in &self.peer_addresses {
+                        let message = Message::Coordinator {
+                            node_id: lowest_node,
+                            load: lowest_load,
+                        };
+                        let self_clone = self.clone();
+                        tokio::spawn(async move {
+                            let _ = self_clone.send_message_to_node(peer_id, message).await;
+                        });
+                    }
                 }
             }
         }
     }
+
+    // ============================================================
+    // Centralized User Tracking (users.txt file)
+    // ============================================================
+
+    /// Read all users from the centralized users.txt file
+    async fn read_users_file() -> Result<HashSet<String>, std::io::Error> {
+        let users_file = "users.txt";
+
+        if !Path::new(users_file).exists() {
+            // File doesn't exist yet, return empty set
+            return Ok(HashSet::new());
+        }
+
+        let file = File::open(users_file).await?;
+        let reader = BufReader::new(file);
+        let mut lines = reader.lines();
+        let mut users = HashSet::new();
+
+        while let Some(line) = lines.next_line().await? {
+            let username = line.trim();
+            if !username.is_empty() {
+                users.insert(username.to_string());
+            }
+        }
+
+        Ok(users)
+    }
+
+    /// Write all users to the centralized users.txt file
+    async fn write_users_file(users: &HashSet<String>) -> Result<(), std::io::Error> {
+        let users_file = "users.txt";
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(users_file)
+            .await?;
+
+        let mut sorted_users: Vec<_> = users.iter().collect();
+        sorted_users.sort();
+
+        for username in sorted_users {
+            file.write_all(format!("{}\n", username).as_bytes()).await?;
+        }
+
+        file.flush().await?;
+        Ok(())
+    }
+
+    /// Add a user to the centralized users.txt file
+    async fn add_user_to_file(username: &str) -> Result<(), std::io::Error> {
+        let mut users = Self::read_users_file().await.unwrap_or_else(|_| HashSet::new());
+        users.insert(username.to_string());
+        Self::write_users_file(&users).await
+    }
+
+    /// Remove a user from the centralized users.txt file
+    async fn remove_user_from_file(username: &str) -> Result<(), std::io::Error> {
+        let mut users = Self::read_users_file().await.unwrap_or_else(|_| HashSet::new());
+        users.remove(username);
+        Self::write_users_file(&users).await
+    }
+
+    /// Check if username exists in the centralized users.txt file
+    async fn user_exists_in_file(username: &str) -> bool {
+        match Self::read_users_file().await {
+            Ok(users) => users.contains(username),
+            Err(_) => false,
+        }
+    }
+
+    // ============================================================
 
     /// Get current node statistics
     pub async fn get_stats(&self) -> NodeStats {
@@ -1467,6 +1685,7 @@ impl Clone for CloudNode {
             chunk_cache: Arc::clone(&self.chunk_cache),
             last_heartbeat: Arc::clone(&self.last_heartbeat),
             failed_nodes: Arc::clone(&self.failed_nodes),
+            peer_load_cache: Arc::clone(&self.peer_load_cache),
         }
     }
 }

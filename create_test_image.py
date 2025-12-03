@@ -1,61 +1,72 @@
 #!/usr/bin/env python3
 """
-Create a TINY test image for UDP testing
-Generates a ~8KB JPEG image that will work with the 10KB limit
-UDP requires both request AND response to fit in 65KB packets
+Create a simple test image for encryption testing
 """
 
-try:
-    from PIL import Image, ImageDraw, ImageFont
-    import random
-except ImportError:
-    print("Installing required package...")
-    import subprocess
-    subprocess.check_call(["pip3", "install", "pillow"])
-    from PIL import Image, ImageDraw, ImageFont
-    import random
+from PIL import Image, ImageDraw, ImageFont
+import random
 
-# Create a TINY colorful image (must be <10KB)
-width, height = 100, 80
-image = Image.new('RGB', (width, height))
-draw = ImageDraw.Draw(image)
+def create_test_image(filename="test_input.jpg", width=800, height=600):
+    """Create a colorful test image with text"""
 
-# Draw colorful gradient background
-for y in range(height):
-    r = int((y / height) * 255)
-    g = int((1 - y / height) * 255)
-    b = 128
-    draw.rectangle([0, y, width, y+1], fill=(r, g, b))
+    # Create image with gradient background
+    img = Image.new('RGB', (width, height))
+    draw = ImageDraw.Draw(img)
 
-# Draw some shapes
-draw.ellipse([20, 20, 80, 80], fill=(255, 255, 0), outline=(0, 0, 0))
-draw.rectangle([100, 50, 180, 130], fill=(255, 100, 100), outline=(0, 0, 0))
-draw.polygon([(120, 10), (140, 40), (100, 40)], fill=(100, 255, 100), outline=(0, 0, 0))
+    # Create gradient background
+    for y in range(height):
+        r = int((y / height) * 255)
+        g = int(128 + (y / height) * 127)
+        b = int(255 - (y / height) * 128)
+        draw.line([(0, y), (width, y)], fill=(r, g, b))
 
-# Add text
-try:
-    draw.text((10, 120), "Test Image", fill=(255, 255, 255))
-except:
-    pass
+    # Add some random circles
+    for _ in range(20):
+        x = random.randint(0, width)
+        y = random.randint(0, height)
+        radius = random.randint(20, 80)
+        color = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+        draw.ellipse([x-radius, y-radius, x+radius, y+radius], fill=color, outline=(0, 0, 0), width=2)
 
-# Save with JPEG compression to keep size VERY small
-image.save('test_image_small.jpg', 'JPEG', quality=70)
+    # Add text
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 48)
+    except:
+        font = ImageFont.load_default()
 
-# Check size
-import os
-size_bytes = os.path.getsize('test_image_small.jpg')
-size_kb = size_bytes / 1024
+    text = "TEST IMAGE"
+    # Get text bounding box
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_width = bbox[2] - bbox[0]
+    text_height = bbox[3] - bbox[1]
 
-print(f"✅ Created test_image_small.jpg")
-print(f"   Size: {size_kb:.1f} KB ({size_bytes} bytes)")
-print(f"   Dimensions: {width}x{height}")
-print("")
-if size_kb < 10:
-    print(f"   ✅ Within UDP limit (10 KB) - should work!")
-else:
-    print(f"   ⚠️  Above UDP limit (10 KB) - will be compressed")
-print("")
-print("⚠️  UDP requires TINY images!")
-print("   Request + Response must BOTH fit in 65KB UDP packets")
-print("")
-print("Use this image to test the client GUI!")
+    text_x = (width - text_width) // 2
+    text_y = (height - text_height) // 2
+
+    # Draw text with shadow
+    draw.text((text_x+3, text_y+3), text, font=font, fill=(0, 0, 0))
+    draw.text((text_x, text_y), text, font=font, fill=(255, 255, 255))
+
+    # Save
+    img.save(filename, quality=95)
+    print(f"✅ Created test image: {filename}")
+    print(f"   Size: {width}x{height}")
+    print(f"   Format: JPEG")
+
+    return filename
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) > 1:
+        filename = sys.argv[1]
+    else:
+        filename = "test_input.jpg"
+
+    if len(sys.argv) > 3:
+        width = int(sys.argv[2])
+        height = int(sys.argv[3])
+    else:
+        width, height = 800, 600
+
+    create_test_image(filename, width, height)

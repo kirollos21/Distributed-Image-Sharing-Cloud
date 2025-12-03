@@ -35,29 +35,39 @@ impl Client {
         };
 
         info!("[Client {}] Registering username: {}", self.id, username);
+        info!("[Client {}] Trying {} cloud nodes...", self.id, self.cloud_addresses.len());
 
         // Try to register with any available node
-        for address in &self.cloud_addresses {
+        let mut last_error = String::new();
+        for (i, address) in self.cloud_addresses.iter().enumerate() {
+            info!("[Client {}] Attempting connection to node {}/{}: {}", self.id, i + 1, self.cloud_addresses.len(), address);
+
             match Self::send_to_node(self.id, address, message.clone()).await {
                 Ok(Message::SessionRegisterResponse { success, error }) => {
                     if success {
                         info!("[Client {}] Successfully registered username: {}", self.id, username);
                         return Ok(());
                     } else {
-                        return Err(error.unwrap_or_else(|| "Registration failed".to_string()));
+                        let err_msg = error.unwrap_or_else(|| "Registration failed".to_string());
+                        error!("[Client {}] Node {} rejected registration: {}", self.id, address, err_msg);
+                        return Err(err_msg);
                     }
                 }
                 Ok(_) => {
-                    return Err("Unexpected response from server".to_string());
+                    let err_msg = "Unexpected response from server".to_string();
+                    error!("[Client {}] Node {} sent unexpected response", self.id, address);
+                    return Err(err_msg);
                 }
                 Err(e) => {
-                    warn!("[Client {}] Failed to register with {}: {}", self.id, address, e);
+                    warn!("[Client {}] Failed to connect to node {} ({}): {}", self.id, i + 1, address, e);
+                    last_error = format!("{}: {}", address, e);
                     continue;
                 }
             }
         }
 
-        Err("Failed to connect to any cloud node".to_string())
+        error!("[Client {}] Failed to connect to any cloud node. Last error: {}", self.id, last_error);
+        Err(format!("Failed to connect to any cloud node. Last error: {}", last_error))
     }
 
     /// Unregister a session
@@ -133,46 +143,97 @@ impl Client {
         address: &str,
         message: Message,
     ) -> Result<Message, String> {
+        debug!("[Client {}] send_to_node: Connecting to {}", client_id, address);
+
         // Create UDP socket
         let socket = match UdpSocket::bind("0.0.0.0:0").await {
-            Ok(s) => s,
+            Ok(s) => {
+                debug!("[Client {}] Socket created successfully", client_id);
+                s
+            }
             Err(e) => {
-                warn!("[Client {}] Failed to create socket: {}", client_id, e);
+                error!("[Client {}] Failed to create socket: {}", client_id, e);
                 return Err(format!("Socket creation failed: {}", e));
             }
         };
 
         // Serialize message
-        let message_bytes = serde_json::to_vec(&message).map_err(|e| e.to_string())?;
+        let message_bytes = serde_json::to_vec(&message).map_err(|e| {
+            error!("[Client {}] Message serialization failed: {}", client_id, e);
+            e.to_string()
+        })?;
 
-        // Check message size
-        if message_bytes.len() > 65507 {
-            return Err("Message exceeds UDP packet size limit".to_string());
+        debug!("[Client {}] Message serialized: {} bytes", client_id, message_bytes.len());
+
+        // Use chunking for any size message
+        let chunks = ChunkedMessage::fragment(message_bytes.clone());
+
+        if chunks.len() == 1 {
+            // Single packet - send directly
+            let chunk_bytes = serde_json::to_vec(&chunks[0]).map_err(|e| {
+                error!("[Client {}] Chunk serialization failed: {}", client_id, e);
+                e.to_string()
+            })?;
+
+            debug!("[Client {}] Sending single packet: {} bytes to {}", client_id, chunk_bytes.len(), address);
+            socket
+                .send_to(&chunk_bytes, address)
+                .await
+                .map_err(|e| {
+                    error!("[Client {}] Send failed to {}: {}", client_id, address, e);
+                    format!("Send error: {}", e)
+                })?;
+        } else {
+            // Multiple chunks - send with delay to prevent packet loss
+            info!("[Client {}] Sending {} chunks ({} bytes total) to {}",
+                  client_id, chunks.len(), message_bytes.len(), address);
+
+            for (i, chunk) in chunks.iter().enumerate() {
+                let chunk_bytes = serde_json::to_vec(&chunk).map_err(|e| {
+                    error!("[Client {}] Chunk {} serialization failed: {}", client_id, i, e);
+                    e.to_string()
+                })?;
+
+                socket
+                    .send_to(&chunk_bytes, address)
+                    .await
+                    .map_err(|e| {
+                        error!("[Client {}] Chunk {} send failed to {}: {}", client_id, i, address, e);
+                        format!("Send error: {}", e)
+                    })?;
+
+                // Small delay between chunks to prevent UDP packet loss
+                if i < chunks.len() - 1 {
+                    sleep(Duration::from_millis(5)).await;
+                }
+            }
+
+            info!("[Client {}] Successfully sent all {} chunks to {}", client_id, chunks.len(), address);
         }
 
-        // Send message
-        socket
-            .send_to(&message_bytes, address)
-            .await
-            .map_err(|e| format!("Send error: {}", e))?;
-
-        debug!("[Client {}] Sent {} bytes to {}", client_id, message_bytes.len(), address);
+        debug!("[Client {}] Successfully sent message to {}", client_id, address);
 
         // Create chunk reassembler for receiving response
         let mut reassembler = ChunkReassembler::new();
         let mut buffer = vec![0u8; 65535]; // Max UDP packet size
 
         // Loop to receive all chunks
+        debug!("[Client {}] Waiting for response from {} (10s timeout)...", client_id, address);
         loop {
             // Read response with timeout
             let n = match tokio::time::timeout(Duration::from_secs(10), socket.recv_from(&mut buffer)).await
             {
-                Ok(Ok((n, _))) => n,
+                Ok(Ok((n, _))) => {
+                    debug!("[Client {}] Received {} bytes from {}", client_id, n, address);
+                    n
+                }
                 Ok(Err(e)) => {
+                    error!("[Client {}] Receive error from {}: {}", client_id, address, e);
                     return Err(format!("Receive error: {}", e));
                 }
                 Err(_) => {
-                    return Err("Timeout waiting for response".to_string());
+                    error!("[Client {}] Timeout waiting for response from {} (waited 10s)", client_id, address);
+                    return Err(format!("Timeout waiting for response from {}", address));
                 }
             };
 
@@ -243,6 +304,7 @@ impl Client {
     }
 
     /// Send an encrypted image to other users
+    /// Sends to ALL nodes for replication
     pub async fn send_image(
         &self,
         from_username: String,
@@ -259,30 +321,42 @@ impl Client {
             image_id: image_id.clone(),
         };
 
-        info!("[Client {}] Sending image {} to {:?}", self.id, image_id, to_usernames);
+        info!("[Client {}] Sending image {} to {:?} (replicating to {} nodes)",
+              self.id, image_id, to_usernames, self.cloud_addresses.len());
 
-        // Try to send to any available node
+        // Send to ALL nodes for replication (so queries can find the image on any node)
+        let mut success_count = 0;
+        let mut last_error = String::new();
+
         for address in &self.cloud_addresses {
             match Self::send_to_node(self.id, address, message.clone()).await {
-                Ok(Message::SendImageResponse { success, image_id, error }) => {
+                Ok(Message::SendImageResponse { success, image_id: _, error }) => {
                     if success {
-                        info!("[Client {}] Successfully sent image: {}", self.id, image_id);
-                        return Ok(image_id);
+                        success_count += 1;
+                        debug!("[Client {}] Image replicated to {}", self.id, address);
                     } else {
-                        return Err(error.unwrap_or_else(|| "Send failed".to_string()));
+                        last_error = error.unwrap_or_else(|| "Send failed".to_string());
+                        warn!("[Client {}] Node {} rejected image: {}", self.id, address, last_error);
                     }
                 }
                 Ok(_) => {
-                    return Err("Unexpected response from server".to_string());
+                    last_error = "Unexpected response from server".to_string();
+                    warn!("[Client {}] Unexpected response from {}", self.id, address);
                 }
                 Err(e) => {
+                    last_error = e.clone();
                     warn!("[Client {}] Failed to send to {}: {}", self.id, address, e);
-                    continue;
                 }
             }
         }
 
-        Err("Failed to connect to any cloud node".to_string())
+        if success_count > 0 {
+            info!("[Client {}] Successfully sent image {} to {}/{} nodes",
+                  self.id, image_id, success_count, self.cloud_addresses.len());
+            Ok(image_id)
+        } else {
+            Err(format!("Failed to send to any node. Last error: {}", last_error))
+        }
     }
 
     /// Query received images for a username
@@ -296,11 +370,11 @@ impl Client {
 
         info!("[Client {}] Querying received images for: {}", self.id, username);
 
-        // Try to query from any available node
+        // Query first available node (simple centralized approach)
         for address in &self.cloud_addresses {
             match Self::send_to_node(self.id, address, message.clone()).await {
                 Ok(Message::QueryReceivedImagesResponse { images }) => {
-                    info!("[Client {}] Found {} images for {}", self.id, images.len(), username);
+                    info!("[Client {}] Found {} images", self.id, images.len());
                     return Ok(images);
                 }
                 Ok(_) => {
@@ -317,6 +391,7 @@ impl Client {
     }
 
     /// View an image (decrements the view counter)
+    /// Tries nodes to find the image
     pub async fn view_image(
         &self,
         username: String,
@@ -329,7 +404,9 @@ impl Client {
 
         info!("[Client {}] Viewing image {} for: {}", self.id, image_id, username);
 
-        // Try to view from any available node
+        // Try nodes until one succeeds
+        let mut last_error = String::new();
+
         for address in &self.cloud_addresses {
             match Self::send_to_node(self.id, address, message.clone()).await {
                 Ok(Message::ViewImageResponse {
@@ -342,7 +419,8 @@ impl Client {
                         let encrypted_data = image_data.ok_or_else(|| "No image data returned".to_string())?;
                         let remaining = remaining_views.ok_or_else(|| "No view count returned".to_string())?;
 
-                        info!("[Client {}] Received encrypted image {} ({} bytes) for viewing", self.id, image_id, encrypted_data.len());
+                        info!("[Client {}] Received encrypted image {} ({} bytes) from {}",
+                              self.id, image_id, encrypted_data.len(), address);
                         eprintln!("[DEBUG] Starting decryption for image {} ({} bytes)", image_id, encrypted_data.len());
 
                         // Decrypt the image to extract metadata and get viewable image
@@ -363,20 +441,26 @@ impl Client {
                             }
                         }
                     } else {
-                        return Err(error.unwrap_or_else(|| "View failed".to_string()));
+                        // Image not found on this node, try next
+                        last_error = error.unwrap_or_else(|| "Image not found on this node".to_string());
+                        warn!("[Client {}] Image {} not on {}: {}", self.id, image_id, address, last_error);
+                        continue;
                     }
                 }
                 Ok(_) => {
-                    return Err("Unexpected response from server".to_string());
+                    last_error = "Unexpected response from server".to_string();
+                    warn!("[Client {}] Unexpected response from {}", self.id, address);
+                    continue;
                 }
                 Err(e) => {
+                    last_error = format!("Connection failed: {}", e);
                     warn!("[Client {}] Failed to view from {}: {}", self.id, address, e);
                     continue;
                 }
             }
         }
 
-        Err("Failed to connect to any cloud node".to_string())
+        Err(format!("Image not found on any node. Last error: {}", last_error))
     }
 
     /// Generate a random test image
