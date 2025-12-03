@@ -21,15 +21,15 @@ pub enum ChunkedMessage {
     /// Multi-packet chunk
     MultiPacket {
         chunk_id: String,      // Unique ID for this multi-packet message
-        chunk_index: u32,      // 0-based index of this chunk
-        total_chunks: u32,     // Total number of chunks
+        chunk_index: u16,      // 0-based index of this chunk
+        total_chunks: u16,     // Total number of chunks
         data: String,          // Chunk data (base64 encoded)
     },
     
     /// Request retransmission of missing chunks
     RetransmitRequest {
         chunk_id: String,      // ID of the multi-packet message
-        missing_indices: Vec<u32>, // Indices of missing chunks to retransmit
+        missing_indices: Vec<u16>, // Indices of missing chunks to retransmit
     },
 }
 
@@ -46,7 +46,7 @@ impl ChunkedMessage {
         }
 
         // Calculate number of chunks needed
-        let total_chunks = ((data_len + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
+        let total_chunks = ((data_len + CHUNK_SIZE - 1) / CHUNK_SIZE) as u16;
         let chunk_id = format!("{}", uuid::Uuid::new_v4());
 
         debug!("Fragmenting message: {} bytes into {} chunks (chunk_id: {})",

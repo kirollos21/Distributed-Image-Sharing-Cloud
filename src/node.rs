@@ -359,28 +359,83 @@ impl CloudNode {
                 {
                     let mut in_flight = self.in_flight_requests.write().await;
                     if in_flight.contains(&request_id) {
-                        if !forwarded {
-                            // Only ignore non-forwarded duplicates
-                            // Forwarded requests from coordinator MUST be processed even if duplicate
-                            warn!("[Node {}] Ignoring duplicate request {} (already in flight)", self.id, request_id);
-                            return None;
-                        } else {
-                            // Coordinator has selected us to process this - override duplicate detection
-                            info!("[Node {}] Processing coordinator-forwarded request {} despite duplicate (coordinator override)",
-                                  self.id, request_id);
-                        }
+                        warn!("[Node {}] Ignoring duplicate request {} (already in flight)", self.id, request_id);
+                        return None;
                     } else {
                         // Mark request as in-flight
                         in_flight.insert(request_id.clone());
                     }
                 }
 
-                // Process request and ensure cleanup happens regardless of outcome
-                let response = if forwarded {
-                    // Request forwarded by coordinator - MUST process locally
-                    info!("[Node {}] Processing forwarded request {} locally (from coordinator)", self.id, request_id);
+                // Get current coordinator (may change due to elections)
+                let manager = self.election_manager.lock().await;
+                let coordinator_id = manager.get_coordinator().unwrap_or(self.id);
+                drop(manager); // Release lock immediately
 
-                    // Process encryption (active_requests incremented inside process_encryption_request)
+                let response = if coordinator_id != self.id {
+                    // NOT coordinator - forward ALL requests to coordinator
+                    info!("[Node {}] Forwarding request {} to coordinator Node {}",
+                          self.id, request_id, coordinator_id);
+
+                    // Capture client address if not already set (original request from client)
+                    let client_addr = if client_address.is_none() {
+                        // Check if this is from a client (not from a peer node)
+                        let addr_str = addr.to_string();
+                        let is_peer = self.peer_addresses.values().any(|peer_addr| {
+                            peer_addr == &addr_str
+                        });
+
+                        if !is_peer {
+                            Some(addr_str)
+                        } else {
+                            None
+                        }
+                    } else {
+                        client_address
+                    };
+
+                    let forward_message = Message::EncryptionRequest {
+                        request_id: request_id.clone(),
+                        client_username,
+                        image_data,
+                        usernames,
+                        quota,
+                        forwarded: true, // Mark as forwarded from non-coordinator
+                        client_address: client_addr,
+                    };
+
+                    match self.send_message_to_node(coordinator_id, forward_message).await {
+                        Ok(Some(response)) => {
+                            info!("[Node {}] Received response from coordinator Node {} for {}",
+                                  self.id, coordinator_id, request_id);
+                            Some(response)
+                        }
+                        Ok(None) => {
+                            warn!("[Node {}] No response from coordinator Node {} for {}",
+                                  self.id, coordinator_id, request_id);
+                            Some(Message::EncryptionResponse {
+                                request_id: request_id.clone(),
+                                encrypted_image: vec![],
+                                success: false,
+                                error: Some("Coordinator did not respond".to_string()),
+                            })
+                        }
+                        Err(e) => {
+                            error!("[Node {}] Failed to contact coordinator Node {} for {}: {}",
+                                   self.id, coordinator_id, request_id, e);
+                            Some(Message::EncryptionResponse {
+                                request_id: request_id.clone(),
+                                encrypted_image: vec![],
+                                success: false,
+                                error: Some(format!("Coordinator unreachable: {}", e)),
+                            })
+                        }
+                    }
+                } else {
+                    // This node IS the coordinator - process ALL requests locally
+                    info!("[Node {}] Coordinator processing request {} locally", self.id, request_id);
+
+                    // Process encryption locally
                     let self_clone = Arc::new(self.clone());
                     let result = self_clone
                         .process_encryption_request(request_id.clone(), image_data, usernames, quota)
@@ -398,12 +453,12 @@ impl CloudNode {
                                 if let Err(e) = self_clone.send_response_to_client(client_sock_addr, result.clone()).await {
                                     error!("[Node {}] Failed to send direct response to client {}: {}",
                                            self.id, client_addr_str, e);
-                                    // Still return response to coordinator as fallback
+                                    // Still return response to forwarding node as fallback
                                     Some(result)
                                 } else {
                                     info!("[Node {}] Successfully sent response for {} directly to client",
                                           self.id, request_id);
-                                    // Return None - no need to send back through coordinator
+                                    // Return None - no need to send back through forwarding node
                                     None
                                 }
                             }
@@ -415,145 +470,12 @@ impl CloudNode {
                             }
                         }
                     } else {
-                        // No client address - return response normally
+                        // No client address - return response to forwarding node
                         Some(result)
-                    }
-                } else {
-                    // Get current coordinator (may change due to elections)
-                    let manager = self.election_manager.lock().await;
-                    let coordinator_id = manager.get_coordinator().unwrap_or(self.id);
-                    drop(manager); // Release lock immediately
-
-                    if coordinator_id != self.id {
-                        // Not coordinator - forward to current coordinator for load balancing
-                        info!("[Node {}] Forwarding request {} to coordinator Node {} for load balancing",
-                              self.id, request_id, coordinator_id);
-
-                        // Capture client address if not already set (original request from client)
-                        let client_addr = if client_address.is_none() {
-                            // Check if this is from a client (not from a peer node)
-                            let addr_str = addr.to_string();
-                            let is_peer = self.peer_addresses.values().any(|peer_addr| {
-                                // peer_addr is a String like "10.40.59.43:8001"
-                                // Compare with sender's address
-                                peer_addr == &addr_str
-                            });
-
-                            if !is_peer {
-                                Some(addr_str)
-                            } else {
-                                None
-                            }
-                        } else {
-                            client_address
-                        };
-
-                        let forward_message = Message::EncryptionRequest {
-                            request_id: request_id.clone(),
-                            client_username,
-                            image_data,
-                            usernames,
-                            quota,
-                            forwarded: false, // Coordinator will do load balancing
-                            client_address: client_addr,
-                        };
-
-                        match self.send_message_to_node(coordinator_id, forward_message).await {
-                            Ok(Some(response)) => {
-                                info!("[Node {}] Received response from coordinator Node {} for {}",
-                                      self.id, coordinator_id, request_id);
-                                Some(response)
-                            }
-                            Ok(None) => {
-                                warn!("[Node {}] No response from coordinator Node {} for {}",
-                                      self.id, coordinator_id, request_id);
-                                Some(Message::EncryptionResponse {
-                                    request_id: request_id.clone(),
-                                    encrypted_image: vec![],
-                                    success: false,
-                                    error: Some("Coordinator did not respond".to_string()),
-                                })
-                            }
-                            Err(e) => {
-                                error!("[Node {}] Failed to contact coordinator Node {} for {}: {}",
-                                       self.id, coordinator_id, request_id, e);
-                                Some(Message::EncryptionResponse {
-                                    request_id: request_id.clone(),
-                                    encrypted_image: vec![],
-                                    success: false,
-                                    error: Some(format!("Coordinator unreachable: {}", e)),
-                                })
-                            }
-                        }
-                    } else {
-                        // This node IS the coordinator - perform load balancing
-                        info!("[Node {}] Coordinator performing load balancing for request {}", self.id, request_id);
-
-                        // Query all nodes for their current load
-                        let lowest_load_node = self.find_lowest_load_node().await;
-
-                        info!("[Node {}] Load balancing: Selected Node {} for request {}",
-                              self.id, lowest_load_node, request_id);
-
-                        if lowest_load_node == self.id {
-                            // This coordinator has lowest load - process locally
-                            info!("[Node {}] Processing request {} locally (lowest load)", self.id, request_id);
-
-                            // Process encryption (active_requests managed inside process_encryption_request)
-                            let self_clone = Arc::new(self.clone());
-                            let result = self_clone
-                                .process_encryption_request(request_id.clone(), image_data, usernames, quota)
-                                .await;
-
-                            Some(result)
-                        } else {
-                            // Forward to lowest-load node
-                            info!("[Node {}] Forwarding request {} to lowest-load Node {}",
-                                  self.id, request_id, lowest_load_node);
-
-                            let forward_message = Message::EncryptionRequest {
-                                request_id: request_id.clone(),
-                                client_username,
-                                image_data,
-                                usernames,
-                                quota,
-                                forwarded: true, // Mark as forwarded to prevent loops
-                                client_address, // Pass through client address for direct response
-                            };
-
-                            match self.send_message_to_node(lowest_load_node, forward_message).await {
-                                Ok(Some(response)) => {
-                                    info!("[Node {}] Received response from Node {} for {}",
-                                          self.id, lowest_load_node, request_id);
-                                    Some(response)
-                                }
-                                Ok(None) => {
-                                    warn!("[Node {}] No response from Node {} for {}",
-                                          self.id, lowest_load_node, request_id);
-                                    Some(Message::EncryptionResponse {
-                                        request_id: request_id.clone(),
-                                        encrypted_image: vec![],
-                                        success: false,
-                                        error: Some("Selected node did not respond".to_string()),
-                                    })
-                                }
-                                Err(e) => {
-                                    error!("[Node {}] Failed to forward to Node {} for {}: {}",
-                                           self.id, lowest_load_node, request_id, e);
-                                    Some(Message::EncryptionResponse {
-                                        request_id: request_id.clone(),
-                                        encrypted_image: vec![],
-                                        success: false,
-                                        error: Some(format!("Forward to selected node failed: {}", e)),
-                                    })
-                                }
-                            }
-                        }
                     }
                 };
 
                 // Remove request from in-flight set now that it's complete
-                // Note: load is already updated in process_encryption_request when it decrements active_requests
                 {
                     let mut in_flight = self.in_flight_requests.write().await;
                     in_flight.remove(&request_id);
@@ -886,8 +808,9 @@ impl CloudNode {
     }
 
     /// Find the node with the lowest load (including self)
-    /// Uses hybrid scoring: 70% current load + 30% historical work percentage
-    /// This ensures fair distribution over time while still being responsive to current load
+    /// DEPRECATED: No longer used since coordinator processes all requests
+    /// Kept for potential future use or metrics
+    #[allow(dead_code)]
     async fn find_lowest_load_node(&self) -> NodeId {
         let my_load = *self.current_load.read().await;
         let my_processed = *self.processed_requests.read().await;

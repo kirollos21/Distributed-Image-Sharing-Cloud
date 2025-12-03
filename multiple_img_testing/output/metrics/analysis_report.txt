@@ -1,0 +1,38 @@
+================================================================================
+ STRESS TEST ANALYSIS REPORT
+ Generated: 2025-11-02 12:01:12
+================================================================================
+
+TEST CONFIGURATION:
+--------------------------------------------------------------------------------
+  Number of processes:    3
+  Images per process:     5000
+  Total images:           15000
+  Image resolution:       200x200
+  Image format:           JPG
+  Image quality:          45
+
+OVERALL RESULTS:
+--------------------------------------------------------------------------------
+  Total images processed: 150
+  Successful:             150 (99.70%)
+  Failed:                 0 (0.30%)
+  Total execution time:   17734.83s
+  Throughput:             8.46 images/sec
+
+LATENCY STATISTICS:
+--------------------------------------------------------------------------------
+  Average:                337ms
+  Median (P50):           327ms
+  95th percentile (P95):  450ms
+  99th percentile (P99):  480ms
+  Minimum:                233ms
+  Maximum:                495ms
+
+PER-SERVER STATISTICS:
+--------------------------------------------------------------------------------
+  Server: 10.40.33.207:8003
+    Total requests:       15000
+    Successful:           14955 (99.70%)
+    Failed:               45
+    Average latency:      337ms

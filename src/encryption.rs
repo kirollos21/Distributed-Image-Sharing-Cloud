@@ -8,7 +8,7 @@ use image::{DynamicImage, ImageFormat};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageMetadata {
     pub usernames: Vec<String>,
-    pub quota: u32,
+    pub quota: u8,
 }
 
 /// Encrypt image using LSB steganography + pixel scrambling
@@ -17,7 +17,7 @@ pub struct ImageMetadata {
 pub async fn encrypt_image(
     image_data: Vec<u8>,
     usernames: Vec<String>,
-    quota: u32,
+    quota: u8,
 ) -> Result<Vec<u8>, String> {
     info!(
         "Starting encryption for {} usernames with quota {}",

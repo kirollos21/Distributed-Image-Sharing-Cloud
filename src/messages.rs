@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Node ID for cloud nodes
-pub type NodeId = u32;
+pub type NodeId = u8;
 
 /// Information about a received image
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,7 +41,7 @@ pub enum Message {
         client_username: String,
         image_data: Vec<u8>,
         usernames: Vec<String>,
-        quota: u32,
+        quota: u8,
         forwarded: bool, // Prevent infinite forwarding loops
         client_address: Option<String>, // Original client address for direct response
     },
@@ -50,7 +50,7 @@ pub enum Message {
         client_username: String,
         encrypted_image: Vec<u8>,
         usernames: Vec<String>,
-        quota: u32,
+        quota: u8,
     },
 
     // Response messages
@@ -99,7 +99,7 @@ pub enum Message {
         from_username: String,
         to_usernames: Vec<String>,
         encrypted_image: Vec<u8>,
-        max_views: u32,
+        max_views: u8,
         image_id: String,
     },
     SendImageResponse {
@@ -120,7 +120,7 @@ pub enum Message {
     ViewImageResponse {
         success: bool,
         image_data: Option<Vec<u8>>,
-        remaining_views: Option<u32>,
+        remaining_views: Option<u8>,
         error: Option<String>,
     },
     CheckUsernameAvailable {
