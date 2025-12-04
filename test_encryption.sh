@@ -2,8 +2,9 @@
 
 # Script to test the new image steganography encryption
 
-PROJECT_DIR="/media/kirollos/Data/Distributed Systems/Cloud Project"
-cd "$PROJECT_DIR"
+# Get the directory where this script is located (works from any location)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
 echo "=========================================="
 echo "  Encryption Test Script"

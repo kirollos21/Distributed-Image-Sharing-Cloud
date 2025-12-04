@@ -4,3 +4,6 @@ kiro
 kirollos
 moaz
 mohab
+potato1
+potato2
+potatokiro

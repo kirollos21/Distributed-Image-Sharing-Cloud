@@ -204,7 +204,7 @@ impl Client {
 
                 // Small delay between chunks to prevent UDP packet loss
                 if i < chunks.len() - 1 {
-                    sleep(Duration::from_millis(5)).await;
+                    sleep(Duration::from_millis(2)).await;
                 }
             }
 
