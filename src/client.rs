@@ -1,4 +1,5 @@
 use crate::chunking::{ChunkedMessage, ChunkReassembler};
+use crate::firebase::FireBaseClient;
 use crate::messages::Message;
 use crate::metrics::MetricsCollector;
 use crate::encryption;
@@ -19,6 +20,54 @@ impl Client {
         Self {
             id,
             cloud_addresses,
+        }
+    }
+
+    /// Create a new client by fetching node addresses from Firebase
+    pub async fn from_firebase(id: usize) -> Result<Self, String> {
+        let firebase = FireBaseClient::new();
+        
+        match firebase.get_all_nodes().await {
+            Ok(nodes) => {
+                let addresses: Vec<String> = nodes
+                    .into_iter()
+                    .map(|(_, node_info)| node_info.address)
+                    .collect();
+
+                if addresses.is_empty() {
+                    Err("No nodes found in Firebase".to_string())
+                } else {
+                    info!("[Client {}] Found {} nodes from Firebase", id, addresses.len());
+                    Ok(Self {
+                        id,
+                        cloud_addresses: addresses,
+                    })
+                }
+            }
+            Err(e) => Err(format!("Failed to fetch nodes from Firebase: {}", e)),
+        }
+    }
+
+    /// Refresh the node list from Firebase
+    pub async fn refresh_nodes(&mut self) -> Result<(), String> {
+        let firebase = FireBaseClient::new();
+        
+        match firebase.get_all_nodes().await {
+            Ok(nodes) => {
+                let addresses: Vec<String> = nodes
+                    .into_iter()
+                    .map(|(_, node_info)| node_info.address)
+                    .collect();
+
+                if addresses.is_empty() {
+                    Err("No nodes found in Firebase".to_string())
+                } else {
+                    info!("[Client {}] Refreshed node list: {} nodes", self.id, addresses.len());
+                    self.cloud_addresses = addresses;
+                    Ok(())
+                }
+            }
+            Err(e) => Err(format!("Failed to refresh nodes from Firebase: {}", e)),
         }
     }
 

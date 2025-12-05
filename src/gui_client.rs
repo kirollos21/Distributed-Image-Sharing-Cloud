@@ -1,24 +1,69 @@
 use crate::client::Client;
+use crate::firebase::{FireBaseClient, UserInfo, UserStatus};
 use crate::messages::Message;
 use eframe::egui;
-use egui::{Color32, RichText, Ui};
+use egui::{Color32, RichText, Ui, ColorImage, TextureHandle};
 use poll_promise::Promise;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::net::UdpSocket;
 use tokio::runtime::Runtime;
+
+/// Get the local IP address by connecting to a remote address
+fn get_local_ip() -> String {
+    // Connect to a public DNS to determine local IP
+    match UdpSocket::bind("0.0.0.0:0") {
+        Ok(socket) => {
+            // Connect to Google's DNS (doesn't actually send data)
+            if socket.connect("8.8.8.8:80").is_ok() {
+                if let Ok(addr) = socket.local_addr() {
+                    return addr.ip().to_string();
+                }
+            }
+            "127.0.0.1".to_string()
+        }
+        Err(_) => "127.0.0.1".to_string(),
+    }
+}
+
+/// Decode a base64 data URL to a ColorImage
+fn decode_base64_image(data_url: &str) -> Option<ColorImage> {
+    // Extract base64 data from data URL (format: "data:image/png;base64,...")
+    let base64_data = if data_url.contains(",") {
+        data_url.split(',').nth(1)?
+    } else {
+        data_url
+    };
+    
+    // Decode base64
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64_data).ok()?;
+    
+    // Load image
+    let img = image::load_from_memory(&bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let pixels = rgba.into_raw();
+    
+    Some(ColorImage::from_rgba_unmultiplied(size, &pixels))
+}
 
 #[derive(Default)]
 pub struct ClientApp {
     // Client configuration
     client_id: String,
     cloud_addresses: Vec<String>,
+    firebase_client: FireBaseClient,
 
     // Session state
     username: String,
+    user_id: String,  // Firebase user ID
     is_logged_in: bool,
-    login_in_progress: Option<Promise<Result<(), String>>>,
+    login_in_progress: Option<Promise<Result<(String, String), String>>>,  // Returns (username, user_id) on success
     login_error: Option<String>,
     username_input: String,
+    password_input: String,  // password field
+    is_registering: bool,    // toggle between login and register
+    just_registered_id: Option<String>,  // Show ID after registration
 
     // Image upload state
     selected_image_path: Option<PathBuf>,
@@ -47,8 +92,29 @@ pub struct ClientApp {
     viewing_image: Option<(Vec<u8>, String, u8)>, // (image_data, image_id, remaining_views)
     viewing_image_texture: Option<egui::TextureHandle>,
 
+    // My Gallery state
+    my_gallery: Vec<String>,  // URLs/paths of gallery images
+    my_gallery_textures: Vec<Option<egui::TextureHandle>>,
+    gallery_loading: Option<Promise<Result<Vec<String>, String>>>,
+    gallery_upload_in_progress: Option<Promise<Result<(), String>>>,
+    gallery_error: Option<String>,
+    gallery_loaded: bool,  // Track if gallery has been loaded
+
+    // Browse Users state
+    user_search_input: String,
+    searched_user: Option<crate::firebase::UserInfo>,
+    searched_user_id: Option<String>,
+    user_search_in_progress: Option<Promise<Result<Option<(String, crate::firebase::UserInfo)>, String>>>,
+    user_search_error: Option<String>,
+    viewed_gallery: Vec<String>,
+    viewed_gallery_textures: Vec<Option<egui::TextureHandle>>,
+
     // Tokio runtime
     runtime: Option<Arc<Runtime>>,
+
+    // Heartbeat for presence tracking (not using Default, initialized in new())
+    #[allow(dead_code)]
+    last_heartbeat: Option<std::time::Instant>,
 
     // UI state
     selected_tab: Tab,
@@ -59,6 +125,8 @@ pub struct ClientApp {
 enum Tab {
     Upload,
     ReceivedImages,
+    MyGallery,
+    BrowseUsers,
     History,
     Settings,
 }
@@ -107,6 +175,7 @@ impl ClientApp {
         Self {
             client_id,
             cloud_addresses,
+            firebase_client: FireBaseClient::new(),
             runtime: Some(runtime),
             viewing_quota: 5,
             available_usernames: vec![],
@@ -114,29 +183,183 @@ impl ClientApp {
             new_username_input: String::new(),
             is_logged_in: false,
             username: String::new(),
+            user_id: String::new(),
             username_input: String::new(),
+            password_input: String::new(),
+            is_registering: false,
             login_in_progress: None,
             login_error: None,
+            last_heartbeat: Some(std::time::Instant::now()),
             ..Default::default()
         }
     }
 
-    fn attempt_login(&mut self) {
-        let username = self.username_input.trim().to_string();
+    fn send_heartbeat(&self) {
+        let user_id = self.user_id.clone();
+        if user_id.is_empty() {
+            return;
+        }
+        
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        std::thread::spawn(move || {
+            let firebase = FireBaseClient::new();
+            runtime.block_on(async move {
+                let now = chrono::Utc::now().timestamp();
+                let _ = firebase.update_last_seen(&user_id, now).await;
+            });
+        });
+    }
 
-        if username.is_empty() {
-            self.login_error = Some("Please enter a username".to_string());
+    fn logout(&mut self) {
+        // Update status to Offline in Firebase
+        let user_id = self.user_id.clone();
+        if !user_id.is_empty() {
+            let runtime = self.runtime.as_ref().unwrap().clone();
+            std::thread::spawn(move || {
+                let firebase = FireBaseClient::new();
+                runtime.block_on(async move {
+                    let _ = firebase.update_user_status(&user_id, &crate::firebase::UserStatus::Offline).await;
+                });
+            });
+        }
+
+        // Reset session state
+        self.is_logged_in = false;
+        self.username.clear();
+        self.user_id.clear();
+        self.username_input.clear();
+        self.password_input.clear();
+        self.login_error = None;
+        self.is_registering = false;
+
+        // Reset gallery state
+        self.my_gallery.clear();
+        self.my_gallery_textures.clear();
+        self.gallery_loaded = false;
+        self.gallery_error = None;
+        self.gallery_loading = None;
+
+        // Reset browse users state
+        self.user_search_input.clear();
+        self.searched_user = None;
+        self.searched_user_id = None;
+        self.viewed_gallery.clear();
+        self.viewed_gallery_textures.clear();
+
+        // Reset other state
+        self.selected_image_path = None;
+        self.image_preview = None;
+        self.selected_tab = Tab::Upload;
+    }
+
+    fn attempt_login(&mut self) {
+        let input = self.username_input.trim().to_string();
+        let password = self.password_input.clone();
+        let is_registering = self.is_registering;
+
+        if input.is_empty() {
+            if is_registering {
+                self.login_error = Some("Please enter a username".to_string());
+            } else {
+                self.login_error = Some("Please enter username#id (e.g., potato#1)".to_string());
+            }
             return;
         }
 
-        let client_id = self.client_id.clone();
-        let cloud_addresses = self.cloud_addresses.clone();
+        if password.is_empty() {
+            self.login_error = Some("Please enter a password".to_string());
+            return;
+        }
+
+        let (username, user_id) = if is_registering {
+            // For registration, just use username - ID will be auto-generated
+            (input.clone(), String::new())
+        } else {
+            // For login, parse username#id format
+            let parts: Vec<&str> = input.split('#').collect();
+            if parts.len() != 2 {
+                self.login_error = Some("Invalid format. Use username#id (e.g., potato#1)".to_string());
+                return;
+            }
+            let username = parts[0].to_string();
+            let user_id = parts[1].to_string();
+
+            if username.is_empty() || user_id.is_empty() {
+                self.login_error = Some("Both username and ID are required (e.g., potato#1)".to_string());
+                return;
+            }
+            (username, user_id)
+        };
+
+        let firebase = FireBaseClient::new();
         let runtime = self.runtime.as_ref().unwrap().clone();
 
         let promise = Promise::spawn_thread("login", move || {
-            let client = Client::new(1, cloud_addresses);
             runtime.block_on(async move {
-                client.register_session(client_id, username).await
+                if is_registering {
+                    // REGISTER: Generate unique ID and create user (allow duplicate usernames)
+                    // Try to find a unique ID (up to 10 attempts)
+                    let mut generated_id = String::new();
+                    let mut attempts = 0;
+                    loop {
+                        let candidate_id = format!("{}", (chrono::Utc::now().timestamp_millis() % 99) + 1);
+                        match firebase.get_user(&candidate_id).await {
+                            Ok(None) => {
+                                // ID is available
+                                generated_id = candidate_id;
+                                break;
+                            }
+                            Ok(Some(_)) => {
+                                // ID exists, try again with slight delay
+                                attempts += 1;
+                                if attempts >= 10 {
+                                    return Err("Could not generate unique ID. Please try again.".to_string());
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
+                            Err(e) => return Err(format!("Network error: {}", e)),
+                        }
+                    }
+                    
+                    let local_ip = get_local_ip();
+                    let new_user = UserInfo {
+                        id: generated_id.clone(),
+                        username: username.clone(),
+                        password: password,
+                        status: UserStatus::Online,
+                        last_seen: chrono::Utc::now().timestamp(),
+                        ip: local_ip,
+                        gallery: vec![],
+                    };
+                    firebase.create_user(&new_user).await
+                        .map_err(|e| format!("Failed to create user: {}", e))?;
+                    Ok((username, generated_id))
+                } else {
+                    // LOGIN: Get user directly by ID and verify
+                    match firebase.get_user(&user_id).await {
+                        Ok(Some(user_info)) => {
+                            // Check username matches
+                            if user_info.username != username {
+                                return Err("Username doesn't match this ID".to_string());
+                            }
+                            // Verify password
+                            match firebase.verify_password(&user_id, &password).await {
+                                Ok(true) => {
+                                    // Update status to Online and set current IP
+                                    let local_ip = get_local_ip();
+                                    let _ = firebase.update_user_status(&user_id, &UserStatus::Online).await;
+                                    let _ = firebase.update_last_seen(&user_id, chrono::Utc::now().timestamp()).await;
+                                    let _ = firebase.update_user_ip(&user_id, &local_ip).await;
+                                    Ok((username, user_id))
+                                }
+                                Ok(false) => Err("Incorrect password".to_string()),
+                                Err(e) => Err(format!("Error verifying password: {}", e)),
+                            }
+                        }
+                        Ok(None) => Err("User ID not found. Click 'Register' to create an account.".to_string()),
+                        Err(e) => Err(format!("Network error: {}", e)),
+                    }
+                }
             })
         });
 
@@ -146,32 +369,44 @@ impl ClientApp {
 
     fn render_login_screen(&mut self, ui: &mut Ui) {
         ui.vertical_centered(|ui| {
-            ui.add_space(100.0);
+            ui.add_space(80.0);
 
-            ui.heading(RichText::new("🖼️  Distributed Image Cloud").size(24.0));
+            ui.heading(RichText::new("🖼️  Distributed Image Cloud").size(28.0));
             ui.add_space(10.0);
-            ui.label(RichText::new("Welcome! Please enter your username to continue.").size(14.0));
+            
+            let mode_text = if self.is_registering { "Create a new account" } else { "Sign in to your account" };
+            ui.label(RichText::new(mode_text).size(14.0));
 
-            ui.add_space(40.0);
+            ui.add_space(30.0);
 
+            // Username field (different label/hint based on mode)
             ui.horizontal(|ui| {
                 ui.add_space(200.0);
-                ui.label(RichText::new("Username:").size(16.0));
-                let response = ui.add(
+                let (label, hint) = if self.is_registering {
+                    ("Username:", "Choose a username")
+                } else {
+                    ("Username#ID:", "e.g., potato#1")
+                };
+                ui.label(RichText::new(label).size(16.0));
+                ui.add(
                     egui::TextEdit::singleline(&mut self.username_input)
                         .desired_width(250.0)
-                        .hint_text("Enter your username")
+                        .hint_text(hint)
                 );
+            });
 
-                // Auto-focus the text input
-                if !self.is_logged_in {
-                    response.request_focus();
-                }
+            ui.add_space(10.0);
 
-                // Handle Enter key
-                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    self.attempt_login();
-                }
+            // Password field
+            ui.horizontal(|ui| {
+                ui.add_space(200.0);
+                ui.label(RichText::new("Password:").size(16.0));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.password_input)
+                        .desired_width(250.0)
+                        .password(true)
+                        .hint_text("Enter your password")
+                );
             });
 
             ui.add_space(20.0);
@@ -182,23 +417,32 @@ impl ClientApp {
                 ui.add_space(10.0);
             }
 
-            // Login button or progress
+            // Login/Register button or progress
             let mut should_clear_progress = false;
+            let was_registering = self.is_registering;
             if let Some(promise) = &self.login_in_progress {
                 match promise.ready() {
                     None => {
                         ui.horizontal(|ui| {
                             ui.add_space(310.0);
                             ui.spinner();
-                            ui.label("Logging in...");
+                            let action = if self.is_registering { "Registering..." } else { "Logging in..." };
+                            ui.label(action);
                         });
                     }
                     Some(result) => {
                         match result {
-                            Ok(()) => {
-                                // Success! Set logged in state
+                            Ok((username, user_id)) => {
+                                // Log in immediately (for both registration and login)
                                 self.is_logged_in = true;
-                                self.username = self.username_input.clone();
+                                self.username = username.clone();
+                                self.user_id = user_id.clone();
+                                self.password_input.clear();
+                                
+                                // If just registered, set flag to show ID popup
+                                if was_registering {
+                                    self.just_registered_id = Some(user_id.clone());
+                                }
                                 should_clear_progress = true;
                             }
                             Err(e) => {
@@ -210,8 +454,10 @@ impl ClientApp {
                 }
             } else {
                 ui.horizontal(|ui| {
-                    ui.add_space(310.0);
-                    if ui.button(RichText::new("Login").size(16.0)).clicked() {
+                    ui.add_space(270.0);
+                    
+                    let button_text = if self.is_registering { "📝 Register" } else { "🔑 Login" };
+                    if ui.button(RichText::new(button_text).size(16.0)).clicked() {
                         self.attempt_login();
                     }
                 });
@@ -222,7 +468,24 @@ impl ClientApp {
             }
 
             ui.add_space(20.0);
-            ui.label(RichText::new("Note: Usernames must be unique across all clients").color(Color32::GRAY).size(12.0));
+
+            // Toggle between login and register
+            ui.horizontal(|ui| {
+                ui.add_space(220.0);
+                if self.is_registering {
+                    ui.label("Already have an account?");
+                    if ui.link("Login").clicked() {
+                        self.is_registering = false;
+                        self.login_error = None;
+                    }
+                } else {
+                    ui.label("Don't have an account?");
+                    if ui.link("Register").clicked() {
+                        self.is_registering = true;
+                        self.login_error = None;
+                    }
+                }
+            });
         });
     }
 
@@ -922,6 +1185,16 @@ impl eframe::App for ClientApp {
         // Repaint continuously to update async operations
         ctx.request_repaint();
 
+        // Send heartbeat every 30 seconds while logged in
+        if self.is_logged_in {
+            if let Some(last) = self.last_heartbeat {
+                if last.elapsed().as_secs() >= 30 {
+                    self.send_heartbeat();
+                    self.last_heartbeat = Some(std::time::Instant::now());
+                }
+            }
+        }
+
         // Show login screen if not logged in
         if !self.is_logged_in {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -936,13 +1209,20 @@ impl eframe::App for ClientApp {
                 ui.heading("🖼️  Distributed Image Cloud - Client");
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Logout button
+                    if ui.button("🚪 Logout").clicked() {
+                        self.logout();
+                    }
+
+                    ui.separator();
+
                     if ui.button("❓ Help").clicked() {
                         self.show_help = !self.show_help;
                     }
 
                     ui.separator();
 
-                    ui.label(RichText::new(format!("👤 {}", self.username))
+                    ui.label(RichText::new(format!("👤 {} (ID: {})", self.username, self.user_id))
                         .color(Color32::from_rgb(0, 200, 255))
                         .strong());
                 });
@@ -962,10 +1242,37 @@ impl eframe::App for ClientApp {
                 });
         }
 
+        // Show welcome popup with ID after registration
+        if self.just_registered_id.is_some() {
+            egui::Window::new("🎉 Welcome!")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(10.0);
+                        ui.label(RichText::new("Registration successful!").size(18.0).color(Color32::from_rgb(0, 200, 0)));
+                        ui.add_space(15.0);
+                        ui.label(RichText::new(format!("Your ID is: {}", self.just_registered_id.as_ref().unwrap())).size(24.0).strong());
+                        ui.add_space(10.0);
+                        ui.label(RichText::new(format!("Login with: {}#{}", self.username, self.user_id)).size(14.0));
+                        ui.add_space(5.0);
+                        ui.label(RichText::new("Remember this for future logins!").size(12.0).color(Color32::GRAY));
+                        ui.add_space(15.0);
+                        if ui.button(RichText::new("  Got it!  ").size(16.0)).clicked() {
+                            self.just_registered_id = None;
+                        }
+                        ui.add_space(10.0);
+                    });
+                });
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.selected_tab, Tab::Upload, "📤 Upload");
                 ui.selectable_value(&mut self.selected_tab, Tab::ReceivedImages, "📬 Received");
+                ui.selectable_value(&mut self.selected_tab, Tab::MyGallery, "🖼️ My Gallery");
+                ui.selectable_value(&mut self.selected_tab, Tab::BrowseUsers, "🔍 Browse Users");
                 ui.selectable_value(&mut self.selected_tab, Tab::History, "📜 History");
                 ui.selectable_value(&mut self.selected_tab, Tab::Settings, "⚙️ Settings");
             });
@@ -976,6 +1283,8 @@ impl eframe::App for ClientApp {
             match self.selected_tab {
                 Tab::Upload => self.render_upload_tab(ui, ctx),
                 Tab::ReceivedImages => self.render_received_images_tab(ui, ctx),
+                Tab::MyGallery => self.render_my_gallery_tab(ui, ctx),
+                Tab::BrowseUsers => self.render_browse_users_tab(ui, ctx),
                 Tab::History => self.render_history_tab(ui),
                 Tab::Settings => self.render_settings_tab(ui),
             }
@@ -985,15 +1294,454 @@ impl eframe::App for ClientApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // Unregister session when app closes
         if self.is_logged_in && !self.username.is_empty() {
-            let client_id = self.client_id.clone();
-            let username = self.username.clone();
-            let cloud_addresses = self.cloud_addresses.clone();
+            let user_id = self.user_id.clone();
             let runtime = self.runtime.as_ref().unwrap().clone();
 
+            // Update status to Offline in Firebase
             runtime.block_on(async move {
-                let client = Client::new(1, cloud_addresses);
-                client.unregister_session(client_id, username).await;
+                let firebase = FireBaseClient::new();
+                let _ = firebase.update_user_status(&user_id, &UserStatus::Offline).await;
             });
         }
+    }
+}
+
+// Additional ClientApp methods for gallery and user browsing
+impl ClientApp {
+    fn render_my_gallery_tab(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        ui.heading("🖼️ My Gallery");
+        ui.add_space(5.0);
+        ui.label(RichText::new("Share up to 5 images in your public gallery (images are pixelated for privacy)").color(Color32::GRAY).size(12.0));
+        ui.add_space(10.0);
+
+        // Load gallery if not loaded yet
+        if !self.gallery_loaded && self.gallery_loading.is_none() {
+            self.load_my_gallery();
+        }
+
+        // Check loading status
+        let mut should_clear_loading = false;
+        if let Some(promise) = &self.gallery_loading {
+            match promise.ready() {
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Loading your gallery...");
+                    });
+                }
+                Some(result) => {
+                    match result {
+                        Ok(gallery) => {
+                            self.my_gallery = gallery.clone();
+                            self.my_gallery_textures = vec![None; gallery.len()];
+                            self.gallery_loaded = true;
+                        }
+                        Err(e) => {
+                            self.gallery_error = Some(e.clone());
+                            self.gallery_loaded = true;  // Mark as loaded even on error to stop retrying
+                        }
+                    }
+                    should_clear_loading = true;
+                }
+            }
+        }
+        if should_clear_loading {
+            self.gallery_loading = None;
+        }
+
+        // Show error if any
+        if let Some(error) = &self.gallery_error {
+            ui.label(RichText::new(error).color(Color32::RED));
+            ui.add_space(5.0);
+        }
+
+        // Gallery grid
+        ui.group(|ui| {
+            ui.label(RichText::new(format!("Your Images ({}/5)", self.my_gallery.len())).size(14.0).strong());
+            ui.add_space(10.0);
+
+            if self.my_gallery.is_empty() {
+                ui.label(RichText::new("No images in your gallery yet").color(Color32::GRAY));
+            } else {
+                ui.horizontal_wrapped(|ui| {
+                    let mut to_remove: Option<usize> = None;
+                    for (i, img_url) in self.my_gallery.iter().enumerate() {
+                        ui.vertical(|ui| {
+                            // Try to load texture if not already loaded
+                            if self.my_gallery_textures.get(i).map(|t| t.is_none()).unwrap_or(true) {
+                                if let Some(color_image) = decode_base64_image(img_url) {
+                                    let texture = ctx.load_texture(
+                                        format!("my_gallery_{}", i),
+                                        color_image,
+                                        egui::TextureOptions::LINEAR,
+                                    );
+                                    if i < self.my_gallery_textures.len() {
+                                        self.my_gallery_textures[i] = Some(texture);
+                                    }
+                                }
+                            }
+
+                            // Display image or placeholder
+                            let size = egui::vec2(100.0, 100.0);
+                            if let Some(Some(texture)) = self.my_gallery_textures.get(i) {
+                                ui.image((texture.id(), size));
+                            } else {
+                                let (rect, _response) = ui.allocate_exact_size(size, egui::Sense::hover());
+                                ui.painter().rect_filled(rect, 5.0, Color32::from_rgb(60, 60, 60));
+                                ui.painter().text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    format!("#{}", i + 1),
+                                    egui::FontId::proportional(14.0),
+                                    Color32::WHITE,
+                                );
+                            }
+
+                            if ui.button("🗑️ Remove").clicked() {
+                                to_remove = Some(i);
+                            }
+                        });
+                        ui.add_space(10.0);
+                    }
+                    if let Some(idx) = to_remove {
+                        self.remove_from_gallery(idx);
+                    }
+                });
+            }
+        });
+
+        ui.add_space(15.0);
+
+        // Add image button
+        let can_add = self.my_gallery.len() < 5 && self.gallery_upload_in_progress.is_none();
+        ui.add_enabled_ui(can_add, |ui| {
+            if ui.button(RichText::new("➕ Add Image to Gallery").size(14.0)).clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Images", &["png", "jpg", "jpeg", "bmp"])
+                    .pick_file()
+                {
+                    self.add_to_gallery(path, ctx);
+                }
+            }
+        });
+
+        if !can_add && self.my_gallery.len() >= 5 {
+            ui.label(RichText::new("⚠️ Gallery is full (max 5 images)").color(Color32::from_rgb(255, 165, 0)));
+        }
+
+        // Upload progress
+        let mut should_clear_upload = false;
+        if let Some(promise) = &self.gallery_upload_in_progress {
+            match promise.ready() {
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Uploading image...");
+                    });
+                }
+                Some(result) => {
+                    match result {
+                        Ok(()) => {
+                            self.gallery_error = None;
+                            // Reload gallery
+                            self.load_my_gallery();
+                        }
+                        Err(e) => {
+                            self.gallery_error = Some(e.clone());
+                        }
+                    }
+                    should_clear_upload = true;
+                }
+            }
+        }
+        if should_clear_upload {
+            self.gallery_upload_in_progress = None;
+        }
+
+        ui.add_space(10.0);
+        if ui.button("🔄 Refresh Gallery").clicked() {
+            self.load_my_gallery();
+        }
+    }
+
+    fn render_browse_users_tab(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        ui.heading("🔍 Browse Users");
+        ui.add_space(10.0);
+
+        // Search bar
+        ui.group(|ui| {
+            ui.label(RichText::new("Search for a user").size(14.0).strong());
+            ui.add_space(5.0);
+
+            ui.horizontal(|ui| {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.user_search_input)
+                        .desired_width(300.0)
+                        .hint_text("Enter username or username#id")
+                );
+
+                let can_search = !self.user_search_input.trim().is_empty() 
+                    && self.user_search_in_progress.is_none();
+
+                if ui.add_enabled(can_search, egui::Button::new("🔍 Search")).clicked()
+                    || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && can_search)
+                {
+                    self.search_user();
+                }
+            });
+        });
+
+        // Search progress/error
+        let mut should_clear_search = false;
+        if let Some(promise) = &self.user_search_in_progress {
+            match promise.ready() {
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Searching...");
+                    });
+                }
+                Some(result) => {
+                    match result {
+                        Ok(Some((user_id, user_info))) => {
+                            self.searched_user = Some(user_info.clone());
+                            self.searched_user_id = Some(user_id.clone());
+                            self.viewed_gallery = user_info.gallery.clone();
+                            self.viewed_gallery_textures = vec![None; user_info.gallery.len()];
+                            self.user_search_error = None;
+                        }
+                        Ok(None) => {
+                            self.searched_user = None;
+                            self.searched_user_id = None;
+                            self.viewed_gallery.clear();
+                            self.user_search_error = Some("User not found".to_string());
+                        }
+                        Err(e) => {
+                            self.user_search_error = Some(e.clone());
+                        }
+                    }
+                    should_clear_search = true;
+                }
+            }
+        }
+        if should_clear_search {
+            self.user_search_in_progress = None;
+        }
+
+        // Show error if any
+        if let Some(error) = &self.user_search_error {
+            ui.add_space(10.0);
+            ui.label(RichText::new(error).color(Color32::RED));
+        }
+
+        ui.add_space(15.0);
+
+        // Show searched user info
+        if let Some(user) = &self.searched_user {
+            let user_id = self.searched_user_id.clone().unwrap_or_default();
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("👤").size(24.0));
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(format!("{}#{}", &user.username, &user_id)).size(18.0).strong());
+                        
+                        // Determine real status based on last_seen (offline if inactive > 60 seconds)
+                        let now = chrono::Utc::now().timestamp();
+                        let seconds_since_seen = now - user.last_seen;
+                        let is_really_online = seconds_since_seen < 60;
+                        
+                        let (status_color, status_text) = if !is_really_online {
+                            (Color32::GRAY, "⚫ Offline")
+                        } else {
+                            match user.status {
+                                UserStatus::Online => (Color32::from_rgb(0, 200, 0), "🟢 Online"),
+                                UserStatus::Offline => (Color32::GRAY, "⚫ Offline"),
+                                UserStatus::Idle => (Color32::from_rgb(255, 165, 0), "🟡 Idle"),
+                            }
+                        };
+                        ui.label(RichText::new(status_text).color(status_color));
+                        
+                        // Show last seen time if offline
+                        if !is_really_online {
+                            let mins_ago = seconds_since_seen / 60;
+                            let last_seen_text = if mins_ago < 60 {
+                                format!("Last seen {} min ago", mins_ago)
+                            } else if mins_ago < 1440 {
+                                format!("Last seen {} hours ago", mins_ago / 60)
+                            } else {
+                                format!("Last seen {} days ago", mins_ago / 1440)
+                            };
+                            ui.label(RichText::new(last_seen_text).color(Color32::GRAY).size(11.0));
+                        }
+                    });
+                });
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(10.0);
+
+                // User's gallery
+                ui.label(RichText::new(format!("Gallery ({} images)", self.viewed_gallery.len())).size(14.0).strong());
+                ui.add_space(5.0);
+
+                if self.viewed_gallery.is_empty() {
+                    ui.label(RichText::new("This user has no public gallery images").color(Color32::GRAY));
+                } else {
+                    ui.horizontal_wrapped(|ui| {
+                        for (i, img_url) in self.viewed_gallery.iter().enumerate() {
+                            // Try to load texture if not already loaded
+                            if self.viewed_gallery_textures.get(i).map(|t| t.is_none()).unwrap_or(true) {
+                                if let Some(color_image) = decode_base64_image(img_url) {
+                                    let texture = ctx.load_texture(
+                                        format!("viewed_gallery_{}", i),
+                                        color_image,
+                                        egui::TextureOptions::LINEAR,
+                                    );
+                                    if i < self.viewed_gallery_textures.len() {
+                                        self.viewed_gallery_textures[i] = Some(texture);
+                                    }
+                                }
+                            }
+
+                            // Display image or placeholder
+                            let size = egui::vec2(120.0, 120.0);
+                            if let Some(Some(texture)) = self.viewed_gallery_textures.get(i) {
+                                ui.image((texture.id(), size));
+                            } else {
+                                let (rect, _response) = ui.allocate_exact_size(size, egui::Sense::click());
+                                ui.painter().rect_filled(rect, 5.0, Color32::from_rgb(80, 80, 80));
+                                ui.painter().text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    format!("Image #{}", i + 1),
+                                    egui::FontId::proportional(12.0),
+                                    Color32::WHITE,
+                                );
+                            }
+                            ui.add_space(5.0);
+                        }
+                    });
+                }
+            });
+        }
+    }
+
+    fn load_my_gallery(&mut self) {
+        let user_id = self.user_id.clone();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+
+        let promise = Promise::spawn_thread("load_gallery", move || {
+            let firebase = FireBaseClient::new();
+            runtime.block_on(async move {
+                firebase.get_user_gallery(&user_id).await
+                    .map_err(|e| format!("Failed to load gallery: {}", e))
+            })
+        });
+
+        self.gallery_loading = Some(promise);
+    }
+
+    fn add_to_gallery(&mut self, path: std::path::PathBuf, _ctx: &egui::Context) {
+        let user_id = self.user_id.clone();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        let mut current_gallery = self.my_gallery.clone();
+
+        let promise = Promise::spawn_thread("upload_gallery", move || {
+            // Read and pixelate the image
+            let img = image::open(&path)
+                .map_err(|e| format!("Failed to open image: {}", e))?;
+
+            // Pixelate by reducing resolution to 64x64 then scaling back
+            let pixelated = img.resize_exact(64, 64, image::imageops::FilterType::Nearest);
+            
+            // Convert to base64 for storage
+            let mut buf = Vec::new();
+            pixelated.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .map_err(|e| format!("Failed to encode image: {}", e))?;
+            
+            let base64_img = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &buf);
+            let data_url = format!("data:image/png;base64,{}", base64_img);
+
+            // Add to gallery
+            current_gallery.push(data_url);
+
+            let firebase = FireBaseClient::new();
+            runtime.block_on(async move {
+                firebase.update_gallery(&user_id, &current_gallery).await
+                    .map_err(|e| format!("Failed to update gallery: {}", e))
+            })
+        });
+
+        self.gallery_upload_in_progress = Some(promise);
+    }
+
+    fn remove_from_gallery(&mut self, index: usize) {
+        let user_id = self.user_id.clone();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        let mut current_gallery = self.my_gallery.clone();
+
+        if index < current_gallery.len() {
+            current_gallery.remove(index);
+        }
+
+        let promise = Promise::spawn_thread("remove_gallery", move || {
+            let firebase = FireBaseClient::new();
+            runtime.block_on(async move {
+                firebase.update_gallery(&user_id, &current_gallery).await
+                    .map_err(|e| format!("Failed to update gallery: {}", e))
+            })
+        });
+
+        self.gallery_upload_in_progress = Some(promise);
+        self.my_gallery.remove(index);
+        if index < self.my_gallery_textures.len() {
+            self.my_gallery_textures.remove(index);
+        }
+    }
+
+    fn search_user(&mut self) {
+        let input = self.user_search_input.trim().to_string();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+
+        let promise = Promise::spawn_thread("search_user", move || {
+            let firebase = FireBaseClient::new();
+            runtime.block_on(async move {
+                // Check if input contains # (username#id format)
+                if input.contains('#') {
+                    let parts: Vec<&str> = input.split('#').collect();
+                    if parts.len() == 2 {
+                        let username = parts[0].to_string();
+                        let user_id = parts[1].to_string();
+                        
+                        // Search by ID directly
+                        match firebase.get_user(&user_id).await {
+                            Ok(Some(user_info)) => {
+                                // Verify username matches
+                                if user_info.username == username {
+                                    Ok(Some((user_id, user_info)))
+                                } else {
+                                    Ok(None) // Username doesn't match this ID
+                                }
+                            }
+                            Ok(None) => Ok(None),
+                            Err(e) => Err(format!("Search failed: {}", e)),
+                        }
+                    } else {
+                        // Invalid format, try as username
+                        firebase.find_user_by_username(&input).await
+                            .map_err(|e| format!("Search failed: {}", e))
+                    }
+                } else {
+                    // Search by username only
+                    firebase.find_user_by_username(&input).await
+                        .map_err(|e| format!("Search failed: {}", e))
+                }
+            })
+        });
+
+        self.user_search_in_progress = Some(promise);
+        self.searched_user = None;
+        self.searched_user_id = None;
+        self.viewed_gallery.clear();
     }
 }
