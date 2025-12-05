@@ -71,6 +71,39 @@ impl Client {
         }
     }
 
+    /// Send message to nodes sequentially with retry logic
+    /// Tries each node in order, if all fail, retries once, then returns maintenance error
+    pub async fn send_with_retry(&self, message: Message) -> Result<Message, String> {
+        let max_retries = 2; // Try twice (original + 1 retry)
+        
+        for retry in 0..max_retries {
+            if retry > 0 {
+                info!("[Client {}] Retrying all nodes (attempt {}/{})", self.id, retry + 1, max_retries);
+                sleep(Duration::from_millis(500)).await; // Brief pause before retry
+            }
+            
+            // Try each node sequentially
+            for (i, address) in self.cloud_addresses.iter().enumerate() {
+                debug!("[Client {}] Trying node {} at {}", self.id, i + 1, address);
+                
+                match Self::send_to_node(self.id, address, message.clone()).await {
+                    Ok(response) => {
+                        debug!("[Client {}] Got response from node {}", self.id, i + 1);
+                        return Ok(response);
+                    }
+                    Err(e) => {
+                        warn!("[Client {}] Node {} ({}) failed: {}", self.id, i + 1, address, e);
+                        continue; // Try next node
+                    }
+                }
+            }
+        }
+        
+        // All nodes failed after retries
+        error!("[Client {}] All nodes unreachable after {} attempts", self.id, max_retries);
+        Err("SYSTEM_MAINTENANCE".to_string())
+    }
+
     /// Register a session with a username
     /// Returns Ok(()) if successful, Err with error message if username is taken
     pub async fn register_session(
@@ -325,6 +358,116 @@ impl Client {
                 }
             }
         }
+    }
+
+    /// Login via node (node handles Firebase) - with retry logic
+    pub async fn client_login(
+        &self,
+        user_id: String,
+        password: String,
+        client_ip: String,
+    ) -> Result<Message, String> {
+        let message = Message::ClientLogin {
+            user_id: user_id.clone(),
+            password,
+            client_ip,
+        };
+
+        info!("[Client {}] Attempting login for user_id: {}", self.id, user_id);
+        
+        self.send_with_retry(message).await
+    }
+
+    /// Send heartbeat via node (node updates Firebase)
+    pub async fn client_heartbeat(&self, user_id: String) {
+        let message = Message::ClientHeartbeat { user_id };
+
+        // Fire and forget to first available node
+        for address in &self.cloud_addresses {
+            if Self::send_to_node(self.id, address, message.clone()).await.is_ok() {
+                return;
+            }
+        }
+    }
+
+    /// Logout via node (node updates Firebase)
+    pub async fn client_logout(&self, user_id: String) {
+        let message = Message::ClientLogout { user_id };
+
+        // Fire and forget to first available node
+        for address in &self.cloud_addresses {
+            if Self::send_to_node(self.id, address, message.clone()).await.is_ok() {
+                return;
+            }
+        }
+    }
+
+    /// Get user list via node
+    pub async fn get_user_list(&self) -> Result<Vec<crate::messages::ClientUserInfo>, String> {
+        let message = Message::GetUserList;
+
+        for address in &self.cloud_addresses {
+            match Self::send_to_node(self.id, address, message.clone()).await {
+                Ok(Message::GetUserListResponse { users }) => {
+                    return Ok(users);
+                }
+                Ok(_) => continue,
+                Err(e) => {
+                    warn!("[Client {}] Failed to get user list via {}: {}", self.id, address, e);
+                    continue;
+                }
+            }
+        }
+
+        Err("Failed to connect to any cloud node".to_string())
+    }
+
+    /// Get specific user info via node
+    pub async fn get_user_info(&self, user_id: String) -> Result<Option<crate::messages::ClientUserInfo>, String> {
+        let message = Message::GetUserInfo { user_id };
+
+        for address in &self.cloud_addresses {
+            match Self::send_to_node(self.id, address, message.clone()).await {
+                Ok(Message::GetUserInfoResponse { success, user_info, .. }) => {
+                    if success {
+                        return Ok(user_info);
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                Ok(_) => continue,
+                Err(e) => {
+                    warn!("[Client {}] Failed to get user info via {}: {}", self.id, address, e);
+                    continue;
+                }
+            }
+        }
+
+        Err("Failed to connect to any cloud node".to_string())
+    }
+
+    /// Get user gallery via node
+    pub async fn get_user_gallery(&self, user_id: String) -> Result<Vec<String>, String> {
+        let message = Message::GetUserGallery { user_id };
+
+        for address in &self.cloud_addresses {
+            match Self::send_to_node(self.id, address, message.clone()).await {
+                Ok(Message::GetUserGalleryResponse { success, images, error }) => {
+                    if success {
+                        return Ok(images);
+                    } else {
+                        return Err(error.unwrap_or_else(|| "Failed to get gallery".to_string()));
+                    }
+                }
+                Ok(_) => continue,
+                Err(e) => {
+                    warn!("[Client {}] Failed to get gallery via {}: {}", self.id, address, e);
+                    continue;
+                }
+            }
+        }
+
+        Err("Failed to connect to any cloud node".to_string())
     }
 
     /// Check if a username is available (not already registered)

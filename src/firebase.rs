@@ -262,6 +262,12 @@ impl FireBaseClient {
         Ok(())
     }
 
+    pub async fn update_node_address(&self, node_id: u8, address: &str) -> Result<(), reqwest::Error> {
+        let url = format!("{}/nodes/node{}/address.json", self.base_url, node_id);
+        self.client.put(&url).json(address).send().await?;
+        Ok(())
+    }
+
     pub async fn get_node_address(&self, node_id: u8) -> Result<Option<String>, reqwest::Error> {
         let url = format!("{}/nodes/node{}/address.json", self.base_url, node_id);
         let resp = self.client.get(&url).send().await?;

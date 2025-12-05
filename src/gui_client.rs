@@ -1,6 +1,6 @@
 use crate::client::Client;
 use crate::firebase::{FireBaseClient, UserInfo, UserStatus};
-use crate::messages::Message;
+use crate::messages::{Message, ClientUserInfo, ClientUserStatus};
 use eframe::egui;
 use egui::{Color32, RichText, Ui, ColorImage, TextureHandle};
 use poll_promise::Promise;
@@ -102,9 +102,9 @@ pub struct ClientApp {
 
     // Browse Users state
     user_search_input: String,
-    searched_user: Option<crate::firebase::UserInfo>,
+    searched_user: Option<UserInfo>,
     searched_user_id: Option<String>,
-    user_search_in_progress: Option<Promise<Result<Option<(String, crate::firebase::UserInfo)>, String>>>,
+    user_search_in_progress: Option<Promise<Result<Option<(String, UserInfo)>, String>>>,
     user_search_error: Option<String>,
     viewed_gallery: Vec<String>,
     viewed_gallery_textures: Vec<Option<egui::TextureHandle>>,
@@ -200,25 +200,26 @@ impl ClientApp {
             return;
         }
         
+        let cloud_addresses = self.cloud_addresses.clone();
         let runtime = self.runtime.as_ref().unwrap().clone();
         std::thread::spawn(move || {
-            let firebase = FireBaseClient::new();
+            let client = Client::new(0, cloud_addresses);
             runtime.block_on(async move {
-                let now = chrono::Utc::now().timestamp();
-                let _ = firebase.update_last_seen(&user_id, now).await;
+                client.client_heartbeat(user_id).await;
             });
         });
     }
 
     fn logout(&mut self) {
-        // Update status to Offline in Firebase
+        // Update status to Offline via node
         let user_id = self.user_id.clone();
         if !user_id.is_empty() {
+            let cloud_addresses = self.cloud_addresses.clone();
             let runtime = self.runtime.as_ref().unwrap().clone();
             std::thread::spawn(move || {
-                let firebase = FireBaseClient::new();
+                let client = Client::new(0, cloud_addresses);
                 runtime.block_on(async move {
-                    let _ = firebase.update_user_status(&user_id, &crate::firebase::UserStatus::Offline).await;
+                    client.client_logout(user_id).await;
                 });
             });
         }
@@ -291,14 +292,14 @@ impl ClientApp {
             (username, user_id)
         };
 
-        let firebase = FireBaseClient::new();
+        let cloud_addresses = self.cloud_addresses.clone();
         let runtime = self.runtime.as_ref().unwrap().clone();
 
         let promise = Promise::spawn_thread("login", move || {
             runtime.block_on(async move {
                 if is_registering {
-                    // REGISTER: Generate unique ID and create user (allow duplicate usernames)
-                    // Try to find a unique ID (up to 10 attempts)
+                    // REGISTER: Generate unique ID and create user (still uses Firebase directly)
+                    let firebase = FireBaseClient::new();
                     let mut generated_id = String::new();
                     let mut attempts = 0;
                     loop {
@@ -335,29 +336,34 @@ impl ClientApp {
                         .map_err(|e| format!("Failed to create user: {}", e))?;
                     Ok((username, generated_id))
                 } else {
-                    // LOGIN: Get user directly by ID and verify
-                    match firebase.get_user(&user_id).await {
-                        Ok(Some(user_info)) => {
-                            // Check username matches
-                            if user_info.username != username {
-                                return Err("Username doesn't match this ID".to_string());
-                            }
-                            // Verify password
-                            match firebase.verify_password(&user_id, &password).await {
-                                Ok(true) => {
-                                    // Update status to Online and set current IP
-                                    let local_ip = get_local_ip();
-                                    let _ = firebase.update_user_status(&user_id, &UserStatus::Online).await;
-                                    let _ = firebase.update_last_seen(&user_id, chrono::Utc::now().timestamp()).await;
-                                    let _ = firebase.update_user_ip(&user_id, &local_ip).await;
+                    // LOGIN: Use node to handle Firebase auth
+                    let client = Client::new(0, cloud_addresses);
+                    let local_ip = get_local_ip();
+                    
+                    match client.client_login(user_id.clone(), password, local_ip).await {
+                        Ok(Message::ClientLoginResponse { success, user_info, error }) => {
+                            if success {
+                                if let Some(info) = user_info {
+                                    // Verify username matches
+                                    if info.username != username {
+                                        return Err("Username doesn't match this ID".to_string());
+                                    }
                                     Ok((username, user_id))
+                                } else {
+                                    Err("Login succeeded but no user info returned".to_string())
                                 }
-                                Ok(false) => Err("Incorrect password".to_string()),
-                                Err(e) => Err(format!("Error verifying password: {}", e)),
+                            } else {
+                                Err(error.unwrap_or_else(|| "Login failed".to_string()))
                             }
                         }
-                        Ok(None) => Err("User ID not found. Click 'Register' to create an account.".to_string()),
-                        Err(e) => Err(format!("Network error: {}", e)),
+                        Ok(_) => Err("Unexpected response from server".to_string()),
+                        Err(e) => {
+                            if e == "SYSTEM_MAINTENANCE" {
+                                Err("🔧 System Under Maintenance - Please try again later".to_string())
+                            } else {
+                                Err(format!("Connection error: {}", e))
+                            }
+                        }
                     }
                 }
             })

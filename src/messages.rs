@@ -13,6 +13,34 @@ pub struct ReceivedImageInfo {
     pub timestamp: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteInfo {
+    pub note_id: String,
+    pub from_id: u8,
+    pub from_username: String,
+    pub content: String,
+    pub timestamp: i64,
+}
+
+/// User status enum (for client-facing messages)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ClientUserStatus {
+    Online,
+    Offline,
+    Idle,
+}
+
+/// User info returned to clients (no password)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientUserInfo {
+    pub id: String,
+    pub username: String,
+    pub status: ClientUserStatus,
+    pub last_seen: i64,
+    pub ip: String,
+    pub gallery: Vec<String>,
+}
+
 /// Message types exchanged between nodes and clients
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
@@ -138,6 +166,65 @@ pub enum Message {
         username: String,
         is_available: bool,
     },
+    SendNote {
+        note_id: String,
+        from_id: u8,
+        to_id: u8,
+        from_username: String,
+        content: String,
+        timestamp: i64,
+    },
+    SendNoteResponse {
+        success: bool,
+        note_id: String,
+        error: Option<String>,
+    },
+    GetPendingNotes {
+        user_id: u8,
+    },
+    GetPendingNotesResponse {
+        notes: Vec<NoteInfo>,
+    },
+
+    // Client authentication & presence (node handles Firebase)
+    ClientLogin {
+        user_id: String,
+        password: String,
+        client_ip: String,
+    },
+    ClientLoginResponse {
+        success: bool,
+        user_info: Option<ClientUserInfo>,
+        error: Option<String>,
+    },
+    ClientHeartbeat {
+        user_id: String,
+    },
+    ClientLogout {
+        user_id: String,
+    },
+
+    // User browsing (node fetches from Firebase)
+    GetUserList,
+    GetUserListResponse {
+        users: Vec<ClientUserInfo>,
+    },
+    GetUserInfo {
+        user_id: String,
+    },
+    GetUserInfoResponse {
+        success: bool,
+        user_info: Option<ClientUserInfo>,
+        error: Option<String>,
+    },
+    GetUserGallery {
+        user_id: String,
+    },
+    GetUserGalleryResponse {
+        success: bool,
+        images: Vec<String>,
+        error: Option<String>,
+    },
 }
 
 impl fmt::Display for Message {
@@ -211,6 +298,48 @@ impl fmt::Display for Message {
             }
             Message::CheckUsernameAvailableResponse { username, is_available } => {
                 write!(f, "CHECK_USERNAME_AVAILABLE_RESPONSE {} (available: {})", username, is_available)
+            }
+            Message::SendNote { note_id, from_username, to_id, .. } => {
+                write!(f, "SEND_NOTE {} from {} to {}", note_id, from_username, to_id)
+            }
+            Message::SendNoteResponse { success, note_id, .. } => {
+                write!(f, "SEND_NOTE_RESPONSE {} (success: {})", note_id, success)
+            }
+            Message::GetPendingNotes { user_id } => {
+                write!(f, "GET_PENDING_NOTES for User {}", user_id)
+            }
+            Message::GetPendingNotesResponse { notes } => {
+                write!(f, "GET_PENDING_NOTES_RESPONSE ({} notes)", notes.len())
+            }
+            Message::ClientLogin { user_id, .. } => {
+                write!(f, "CLIENT_LOGIN user_id: {}", user_id)
+            }
+            Message::ClientLoginResponse { success, .. } => {
+                write!(f, "CLIENT_LOGIN_RESPONSE (success: {})", success)
+            }
+            Message::ClientHeartbeat { user_id } => {
+                write!(f, "CLIENT_HEARTBEAT user_id: {}", user_id)
+            }
+            Message::ClientLogout { user_id } => {
+                write!(f, "CLIENT_LOGOUT user_id: {}", user_id)
+            }
+            Message::GetUserList => {
+                write!(f, "GET_USER_LIST")
+            }
+            Message::GetUserListResponse { users } => {
+                write!(f, "GET_USER_LIST_RESPONSE ({} users)", users.len())
+            }
+            Message::GetUserInfo { user_id } => {
+                write!(f, "GET_USER_INFO user_id: {}", user_id)
+            }
+            Message::GetUserInfoResponse { success, .. } => {
+                write!(f, "GET_USER_INFO_RESPONSE (success: {})", success)
+            }
+            Message::GetUserGallery { user_id } => {
+                write!(f, "GET_USER_GALLERY user_id: {}", user_id)
+            }
+            Message::GetUserGalleryResponse { success, images, .. } => {
+                write!(f, "GET_USER_GALLERY_RESPONSE (success: {}, {} images)", success, images.len())
             }
         }
     }

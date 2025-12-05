@@ -1,7 +1,8 @@
 use crate::chunking::{ChunkReassembler, ChunkedMessage};
 use crate::election::{ElectionManager, ElectionResult};
 use crate::encryption;
-use crate::messages::{Message, NodeId, NodeState, ReceivedImageInfo};
+use crate::firebase::{FireBaseClient, UserStatus};
+use crate::messages::{Message, NodeId, NodeState, ReceivedImageInfo, ClientUserInfo, ClientUserStatus};
 use log::{debug, error, info, warn};
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
@@ -81,6 +82,17 @@ impl CloudNode {
     /// Start the cloud node server
     pub async fn start(self: Arc<Self>) -> Result<(), Box<dyn std::error::Error>> {
         info!("[Node {}] Starting on {}", self.id, self.address);
+
+        // Update node address and status in Firebase
+        let firebase = FireBaseClient::new();
+        match firebase.update_node_address(self.id, &self.address).await {
+            Ok(_) => info!("[Node {}] Updated address in Firebase: {}", self.id, self.address),
+            Err(e) => warn!("[Node {}] Failed to update address in Firebase: {}", self.id, e),
+        }
+        match firebase.update_node_status(self.id, &crate::firebase::NodeStatus::Active).await {
+            Ok(_) => info!("[Node {}] Updated status to Active in Firebase", self.id),
+            Err(e) => warn!("[Node {}] Failed to update status in Firebase: {}", self.id, e),
+        }
 
         let socket = UdpSocket::bind(&self.address).await?;
         info!("[Node {}] Listening on {} (UDP)", self.id, self.address);
@@ -771,6 +783,201 @@ impl CloudNode {
                         remaining_views: None,
                         error: Some("No images for this user".to_string()),
                     })
+                }
+            }
+
+            // Client authentication via node (node handles Firebase)
+            Message::ClientLogin { user_id, password, client_ip } => {
+                info!("[Node {}] ClientLogin request for user_id: {}", self.id, user_id);
+                let firebase = FireBaseClient::new();
+                
+                match firebase.get_user(&user_id).await {
+                    Ok(Some(user_info)) => {
+                        // Verify password
+                        match firebase.verify_password(&user_id, &password).await {
+                            Ok(true) => {
+                                // Update status to Online and set current IP
+                                let _ = firebase.update_user_status(&user_id, &UserStatus::Online).await;
+                                let _ = firebase.update_last_seen(&user_id, chrono::Utc::now().timestamp()).await;
+                                let _ = firebase.update_user_ip(&user_id, &client_ip).await;
+                                
+                                info!("[Node {}] User {} logged in successfully", self.id, user_id);
+                                Some(Message::ClientLoginResponse {
+                                    success: true,
+                                    user_info: Some(ClientUserInfo {
+                                        id: user_id,
+                                        username: user_info.username,
+                                        status: match user_info.status {
+                                            UserStatus::Online => ClientUserStatus::Online,
+                                            UserStatus::Offline => ClientUserStatus::Offline,
+                                            UserStatus::Idle => ClientUserStatus::Idle,
+                                        },
+                                        last_seen: user_info.last_seen,
+                                        ip: client_ip,
+                                        gallery: user_info.gallery,
+                                    }),
+                                    error: None,
+                                })
+                            }
+                            Ok(false) => {
+                                info!("[Node {}] Login failed for user {}: incorrect password", self.id, user_id);
+                                Some(Message::ClientLoginResponse {
+                                    success: false,
+                                    user_info: None,
+                                    error: Some("Incorrect password".to_string()),
+                                })
+                            }
+                            Err(e) => {
+                                error!("[Node {}] Password verification error: {}", self.id, e);
+                                Some(Message::ClientLoginResponse {
+                                    success: false,
+                                    user_info: None,
+                                    error: Some(format!("Error verifying password: {}", e)),
+                                })
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        info!("[Node {}] Login failed: user_id {} not found", self.id, user_id);
+                        Some(Message::ClientLoginResponse {
+                            success: false,
+                            user_info: None,
+                            error: Some("User ID not found".to_string()),
+                        })
+                    }
+                    Err(e) => {
+                        error!("[Node {}] Firebase error during login: {}", self.id, e);
+                        Some(Message::ClientLoginResponse {
+                            success: false,
+                            user_info: None,
+                            error: Some(format!("Network error: {}", e)),
+                        })
+                    }
+                }
+            }
+
+            Message::ClientHeartbeat { user_id } => {
+                debug!("[Node {}] ClientHeartbeat from user_id: {}", self.id, user_id);
+                let firebase = FireBaseClient::new();
+                let now = chrono::Utc::now().timestamp();
+                let _ = firebase.update_last_seen(&user_id, now).await;
+                // No response needed for heartbeat
+                None
+            }
+
+            Message::ClientLogout { user_id } => {
+                info!("[Node {}] ClientLogout for user_id: {}", self.id, user_id);
+                let firebase = FireBaseClient::new();
+                let _ = firebase.update_user_status(&user_id, &UserStatus::Offline).await;
+                // No response needed for logout
+                None
+            }
+
+            Message::GetUserList => {
+                info!("[Node {}] GetUserList request", self.id);
+                let firebase = FireBaseClient::new();
+                
+                // Get all users from Firebase
+                let url = format!("{}/users.json", "https://dist-b6621-default-rtdb.europe-west1.firebasedatabase.app");
+                match reqwest::get(&url).await {
+                    Ok(resp) => {
+                        match resp.json::<Option<HashMap<String, crate::firebase::UserInfo>>>().await {
+                            Ok(Some(users_map)) => {
+                                let users: Vec<ClientUserInfo> = users_map
+                                    .into_iter()
+                                    .map(|(id, user)| ClientUserInfo {
+                                        id,
+                                        username: user.username,
+                                        status: match user.status {
+                                            UserStatus::Online => ClientUserStatus::Online,
+                                            UserStatus::Offline => ClientUserStatus::Offline,
+                                            UserStatus::Idle => ClientUserStatus::Idle,
+                                        },
+                                        last_seen: user.last_seen,
+                                        ip: user.ip,
+                                        gallery: user.gallery,
+                                    })
+                                    .collect();
+                                info!("[Node {}] Returning {} users", self.id, users.len());
+                                Some(Message::GetUserListResponse { users })
+                            }
+                            Ok(None) => {
+                                Some(Message::GetUserListResponse { users: vec![] })
+                            }
+                            Err(e) => {
+                                error!("[Node {}] Failed to parse users: {}", self.id, e);
+                                Some(Message::GetUserListResponse { users: vec![] })
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("[Node {}] Failed to fetch users: {}", self.id, e);
+                        Some(Message::GetUserListResponse { users: vec![] })
+                    }
+                }
+            }
+
+            Message::GetUserInfo { user_id } => {
+                info!("[Node {}] GetUserInfo request for user_id: {}", self.id, user_id);
+                let firebase = FireBaseClient::new();
+                
+                match firebase.get_user(&user_id).await {
+                    Ok(Some(user)) => {
+                        Some(Message::GetUserInfoResponse {
+                            success: true,
+                            user_info: Some(ClientUserInfo {
+                                id: user_id,
+                                username: user.username,
+                                status: match user.status {
+                                    UserStatus::Online => ClientUserStatus::Online,
+                                    UserStatus::Offline => ClientUserStatus::Offline,
+                                    UserStatus::Idle => ClientUserStatus::Idle,
+                                },
+                                last_seen: user.last_seen,
+                                ip: user.ip,
+                                gallery: user.gallery,
+                            }),
+                            error: None,
+                        })
+                    }
+                    Ok(None) => {
+                        Some(Message::GetUserInfoResponse {
+                            success: false,
+                            user_info: None,
+                            error: Some("User not found".to_string()),
+                        })
+                    }
+                    Err(e) => {
+                        error!("[Node {}] Failed to get user info: {}", self.id, e);
+                        Some(Message::GetUserInfoResponse {
+                            success: false,
+                            user_info: None,
+                            error: Some(format!("Error: {}", e)),
+                        })
+                    }
+                }
+            }
+
+            Message::GetUserGallery { user_id } => {
+                info!("[Node {}] GetUserGallery request for user_id: {}", self.id, user_id);
+                let firebase = FireBaseClient::new();
+                
+                match firebase.get_user_gallery(&user_id).await {
+                    Ok(images) => {
+                        Some(Message::GetUserGalleryResponse {
+                            success: true,
+                            images,
+                            error: None,
+                        })
+                    }
+                    Err(e) => {
+                        error!("[Node {}] Failed to get gallery: {}", self.id, e);
+                        Some(Message::GetUserGalleryResponse {
+                            success: false,
+                            images: vec![],
+                            error: Some(format!("Error: {}", e)),
+                        })
+                    }
                 }
             }
 
