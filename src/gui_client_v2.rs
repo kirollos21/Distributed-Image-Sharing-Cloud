@@ -8,6 +8,7 @@ use eframe::egui;
 use egui::{Color32, RichText, Vec2, Rounding};
 use poll_promise::Promise;
 use std::sync::Arc;
+use std::sync::mpsc;
 
 // ============================================================================
 // App State
@@ -96,6 +97,8 @@ pub struct ClientAppV2 {
     notes: Vec<NoteMeta>,
     notes_loading: Option<Promise<Result<Vec<NoteMeta>, String>>>,
     note_delete_in_progress: Option<Promise<Result<String, String>>>,  // note_id being deleted
+    // Incoming note channel (from local UDP listener)
+    incoming_note_rx: Option<mpsc::Receiver<NoteMeta>>,
     
     // Settings state
     new_username_input: String,
@@ -251,6 +254,7 @@ impl ClientAppV2 {
             notes: Vec::new(),
             notes_loading: None,
             note_delete_in_progress: None,
+            incoming_note_rx: None,
             new_username_input: String::new(),
             username_change_in_progress: None,
             settings_message: None,
@@ -296,6 +300,80 @@ impl ClientAppV2 {
         self.current_page = Page::Login;
         self.auth_error = None;
         self.auth_success = None;
+
+        // Prepare local_addr and start UDP listener so nodes can forward notes directly to this client.
+        // Try default port 8009 first, otherwise pick an ephemeral port.
+        let (tx, rx) = mpsc::channel::<NoteMeta>();
+        let mut local_addr = get_local_ip();
+        if let Ok(sock) = std::net::UdpSocket::bind(("0.0.0.0", 8009)) {
+            if let Ok(addr) = sock.local_addr() {
+                local_addr = format!("{}:{}", local_addr, addr.port());
+            }
+            let tx_clone = tx.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 65536];
+                loop {
+                    match sock.recv_from(&mut buf) {
+                        Ok((n, _src)) => {
+                            if let Ok(msg) = serde_json::from_slice::<Message>(&buf[..n]) {
+                                if let Message::SendNote { note_id, from_username, content, timestamp, .. } = msg {
+                                    let note = NoteMeta {
+                                        note_id: note_id.clone(),
+                                        from_user: from_username.clone(),
+                                        content: content.clone(),
+                                        timestamp,
+                                    };
+                                    let _ = tx_clone.send(note);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("UDP recv error: {}", e);
+                            break;
+                        }
+                    }
+                }
+            });
+            self.incoming_note_rx = Some(rx);
+        } else if let Ok(sock) = std::net::UdpSocket::bind(("0.0.0.0", 0)) {
+            if let Ok(addr) = sock.local_addr() {
+                local_addr = format!("{}:{}", local_addr, addr.port());
+            }
+            let tx_clone = tx.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 65536];
+                loop {
+                    match sock.recv_from(&mut buf) {
+                        Ok((n, _src)) => {
+                            if let Ok(msg) = serde_json::from_slice::<Message>(&buf[..n]) {
+                                if let Message::SendNote { note_id, from_username, content, timestamp, .. } = msg {
+                                    let note = NoteMeta {
+                                        note_id: note_id.clone(),
+                                        from_user: from_username.clone(),
+                                        content: content.clone(),
+                                        timestamp,
+                                    };
+                                    let _ = tx_clone.send(note);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("UDP recv error: {}", e);
+                            break;
+                        }
+                    }
+                }
+            });
+            self.incoming_note_rx = Some(rx);
+        } else {
+            eprintln!("Failed to bind UDP listener on default and ephemeral ports");
+        }
+
+        
+
+        
+
+        
         self.recipients.clear();
         self.received_images.clear();
         self.search_results.clear();
@@ -777,6 +855,14 @@ impl eframe::App for ClientAppV2 {
             
             // Process view image results
             self.process_view_result(ctx);
+
+            // Process incoming notes from UDP listener (if any)
+            if let Some(rx) = &self.incoming_note_rx {
+                while let Ok(note) = rx.try_recv() {
+                    // Prepend to notes list so newest appear first
+                    self.notes.insert(0, note);
+                }
+            }
         }
 
         // Main panel with dark background
@@ -954,6 +1040,74 @@ impl ClientAppV2 {
         self.auth_error = None;
         self.auth_success = None;
 
+        // Prepare local_addr and start UDP listener so nodes can forward notes directly to this client.
+        // Try default port 8009 first, otherwise pick an ephemeral port.
+        let (tx, rx) = mpsc::channel::<NoteMeta>();
+        let mut local_addr = get_local_ip();
+        if let Ok(sock) = std::net::UdpSocket::bind(("0.0.0.0", 8009)) {
+            if let Ok(addr) = sock.local_addr() {
+                local_addr = format!("{}:{}", local_addr, addr.port());
+            }
+            let tx_clone = tx.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 65536];
+                loop {
+                    match sock.recv_from(&mut buf) {
+                        Ok((n, _src)) => {
+                            if let Ok(msg) = serde_json::from_slice::<Message>(&buf[..n]) {
+                                if let Message::SendNote { note_id, from_username, content, timestamp, .. } = msg {
+                                    let note = NoteMeta {
+                                        note_id: note_id.clone(),
+                                        from_user: from_username.clone(),
+                                        content: content.clone(),
+                                        timestamp,
+                                    };
+                                    let _ = tx_clone.send(note);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("UDP recv error: {}", e);
+                            break;
+                        }
+                    }
+                }
+            });
+            self.incoming_note_rx = Some(rx);
+        } else if let Ok(sock) = std::net::UdpSocket::bind(("0.0.0.0", 0)) {
+            if let Ok(addr) = sock.local_addr() {
+                local_addr = format!("{}:{}", local_addr, addr.port());
+            }
+            let tx_clone = tx.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 65536];
+                loop {
+                    match sock.recv_from(&mut buf) {
+                        Ok((n, _src)) => {
+                            if let Ok(msg) = serde_json::from_slice::<Message>(&buf[..n]) {
+                                if let Message::SendNote { note_id, from_username, content, timestamp, .. } = msg {
+                                    let note = NoteMeta {
+                                        note_id: note_id.clone(),
+                                        from_user: from_username.clone(),
+                                        content: content.clone(),
+                                        timestamp,
+                                    };
+                                    let _ = tx_clone.send(note);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("UDP recv error: {}", e);
+                            break;
+                        }
+                    }
+                }
+            });
+            self.incoming_note_rx = Some(rx);
+        } else {
+            eprintln!("Failed to bind UDP listener on default and ephemeral ports");
+        }
+
         let promise = Promise::spawn_thread("auth", move || {
             runtime.block_on(async move {
                 let firebase = FireBaseClient::new();
@@ -1009,8 +1163,8 @@ impl ClientAppV2 {
                     let expected_username = parts[1].to_string();
                     
                     let client = Client::new(0, cloud_addresses);
-                    let local_ip = get_local_ip();
-                    
+                    let local_ip = local_addr.clone();
+
                     match client.client_login(user_id.clone(), password, local_ip).await {
                         Ok(Message::ClientLoginResponse { success, user_info, error }) => {
                             if success {

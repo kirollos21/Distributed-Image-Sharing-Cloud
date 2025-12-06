@@ -783,6 +783,53 @@ impl CloudNode {
                     Ok(_) => {
                         info!("[Node {}] Stored note {} from {} to user {}", 
                               self.id, note_id, from_username, user_id);
+                        // If recipient appears online, attempt to forward the note directly to their client
+                        match firebase.get_user_ip(&user_id).await {
+                            Ok(Some(ip_str)) => {
+                                // Also check status is Online if available
+                                match firebase.get_user_status(&user_id).await {
+                                    Ok(status) => {
+                                        if matches!(status, crate::firebase::UserStatus::Online) {
+                                            if let Ok(addr) = ip_str.parse::<SocketAddr>() {
+                                                // Build a SendNote message to push to recipient
+                                                let push_msg = Message::SendNote {
+                                                    note_id: note_id.clone(),
+                                                    from_id: 0, // not critical for client push
+                                                    to_id: to_id,
+                                                    from_username: from_username.clone(),
+                                                    content: note_meta.content.clone(),
+                                                    timestamp: note_meta.timestamp,
+                                                };
+
+                                                // Try sending directly to client (best effort)
+                                                match self.send_response_to_client(addr, push_msg).await {
+                                                    Ok(()) => {
+                                                        info!("[Node {}] Forwarded note {} to online user {} at {}", self.id, note_id, user_id, ip_str);
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("[Node {}] Failed to forward note {} to {} at {}: {}", self.id, note_id, user_id, ip_str, e);
+                                                    }
+                                                }
+                                            } else {
+                                                debug!("[Node {}] Recipient IP '{}' could not be parsed as SocketAddr", self.id, ip_str);
+                                            }
+                                        } else {
+                                            debug!("[Node {}] Recipient {} is not Online (status: {:?}), skipping direct forward", self.id, user_id, status);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("[Node {}] Failed to fetch user status for {}: {}", self.id, user_id, e);
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                debug!("[Node {}] No IP recorded for recipient {} in Firebase", self.id, user_id);
+                            }
+                            Err(e) => {
+                                warn!("[Node {}] Error fetching recipient IP for {}: {}", self.id, user_id, e);
+                            }
+                        }
+
                         Some(Message::SendNoteResponse {
                             success: true,
                             note_id,
