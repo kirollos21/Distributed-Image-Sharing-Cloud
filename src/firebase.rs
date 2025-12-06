@@ -373,6 +373,34 @@ impl FireBaseClient {
         self.client.delete(&url).send().await?;
         Ok(())
     }
+
+    // ==================== NOTES OPERATIONS ====================
+
+    /// Store a note in Firebase for a user
+    pub async fn add_note(&self, user_id: &str, note: &NoteMeta) -> Result<(), reqwest::Error> {
+        let url = format!("{}/notes/{}/{}.json", self.base_url, user_id, note.note_id);
+        self.client.put(&url).json(note).send().await?;
+        Ok(())
+    }
+
+    /// Get all notes for a user from Firebase
+    pub async fn get_notes(&self, user_id: &str) -> Result<Vec<NoteMeta>, reqwest::Error> {
+        let url = format!("{}/notes/{}.json", self.base_url, user_id);
+        let resp = self.client.get(&url).send().await?;
+        let notes_map = resp.json::<Option<HashMap<String, NoteMeta>>>().await?;
+        
+        match notes_map {
+            Some(map) => Ok(map.into_values().collect()),
+            None => Ok(vec![]),
+        }
+    }
+
+    /// Delete a note from Firebase
+    pub async fn delete_note(&self, user_id: &str, note_id: &str) -> Result<(), reqwest::Error> {
+        let url = format!("{}/notes/{}/{}.json", self.base_url, user_id, note_id);
+        self.client.delete(&url).send().await?;
+        Ok(())
+    }
 }
 
 /// Metadata for received images stored in Firebase
@@ -384,4 +412,13 @@ pub struct ReceivedImageMeta {
     pub max_views: u8,
     pub received_at: i64,
     pub encrypted_data_base64: String,  // Store the encrypted image data
+}
+
+/// Metadata for notes stored in Firebase
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteMeta {
+    pub note_id: String,
+    pub from_user: String,
+    pub content: String,
+    pub timestamp: i64,
 }

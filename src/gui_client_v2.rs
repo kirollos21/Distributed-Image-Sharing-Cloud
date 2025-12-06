@@ -1,8 +1,8 @@
 // New clean GUI client for Distributed Image Cloud
-// Features: Login, Register, Send Images, Inbox, My Gallery, Browse Users, Settings
+// Features: Login, Register, Send Images, Inbox, Notes, My Gallery, Browse Users, Settings
 
 use crate::client::Client;
-use crate::firebase::{FireBaseClient, UserInfo, UserStatus, ReceivedImageMeta};
+use crate::firebase::{FireBaseClient, UserInfo, UserStatus, ReceivedImageMeta, NoteMeta};
 use crate::messages::Message;
 use eframe::egui;
 use egui::{Color32, RichText, Vec2, Rounding};
@@ -19,6 +19,7 @@ pub enum Page {
     Login,
     SendImage,
     Inbox,       // Images sent TO you (private, with view quota)
+    Notes,       // Text notes from other users (synced)
     MyGallery,   // Your public gallery (up to 5 pixelated images)
     BrowseUsers, // Search users and see their galleries
     Settings,
@@ -71,7 +72,7 @@ pub struct ClientAppV2 {
     selected_received_image: Option<usize>,
     viewing_image: Option<Vec<u8>>,  // Decrypted image being viewed
     viewing_image_texture: Option<egui::TextureHandle>,  // Texture for display
-    viewing_in_progress: Option<Promise<Result<(Vec<u8>, u8), String>>>,  // (decrypted_data, remaining_views)
+    viewing_in_progress: Option<Promise<Result<(Vec<u8>, u8, Option<PendingFirebaseUpdate>), String>>>,  // (decrypted_data, remaining_views, pending_update)
     view_error: Option<String>,
     
     // My Gallery state (public pixelated images - max 5)
@@ -88,6 +89,13 @@ pub struct ClientAppV2 {
     search_results: Vec<UserSearchResult>,
     search_in_progress: Option<Promise<Result<Vec<UserSearchResult>, String>>>,
     search_gallery_textures: std::collections::HashMap<String, Vec<egui::TextureHandle>>,  // user_id -> textures
+    note_input: std::collections::HashMap<String, String>,  // user_id -> note text input
+    send_note_in_progress: Option<Promise<Result<String, String>>>,  // Returns recipient user_id on success
+    
+    // Notes state
+    notes: Vec<NoteMeta>,
+    notes_loading: Option<Promise<Result<Vec<NoteMeta>, String>>>,
+    note_delete_in_progress: Option<Promise<Result<String, String>>>,  // note_id being deleted
     
     // Settings state
     new_username_input: String,
@@ -98,6 +106,18 @@ pub struct ClientAppV2 {
     last_heartbeat: Option<std::time::Instant>,
     last_poll: Option<std::time::Instant>,
     poll_in_progress: Option<Promise<Result<u32, String>>>,  // Number of new images received
+    
+    // Pending Firebase updates (for offline support)
+    pending_firebase_updates: Vec<PendingFirebaseUpdate>,
+}
+
+/// Pending Firebase update for offline support
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct PendingFirebaseUpdate {
+    pub user_id: String,
+    pub image_id: String,
+    pub remaining_views: u8,
+    pub should_delete: bool,  // If true, delete the record; if false, update views
 }
 
 /// Represents a received encrypted image stored on disk
@@ -226,12 +246,18 @@ impl ClientAppV2 {
             search_results: Vec::new(),
             search_in_progress: None,
             search_gallery_textures: std::collections::HashMap::new(),
+            note_input: std::collections::HashMap::new(),
+            send_note_in_progress: None,
+            notes: Vec::new(),
+            notes_loading: None,
+            note_delete_in_progress: None,
             new_username_input: String::new(),
             username_change_in_progress: None,
             settings_message: None,
             last_heartbeat: None,
             last_poll: None,
             poll_in_progress: None,
+            pending_firebase_updates: Vec::new(),
         }
     }
 
@@ -427,6 +453,63 @@ impl ClientAppV2 {
             });
         });
     }
+    
+    /// Upload local images to Firebase that might be missing (for cross-device sync)
+    /// This ensures images received while offline get uploaded when back online
+    fn upload_local_to_firebase(&mut self) {
+        let user_id = self.session.user_id.clone();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        
+        std::thread::spawn(move || {
+            let cache_dir = Self::get_user_cache_dir(&user_id);
+            
+            runtime.block_on(async move {
+                let firebase = FireBaseClient::new();
+                
+                // Get existing Firebase image IDs
+                let existing_ids: std::collections::HashSet<String> = firebase
+                    .get_received_images(&user_id)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|img| img.image_id)
+                    .collect();
+                
+                // Scan local cache for images not in Firebase
+                if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().map_or(false, |e| e == "enc") {
+                            let meta_path = path.with_extension("meta.json");
+                            
+                            if let Ok(meta_content) = std::fs::read_to_string(&meta_path) {
+                                if let Ok(meta) = serde_json::from_str::<ImageCacheMeta>(&meta_content) {
+                                    // Check if this image is NOT in Firebase
+                                    if !existing_ids.contains(&meta.image_id) {
+                                        // Read and upload
+                                        if let Ok(encrypted_data) = std::fs::read(&path) {
+                                            let firebase_meta = ReceivedImageMeta {
+                                                image_id: meta.image_id.clone(),
+                                                from_user: meta.from_user.clone(),
+                                                remaining_views: meta.remaining_views,
+                                                max_views: meta.max_views,
+                                                received_at: meta.received_at,
+                                                encrypted_data_base64: base64::Engine::encode(
+                                                    &base64::engine::general_purpose::STANDARD,
+                                                    &encrypted_data
+                                                ),
+                                            };
+                                            let _ = firebase.add_received_image(&user_id, &firebase_meta).await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        });
+    }
 
     fn process_poll_result(&mut self) {
         let result = if let Some(promise) = &self.poll_in_progress {
@@ -467,6 +550,7 @@ impl ClientAppV2 {
         let user_id = self.session.user_id.clone();
         let image_id = image.image_id.clone();
         
+        // Return type: (decrypted_image, remaining_views, firebase_update_success, pending_update)
         let promise = Promise::spawn_thread("view_image", move || {
             // Read encrypted image from disk
             let encrypted_data = std::fs::read(&file_path)
@@ -497,23 +581,35 @@ impl ClientAppV2 {
                 }
             }
             
-            // Update Firebase with new view count (for cross-device sync)
-            rt.block_on(async {
+            // Try to update Firebase (may fail if offline)
+            let firebase_success = rt.block_on(async {
                 let firebase = FireBaseClient::new();
-                if remaining > 0 {
-                    let _ = firebase.update_received_image_views(&user_id, &image_id, remaining).await;
+                let result = if remaining > 0 {
+                    firebase.update_received_image_views(&user_id, &image_id, remaining).await
                 } else {
-                    // No views left, delete from Firebase
-                    let _ = firebase.delete_received_image(&user_id, &image_id).await;
-                }
+                    firebase.delete_received_image(&user_id, &image_id).await
+                };
+                result.is_ok()
             });
+            
+            // Create pending update if Firebase failed
+            let pending_update = if !firebase_success {
+                Some(PendingFirebaseUpdate {
+                    user_id: user_id.clone(),
+                    image_id: image_id.clone(),
+                    remaining_views: remaining,
+                    should_delete: remaining == 0,
+                })
+            } else {
+                None
+            };
             
             // Decrypt to get the viewable image
             let (decrypted_image, _) = rt.block_on(async {
                 crate::encryption::decrypt_image(updated_encrypted).await
             })?;
             
-            Ok((decrypted_image, remaining))
+            Ok((decrypted_image, remaining, pending_update))
         });
         
         self.viewing_in_progress = Some(promise);
@@ -530,7 +626,13 @@ impl ClientAppV2 {
 
         if let Some(res) = result {
             match res {
-                Ok((image_data, remaining_views)) => {
+                Ok((image_data, remaining_views, pending_update)) => {
+                    // Queue pending Firebase update if needed (for offline support)
+                    if let Some(update) = pending_update {
+                        self.pending_firebase_updates.push(update);
+                        self.save_pending_updates();
+                    }
+                    
                     // Load the decrypted image as a texture
                     if let Ok(img) = image::load_from_memory(&image_data) {
                         let rgba = img.to_rgba8();
@@ -567,6 +669,70 @@ impl ClientAppV2 {
         self.selected_received_image = None;
         self.view_error = None;
     }
+    
+    /// Save pending Firebase updates to disk (for persistence across app restarts)
+    fn save_pending_updates(&self) {
+        let cache_dir = Self::get_user_cache_dir(&self.session.user_id);
+        let pending_file = cache_dir.join("pending_firebase_updates.json");
+        let _ = std::fs::write(&pending_file, serde_json::to_string(&self.pending_firebase_updates).unwrap_or_default());
+    }
+    
+    /// Load pending Firebase updates from disk
+    fn load_pending_updates(&mut self) {
+        let cache_dir = Self::get_user_cache_dir(&self.session.user_id);
+        let pending_file = cache_dir.join("pending_firebase_updates.json");
+        if let Ok(content) = std::fs::read_to_string(&pending_file) {
+            if let Ok(updates) = serde_json::from_str::<Vec<PendingFirebaseUpdate>>(&content) {
+                self.pending_firebase_updates = updates;
+            }
+        }
+    }
+    
+    /// Try to sync pending Firebase updates (called periodically when online)
+    fn sync_pending_updates(&mut self) {
+        if self.pending_firebase_updates.is_empty() {
+            return;
+        }
+        
+        let updates = self.pending_firebase_updates.clone();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        let user_id = self.session.user_id.clone();
+        
+        // Fire-and-forget sync
+        std::thread::spawn(move || {
+            runtime.block_on(async {
+                let firebase = FireBaseClient::new();
+                let mut successful_indices = Vec::new();
+                
+                for (i, update) in updates.iter().enumerate() {
+                    let result = if update.should_delete {
+                        firebase.delete_received_image(&update.user_id, &update.image_id).await
+                    } else {
+                        firebase.update_received_image_views(&update.user_id, &update.image_id, update.remaining_views).await
+                    };
+                    
+                    if result.is_ok() {
+                        successful_indices.push(i);
+                    }
+                }
+                
+                // Remove successful updates from the pending list on disk
+                if !successful_indices.is_empty() {
+                    let cache_dir = Self::get_user_cache_dir(&user_id);
+                    let pending_file = cache_dir.join("pending_firebase_updates.json");
+                    
+                    let mut remaining_updates = updates;
+                    for i in successful_indices.into_iter().rev() {
+                        remaining_updates.remove(i);
+                    }
+                    let _ = std::fs::write(&pending_file, serde_json::to_string(&remaining_updates).unwrap_or_default());
+                }
+            });
+        });
+        
+        // Clear in-memory list (will be reloaded next time)
+        self.pending_firebase_updates.clear();
+    }
 }
 
 /// Metadata stored alongside cached encrypted images
@@ -594,6 +760,10 @@ impl eframe::App for ClientAppV2 {
             if self.last_heartbeat.map_or(true, |t| now.duration_since(t).as_secs() >= 70) {
                 self.send_heartbeat();
                 self.last_heartbeat = Some(now);
+                
+                // Also try to sync any pending Firebase updates
+                self.load_pending_updates();
+                self.sync_pending_updates();
             }
             
             // Poll for pending images every 30 seconds
@@ -894,11 +1064,23 @@ impl ClientAppV2 {
                             self.username_input.clear();
                             self.password_input.clear();
                             
-                            // Sync images from Firebase for cross-device access
+                            // Load pending Firebase updates (for offline support)
+                            self.load_pending_updates();
+                            
+                            // Try to sync any pending updates from previous offline sessions
+                            self.sync_pending_updates();
+                            
+                            // Sync images from Firebase for cross-device access (download from cloud)
                             self.sync_from_firebase();
+                            
+                            // Upload local images to Firebase that might be missing
+                            self.upload_local_to_firebase();
                             
                             // Load any cached images for this user
                             self.load_cached_images();
+                            
+                            // Load notes from Firebase
+                            self.load_notes();
                             
                             // Trigger immediate poll for pending images
                             self.last_poll = None;
@@ -934,6 +1116,7 @@ impl ClientAppV2 {
                 Page::Login => {},  // Shouldn't happen when logged in
                 Page::SendImage => self.render_send_image_page(ui, ctx),
                 Page::Inbox => self.render_inbox_page(ui, ctx),
+                Page::Notes => self.render_notes_page(ui, ctx),
                 Page::MyGallery => self.render_my_gallery_page(ui, ctx),
                 Page::BrowseUsers => self.render_browse_users_page(ui, ctx),
                 Page::Settings => self.render_settings_page(ui, ctx),
@@ -980,9 +1163,10 @@ impl ClientAppV2 {
             ui.add_space(20.0);
             
             let tabs = [
-                (Page::SendImage, "📤", "Send Image"),
+                (Page::SendImage, "📤", "Send"),
                 (Page::Inbox, "📥", "Inbox"),
-                (Page::MyGallery, "🖼️", "My Gallery"),
+                (Page::Notes, "📝", "Notes"),
+                (Page::MyGallery, "🖼️", "Gallery"),
                 (Page::BrowseUsers, "👥", "Browse"),
                 (Page::Settings, "⚙️", "Settings"),
             ];
@@ -999,10 +1183,15 @@ impl ClientAppV2 {
                 )
                 .fill(bg_color)
                 .rounding(Rounding::same(8.0))
-                .min_size(Vec2::new(120.0, 36.0));
+                .min_size(Vec2::new(100.0, 36.0));
                 
                 if ui.add(button).clicked() {
-                    self.current_page = page;
+                    self.current_page = page.clone();
+                    
+                    // Load notes when switching to Notes page
+                    if page == Page::Notes {
+                        self.load_notes();
+                    }
                 }
                 
                 ui.add_space(8.0);
@@ -1445,7 +1634,7 @@ impl ClientAppV2 {
                                             ui.label(RichText::new("📨").size(32.0));
                                         });
                                         
-                                        ui.add_space(6.0);
+                                        // ui.add_space(2.0);
                                         
                                         // Sender info
                                         ui.label(RichText::new(format!("From: {}", from_user))
@@ -1458,6 +1647,7 @@ impl ClientAppV2 {
                                         } else { 
                                             AppColors::ERROR 
                                         };
+                                        ui.add_space(2.0);
                                         ui.label(RichText::new(format!("Views: {}/{}", remaining_views, max_views))
                                             .size(11.0)
                                             .color(views_color));
@@ -1871,7 +2061,63 @@ impl ClientAppV2 {
                         ui.add_space(8.0);
                     }
                     
-                    // Apply deferred action
+                    // Render send note section for each user (separate pass to avoid borrow issues)
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("📝 Send a Note")
+                        .size(16.0)
+                        .color(AppColors::TEXT_PRIMARY)
+                        .strong());
+                    ui.add_space(10.0);
+                    
+                    // Process send note result
+                    self.process_send_note_result();
+                    
+                    let mut send_note_action: Option<(String, String, String)> = None;
+                    
+                    for user in &results_clone {
+                        let user_id = user.user_id.clone();
+                        let username = user.username.clone();
+                        
+                        egui::Frame::default()
+                            .fill(AppColors::BG_CARD)
+                            .rounding(Rounding::same(6.0))
+                            .inner_margin(egui::Margin::same(10.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(format!("To: {}#{}", username, user_id))
+                                        .size(13.0)
+                                        .color(AppColors::PRIMARY));
+                                    
+                                    let note_text = self.note_input.entry(user_id.clone()).or_insert_with(String::new);
+                                    
+                                    let text_edit = egui::TextEdit::singleline(note_text)
+                                        .hint_text("Type note (max 200 chars)...")
+                                        .desired_width(200.0);
+                                    ui.add(text_edit);
+                                    
+                                    let char_count = note_text.len();
+                                    let count_color = if char_count > 200 { AppColors::ERROR } else { AppColors::TEXT_SECONDARY };
+                                    ui.label(RichText::new(format!("{}/200", char_count))
+                                        .size(10.0)
+                                        .color(count_color));
+                                    
+                                    let can_send = !note_text.is_empty() && char_count <= 200 && self.send_note_in_progress.is_none();
+                                    
+                                    if ui.add_enabled(can_send, egui::Button::new("Send")
+                                        .fill(if can_send { AppColors::SUCCESS } else { AppColors::BG_CARD })
+                                        .rounding(Rounding::same(4.0))).clicked() {
+                                        send_note_action = Some((user_id.clone(), username.clone(), note_text.clone()));
+                                    }
+                                });
+                            });
+                        ui.add_space(5.0);
+                    }
+                    
+                    if let Some((user_id, username, content)) = send_note_action {
+                        self.send_note_to_user(&user_id, &username, &content);
+                    }
+                    
+                    // Apply deferred add recipient action
                     if let Some(user_tag) = add_recipient {
                         if !self.recipients.contains(&user_tag) {
                             self.recipients.push(user_tag);
@@ -1880,6 +2126,53 @@ impl ClientAppV2 {
                 }
             });
         });
+    }
+    
+    fn send_note_to_user(&mut self, user_id: &str, username: &str, content: &str) {
+        if self.send_note_in_progress.is_some() {
+            return;
+        }
+        
+        let from_username = format!("{}#{}", self.session.username, self.session.user_id);
+        let to_user_id = user_id.to_string();
+        let note_content = content.to_string();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        
+        let promise = Promise::spawn_thread("send_note", move || {
+            runtime.block_on(async {
+                let firebase = FireBaseClient::new();
+                let note_id = format!("note_{}_{}", chrono::Utc::now().timestamp_millis(), rand::random::<u16>());
+                
+                let note = NoteMeta {
+                    note_id,
+                    from_user: from_username,
+                    content: note_content,
+                    timestamp: chrono::Utc::now().timestamp(),
+                };
+                
+                firebase.add_note(&to_user_id, &note).await
+                    .map(|_| to_user_id.clone())
+                    .map_err(|e| format!("Failed to send note: {}", e))
+            })
+        });
+        
+        self.send_note_in_progress = Some(promise);
+    }
+    
+    fn process_send_note_result(&mut self) {
+        let result = if let Some(promise) = &self.send_note_in_progress {
+            promise.ready().cloned()
+        } else {
+            None
+        };
+        
+        if let Some(res) = result {
+            if let Ok(user_id) = res {
+                // Clear the note input for that user
+                self.note_input.remove(&user_id);
+            }
+            self.send_note_in_progress = None;
+        }
     }
 
     fn search_users(&mut self) {
@@ -1936,6 +2229,197 @@ impl ClientAppV2 {
                 }
                 self.search_in_progress = None;
             }
+        }
+    }
+
+    // ========================================================================
+    // Notes Page
+    // ========================================================================
+    
+    fn render_notes_page(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+        // Process any pending operations
+        self.process_notes_loading();
+        self.process_note_delete();
+        
+        ui.horizontal(|ui| {
+            ui.add_space(20.0);
+            
+            ui.vertical(|ui| {
+                ui.set_width(ui.available_width() - 40.0);
+                
+                ui.label(RichText::new("Notes")
+                    .size(24.0)
+                    .color(AppColors::TEXT_PRIMARY)
+                    .strong());
+                ui.label(RichText::new("Messages from other users")
+                    .size(14.0)
+                    .color(AppColors::TEXT_SECONDARY));
+                
+                ui.add_space(10.0);
+                
+                // Refresh button
+                if ui.add(egui::Button::new("🔄 Refresh")
+                    .fill(AppColors::BG_CARD)
+                    .rounding(Rounding::same(6.0))).clicked() {
+                    self.load_notes();
+                }
+                
+                ui.add_space(20.0);
+                
+                // Show loading indicator
+                if self.notes_loading.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Loading notes...");
+                    });
+                    return;
+                }
+                
+                // Show notes
+                if self.notes.is_empty() {
+                    egui::Frame::default()
+                        .fill(AppColors::BG_CARD)
+                        .rounding(Rounding::same(10.0))
+                        .inner_margin(egui::Margin::same(30.0))
+                        .show(ui, |ui| {
+                            ui.vertical_centered(|ui| {
+                                ui.label(RichText::new("📝")
+                                    .size(48.0)
+                                    .color(AppColors::TEXT_SECONDARY));
+                                ui.add_space(10.0);
+                                ui.label(RichText::new("No notes yet")
+                                    .size(16.0)
+                                    .color(AppColors::TEXT_SECONDARY));
+                            });
+                        });
+                } else {
+                    // Clone notes for iteration to avoid borrow issues
+                    let notes_clone: Vec<NoteMeta> = self.notes.clone();
+                    let mut delete_note_id: Option<String> = None;
+                    
+                    for note in &notes_clone {
+                        egui::Frame::default()
+                            .fill(AppColors::BG_CARD)
+                            .rounding(Rounding::same(8.0))
+                            .inner_margin(egui::Margin::same(15.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.vertical(|ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new(format!("From: {}", note.from_user))
+                                                .size(14.0)
+                                                .color(AppColors::PRIMARY)
+                                                .strong());
+                                            
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                // Format timestamp
+                                                let datetime = chrono::DateTime::from_timestamp(note.timestamp, 0)
+                                                    .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                                                    .unwrap_or_else(|| "Unknown".to_string());
+                                                ui.label(RichText::new(datetime)
+                                                    .size(11.0)
+                                                    .color(AppColors::TEXT_SECONDARY));
+                                            });
+                                        });
+                                        
+                                        ui.add_space(8.0);
+                                        
+                                        ui.label(RichText::new(&note.content)
+                                            .size(14.0)
+                                            .color(AppColors::TEXT_PRIMARY));
+                                        
+                                        ui.add_space(10.0);
+                                        
+                                        if ui.add(egui::Button::new("🗑️ Delete")
+                                            .fill(AppColors::ERROR)
+                                            .rounding(Rounding::same(4.0))).clicked() {
+                                            delete_note_id = Some(note.note_id.clone());
+                                        }
+                                    });
+                                });
+                            });
+                        ui.add_space(10.0);
+                    }
+                    
+                    // Apply deferred delete
+                    if let Some(note_id) = delete_note_id {
+                        self.delete_note(&note_id);
+                    }
+                }
+            });
+        });
+    }
+    
+    fn load_notes(&mut self) {
+        if self.notes_loading.is_some() {
+            return;
+        }
+        
+        let user_id = self.session.user_id.clone();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        
+        let promise = Promise::spawn_thread("load_notes", move || {
+            runtime.block_on(async {
+                let firebase = FireBaseClient::new();
+                firebase.get_notes(&user_id).await
+                    .map_err(|e| format!("Failed to load notes: {}", e))
+            })
+        });
+        
+        self.notes_loading = Some(promise);
+    }
+    
+    fn process_notes_loading(&mut self) {
+        let result = if let Some(promise) = &self.notes_loading {
+            promise.ready().cloned()
+        } else {
+            None
+        };
+        
+        if let Some(res) = result {
+            if let Ok(mut notes) = res {
+                // Sort by timestamp (newest first)
+                notes.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+                self.notes = notes;
+            }
+            self.notes_loading = None;
+        }
+    }
+    
+    fn delete_note(&mut self, note_id: &str) {
+        if self.note_delete_in_progress.is_some() {
+            return;
+        }
+        
+        let user_id = self.session.user_id.clone();
+        let note_id_owned = note_id.to_string();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        
+        let promise = Promise::spawn_thread("delete_note", move || {
+            runtime.block_on(async {
+                let firebase = FireBaseClient::new();
+                firebase.delete_note(&user_id, &note_id_owned).await
+                    .map(|_| note_id_owned.clone())
+                    .map_err(|e| format!("Failed to delete note: {}", e))
+            })
+        });
+        
+        self.note_delete_in_progress = Some(promise);
+    }
+    
+    fn process_note_delete(&mut self) {
+        let result = if let Some(promise) = &self.note_delete_in_progress {
+            promise.ready().cloned()
+        } else {
+            None
+        };
+        
+        if let Some(res) = result {
+            if let Ok(deleted_id) = res {
+                // Remove from local list
+                self.notes.retain(|n| n.note_id != deleted_id);
+            }
+            self.note_delete_in_progress = None;
         }
     }
 

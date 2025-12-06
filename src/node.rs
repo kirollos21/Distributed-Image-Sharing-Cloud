@@ -1,7 +1,7 @@
 use crate::chunking::{ChunkReassembler, ChunkedMessage};
 use crate::election::{ElectionManager, ElectionResult};
 use crate::encryption;
-use crate::firebase::{FireBaseClient, UserStatus};
+use crate::firebase::{FireBaseClient, UserStatus, ReceivedImageMeta, NoteMeta};
 use crate::messages::{Message, NodeId, NodeState, ReceivedImageInfo, ClientUserInfo, ClientUserStatus};
 use log::{debug, error, info, warn};
 use rand::Rng;
@@ -15,6 +15,7 @@ use tokio::time::{interval, sleep};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use std::path::Path;
+use base64::Engine;
 
 /// Stored image data
 #[derive(Clone, Debug)]
@@ -691,6 +692,7 @@ impl CloudNode {
             } => {
                 let mut stored = self.stored_images.write().await;
                 let timestamp = chrono::Utc::now().timestamp();
+                let firebase = FireBaseClient::new();
 
                 for username in to_usernames {
                     let image = StoredImage {
@@ -703,6 +705,31 @@ impl CloudNode {
                     };
 
                     stored.entry(username.clone()).or_insert_with(Vec::new).push(image);
+                    
+                    // Upload to Firebase for cross-device sync
+                    // Extract user_id from username (format: "name#id")
+                    let user_id = if username.contains('#') {
+                        username.rsplit('#').next().unwrap_or(&username).to_string()
+                    } else {
+                        username.clone()
+                    };
+                    
+                    let firebase_meta = ReceivedImageMeta {
+                        image_id: image_id.clone(),
+                        from_user: from_username.clone(),
+                        remaining_views: max_views,
+                        max_views,
+                        received_at: timestamp,
+                        encrypted_data_base64: base64::engine::general_purpose::STANDARD.encode(&encrypted_image),
+                    };
+                    
+                    if let Err(e) = firebase.add_received_image(&user_id, &firebase_meta).await {
+                        warn!("[Node {}] Failed to upload image {} to Firebase for user {}: {}", 
+                              self.id, image_id, user_id, e);
+                    } else {
+                        info!("[Node {}] Uploaded image {} to Firebase for user {}", 
+                              self.id, image_id, user_id);
+                    }
                 }
 
                 info!("[Node {}] Stored image {} from {}", self.id, image_id, from_username);
@@ -732,6 +759,46 @@ impl CloudNode {
                     .unwrap_or_default();
 
                 Some(Message::QueryReceivedImagesResponse { images })
+            }
+
+            Message::SendNote {
+                note_id,
+                from_id: _,
+                to_id,
+                from_username,
+                content,
+                timestamp,
+            } => {
+                let firebase = FireBaseClient::new();
+                let user_id = to_id.to_string();
+                
+                let note_meta = NoteMeta {
+                    note_id: note_id.clone(),
+                    from_user: from_username.clone(),
+                    content,
+                    timestamp,
+                };
+                
+                match firebase.add_note(&user_id, &note_meta).await {
+                    Ok(_) => {
+                        info!("[Node {}] Stored note {} from {} to user {}", 
+                              self.id, note_id, from_username, user_id);
+                        Some(Message::SendNoteResponse {
+                            success: true,
+                            note_id,
+                            error: None,
+                        })
+                    }
+                    Err(e) => {
+                        error!("[Node {}] Failed to store note {} to Firebase: {}", 
+                               self.id, note_id, e);
+                        Some(Message::SendNoteResponse {
+                            success: false,
+                            note_id,
+                            error: Some(format!("Failed to store note: {}", e)),
+                        })
+                    }
+                }
             }
 
             Message::CheckUsernameAvailable { username } => {
