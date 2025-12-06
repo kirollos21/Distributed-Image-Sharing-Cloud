@@ -4,6 +4,7 @@
 use crate::client::Client;
 use crate::firebase::{FireBaseClient, UserInfo, UserStatus, ReceivedImageMeta, NoteMeta};
 use crate::messages::Message;
+use crate::chunking::{ChunkReassembler, ChunkedMessage};
 use eframe::egui;
 use egui::{Color32, RichText, Vec2, Rounding};
 use poll_promise::Promise;
@@ -318,10 +319,44 @@ impl ClientAppV2 {
             let image_tx_clone = image_tx.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 65536];
+                let mut reassembler = ChunkReassembler::new();
                 loop {
                     match sock.recv_from(&mut buf) {
                         Ok((n, _src)) => {
-                            if let Ok(msg) = serde_json::from_slice::<Message>(&buf[..n]) {
+                            // Try to parse as ChunkedMessage first
+                            if let Ok(chunked_msg) = serde_json::from_slice::<ChunkedMessage>(&buf[..n]) {
+                                // Process chunk through reassembler
+                                if let Some(complete_data) = reassembler.process_chunk(chunked_msg) {
+                                    // Parse complete message
+                                    if let Ok(msg) = serde_json::from_slice::<Message>(&complete_data) {
+                                        match msg {
+                                            Message::SendNote { note_id, from_username, content, timestamp, .. } => {
+                                                let note = NoteMeta {
+                                                    note_id: note_id.clone(),
+                                                    from_user: from_username.clone(),
+                                                    content: content.clone(),
+                                                    timestamp,
+                                                };
+                                                let _ = note_tx_clone.send(note);
+                                            }
+                                            Message::SendImage { from_username, encrypted_image, max_views, image_id, .. } => {
+                                                let timestamp = chrono::Utc::now().timestamp();
+                                                let image_meta = ReceivedImageMeta {
+                                                    image_id: image_id.clone(),
+                                                    from_user: from_username.clone(),
+                                                    remaining_views: max_views,
+                                                    max_views,
+                                                    received_at: timestamp,
+                                                    encrypted_data_base64: base64::engine::general_purpose::STANDARD.encode(&encrypted_image),
+                                                };
+                                                let _ = image_tx_clone.send(image_meta);
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            } else if let Ok(msg) = serde_json::from_slice::<Message>(&buf[..n]) {
+                                // Direct message (not chunked) - for small messages
                                 match msg {
                                     Message::SendNote { note_id, from_username, content, timestamp, .. } => {
                                         let note = NoteMeta {
@@ -333,7 +368,6 @@ impl ClientAppV2 {
                                         let _ = note_tx_clone.send(note);
                                     }
                                     Message::SendImage { from_username, encrypted_image, max_views, image_id, .. } => {
-                                        // Handle directly delivered image
                                         let timestamp = chrono::Utc::now().timestamp();
                                         let image_meta = ReceivedImageMeta {
                                             image_id: image_id.clone(),
@@ -366,10 +400,44 @@ impl ClientAppV2 {
             let image_tx_clone = image_tx.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 65536];
+                let mut reassembler = ChunkReassembler::new();
                 loop {
                     match sock.recv_from(&mut buf) {
                         Ok((n, _src)) => {
-                            if let Ok(msg) = serde_json::from_slice::<Message>(&buf[..n]) {
+                            // Try to parse as ChunkedMessage first
+                            if let Ok(chunked_msg) = serde_json::from_slice::<ChunkedMessage>(&buf[..n]) {
+                                // Process chunk through reassembler
+                                if let Some(complete_data) = reassembler.process_chunk(chunked_msg) {
+                                    // Parse complete message
+                                    if let Ok(msg) = serde_json::from_slice::<Message>(&complete_data) {
+                                        match msg {
+                                            Message::SendNote { note_id, from_username, content, timestamp, .. } => {
+                                                let note = NoteMeta {
+                                                    note_id: note_id.clone(),
+                                                    from_user: from_username.clone(),
+                                                    content: content.clone(),
+                                                    timestamp,
+                                                };
+                                                let _ = note_tx_clone.send(note);
+                                            }
+                                            Message::SendImage { from_username, encrypted_image, max_views, image_id, .. } => {
+                                                let timestamp = chrono::Utc::now().timestamp();
+                                                let image_meta = ReceivedImageMeta {
+                                                    image_id: image_id.clone(),
+                                                    from_user: from_username.clone(),
+                                                    remaining_views: max_views,
+                                                    max_views,
+                                                    received_at: timestamp,
+                                                    encrypted_data_base64: base64::engine::general_purpose::STANDARD.encode(&encrypted_image),
+                                                };
+                                                let _ = image_tx_clone.send(image_meta);
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            } else if let Ok(msg) = serde_json::from_slice::<Message>(&buf[..n]) {
+                                // Direct message (not chunked) - for small messages
                                 match msg {
                                     Message::SendNote { note_id, from_username, content, timestamp, .. } => {
                                         let note = NoteMeta {
@@ -381,7 +449,6 @@ impl ClientAppV2 {
                                         let _ = note_tx_clone.send(note);
                                     }
                                     Message::SendImage { from_username, encrypted_image, max_views, image_id, .. } => {
-                                        // Handle directly delivered image
                                         let timestamp = chrono::Utc::now().timestamp();
                                         let image_meta = ReceivedImageMeta {
                                             image_id: image_id.clone(),

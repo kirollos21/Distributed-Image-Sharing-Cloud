@@ -321,7 +321,8 @@ impl CloudNode {
             response,
             Message::EncryptionResponse { .. } |
             Message::DecryptionResponse { .. } |
-            Message::ViewImageResponse { .. }
+            Message::ViewImageResponse { .. } |
+            Message::SendImage { .. }  // Direct image delivery to clients
         );
 
         if needs_chunking {
