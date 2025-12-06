@@ -81,7 +81,39 @@ pub enum NodeStatus { Active, Inactive }
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NodeInfo {
     pub address: String,
+    #[serde(deserialize_with = "deserialize_node_status")]
     pub status: NodeStatus,
+}
+
+/// Custom deserializer to handle various status string formats
+fn deserialize_node_status<'de, D>(deserializer: D) -> Result<NodeStatus, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    
+    struct NodeStatusVisitor;
+    
+    impl<'de> Visitor<'de> for NodeStatusVisitor {
+        type Value = NodeStatus;
+        
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a string like 'Active', 'online', 'Inactive', 'offline'")
+        }
+        
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            match v.to_lowercase().as_str() {
+                "active" | "online" => Ok(NodeStatus::Active),
+                "inactive" | "offline" => Ok(NodeStatus::Inactive),
+                _ => Ok(NodeStatus::Inactive), // Default to inactive for unknown
+            }
+        }
+    }
+    
+    deserializer.deserialize_str(NodeStatusVisitor)
 }
 
 impl FireBaseClient {
@@ -273,5 +305,28 @@ impl FireBaseClient {
         let resp = self.client.get(&url).send().await?;
         let address = resp.json::<Option<String>>().await?;
         Ok(address)
+    }
+
+    /// Get all online node addresses from Firebase
+    pub async fn get_online_node_addresses(&self) -> Result<Vec<String>, reqwest::Error> {
+        let nodes = self.get_all_nodes().await?;
+        let mut addresses: Vec<String> = nodes
+            .into_iter()
+            .filter(|(_, info)| {
+                // Include nodes that are Active
+                matches!(info.status, NodeStatus::Active)
+            })
+            .filter_map(|(_, info)| {
+                if !info.address.is_empty() && info.address != "127.0.0.1:0" {
+                    Some(info.address)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        
+        // Sort for consistent ordering
+        addresses.sort();
+        Ok(addresses)
     }
 }

@@ -163,12 +163,41 @@ impl ClientApp {
             tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"),
         );
 
-        // Use provided addresses or default to localhost
-        let cloud_addresses = node_addresses.unwrap_or_else(|| vec![
-            "127.0.0.1:8001".to_string(),
-            "127.0.0.1:8002".to_string(),
-            "127.0.0.1:8003".to_string(),
-        ]);
+        // Use provided addresses, fetch from Firebase, or default to localhost
+        let cloud_addresses = if let Some(addrs) = node_addresses {
+            println!("Using provided node addresses: {:?}", addrs);
+            addrs
+        } else {
+            // Try to fetch from Firebase
+            println!("Fetching node addresses from Firebase...");
+            let firebase = FireBaseClient::new();
+            let fetched = runtime.block_on(async {
+                firebase.get_online_node_addresses().await
+            });
+            
+            match fetched {
+                Ok(addrs) if !addrs.is_empty() => {
+                    println!("Found {} online nodes from Firebase: {:?}", addrs.len(), addrs);
+                    addrs
+                }
+                Ok(_) => {
+                    println!("No online nodes found in Firebase, using localhost defaults");
+                    vec![
+                        "127.0.0.1:8001".to_string(),
+                        "127.0.0.1:8002".to_string(),
+                        "127.0.0.1:8003".to_string(),
+                    ]
+                }
+                Err(e) => {
+                    println!("Failed to fetch nodes from Firebase: {}, using localhost defaults", e);
+                    vec![
+                        "127.0.0.1:8001".to_string(),
+                        "127.0.0.1:8002".to_string(),
+                        "127.0.0.1:8003".to_string(),
+                    ]
+                }
+            }
+        };
 
         println!("Client will connect to nodes: {:?}", cloud_addresses);
 
