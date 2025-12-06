@@ -9,6 +9,8 @@ use image::{DynamicImage, GenericImageView};
 pub struct ImageMetadata {
     pub usernames: Vec<String>,
     pub quota: u8,
+    #[serde(default)]
+    pub viewed: u8,  // Counter for how many times the image has been viewed (starts at 0)
 }
 
 /// Encrypt image by hiding it inside a cover image using LSB steganography
@@ -41,8 +43,8 @@ pub async fn encrypt_image(
     let pixels = cover_img.as_mut();
     let available_bits = pixels.len(); // Each byte can hold 1 bit in LSB
 
-    // Prepare metadata
-    let metadata = ImageMetadata { usernames, quota };
+    // Prepare metadata (viewed starts at 0 for new images)
+    let metadata = ImageMetadata { usernames, quota, viewed: 0 };
     let metadata_json = serde_json::to_string(&metadata).map_err(|e| e.to_string())?;
     let metadata_bytes = metadata_json.as_bytes();
 
@@ -229,14 +231,143 @@ pub fn decrement_quota(metadata: &mut ImageMetadata) -> bool {
     }
 }
 
+/// Check if the image can still be viewed (viewed count < quota)
+pub fn can_view(metadata: &ImageMetadata) -> bool {
+    metadata.viewed < metadata.quota
+}
+
+/// Get remaining views for an image
+pub fn remaining_views(metadata: &ImageMetadata) -> u8 {
+    metadata.quota.saturating_sub(metadata.viewed)
+}
+
+/// Update the view count in an encrypted image file
+/// Returns: Ok(Some(metadata)) if view was counted, Ok(None) if quota exhausted, Err on failure
+pub async fn update_view_count(image_data: &[u8]) -> Result<(Vec<u8>, ImageMetadata, bool), String> {
+    info!("Updating view count in encrypted image");
+
+    // Decode the cover image
+    let img = image::load_from_memory(image_data)
+        .map_err(|e| format!("Failed to decode encrypted image: {}", e))?;
+
+    let rgb_img = img.to_rgb8();
+    let pixels = rgb_img.as_raw();
+
+    if pixels.len() < 64 {
+        return Err("Image too small to contain hidden data".to_string());
+    }
+
+    let mut bit_index = 0;
+
+    // STEP 1: Extract metadata length (4 bytes)
+    let metadata_len = extract_u32(pixels, &mut bit_index)? as usize;
+
+    if metadata_len == 0 || metadata_len > 10000 {
+        return Err(format!("Invalid metadata length: {}", metadata_len));
+    }
+
+    // STEP 2: Extract metadata
+    let mut metadata_bytes = vec![0u8; metadata_len];
+    extract_bytes(pixels, &mut bit_index, &mut metadata_bytes)?;
+
+    let metadata_json = String::from_utf8(metadata_bytes)
+        .map_err(|e| format!("Invalid metadata UTF-8: {}", e))?;
+    let mut metadata: ImageMetadata = serde_json::from_str(&metadata_json)
+        .map_err(|e| format!("Invalid metadata JSON: {}", e))?;
+
+    // Check if quota is exhausted
+    if metadata.viewed >= metadata.quota {
+        info!("Quota exhausted: viewed {} times, quota is {}", metadata.viewed, metadata.quota);
+        return Ok((image_data.to_vec(), metadata, false));
+    }
+
+    // STEP 3: Extract original image length (4 bytes)
+    let image_len = extract_u32(pixels, &mut bit_index)? as usize;
+
+    if image_len == 0 || image_len > 10_000_000 {
+        return Err(format!("Invalid image length: {}", image_len));
+    }
+
+    // STEP 4: Extract original image data
+    let mut original_image_data = vec![0u8; image_len];
+    extract_bytes(pixels, &mut bit_index, &mut original_image_data)?;
+
+    // Increment view count
+    metadata.viewed += 1;
+    info!("View count updated: {} / {}", metadata.viewed, metadata.quota);
+
+    // Re-embed with updated metadata
+    let updated_encrypted = re_embed_metadata(&rgb_img, &metadata, &original_image_data)?;
+
+    Ok((updated_encrypted, metadata, true))
+}
+
+/// Re-embed metadata into an existing cover image with the same original image data
+fn re_embed_metadata(
+    cover_img: &image::RgbImage,
+    metadata: &ImageMetadata,
+    original_image_data: &[u8],
+) -> Result<Vec<u8>, String> {
+    let mut cover_img = cover_img.clone();
+    let pixels = cover_img.as_mut();
+
+    // Prepare new metadata
+    let metadata_json = serde_json::to_string(metadata).map_err(|e| e.to_string())?;
+    let metadata_bytes = metadata_json.as_bytes();
+
+    let mut bit_index = 0;
+
+    // STEP 1: Embed metadata length (4 bytes)
+    let metadata_len = metadata_bytes.len() as u32;
+    embed_u32(pixels, &mut bit_index, metadata_len);
+
+    // STEP 2: Embed metadata
+    embed_bytes(pixels, &mut bit_index, metadata_bytes);
+
+    // STEP 3: Embed original image length (4 bytes)
+    let image_len = original_image_data.len() as u32;
+    embed_u32(pixels, &mut bit_index, image_len);
+
+    // STEP 4: Embed original image data
+    embed_bytes(pixels, &mut bit_index, original_image_data);
+
+    // Convert to DynamicImage and encode as PNG (lossless)
+    let final_img = DynamicImage::ImageRgb8(cover_img);
+    let mut output_bytes = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut output_bytes);
+    let encoder = image::codecs::png::PngEncoder::new(&mut cursor);
+    final_img.write_with_encoder(encoder)
+        .map_err(|e| format!("Failed to encode PNG: {}", e))?;
+
+    info!("Re-embedded image with updated metadata: {} bytes", output_bytes.len());
+    Ok(output_bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Helper to create a valid PNG image for testing
+    fn create_test_image() -> Vec<u8> {
+        use image::{ImageBuffer, Rgb};
+        
+        // Create a small 10x10 RGB image
+        let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(10, 10, |x, y| {
+            Rgb([(x * 25) as u8, (y * 25) as u8, 128u8])
+        });
+        
+        // Encode as PNG
+        let mut buffer = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut buffer);
+        let encoder = image::codecs::png::PngEncoder::new(&mut cursor);
+        img.write_with_encoder(encoder).unwrap();
+        buffer
+    }
+
     #[tokio::test]
     async fn test_encrypt_decrypt() {
-        // Create a simple test image (1KB of random data)
-        let image_data: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
+        // Create a valid test image
+        let image_data = create_test_image();
         let usernames = vec!["alice".to_string(), "bob".to_string()];
         let quota = 5;
 
@@ -250,6 +381,7 @@ mod tests {
 
         assert_eq!(metadata.usernames, usernames);
         assert_eq!(metadata.quota, quota);
+        assert_eq!(metadata.viewed, 0); // New images start with viewed = 0
     }
 
     #[tokio::test]
@@ -257,6 +389,7 @@ mod tests {
         let metadata = ImageMetadata {
             usernames: vec!["alice".to_string(), "bob".to_string()],
             quota: 3,
+            viewed: 0,
         };
 
         assert!(is_authorized(&metadata, "alice"));
@@ -269,6 +402,7 @@ mod tests {
         let mut metadata = ImageMetadata {
             usernames: vec!["alice".to_string()],
             quota: 2,
+            viewed: 0,
         };
 
         assert!(decrement_quota(&mut metadata));
@@ -279,5 +413,58 @@ mod tests {
 
         assert!(!decrement_quota(&mut metadata));
         assert_eq!(metadata.quota, 0);
+    }
+
+    #[tokio::test]
+    async fn test_view_count() {
+        // Create a valid test image
+        let image_data = create_test_image();
+        let usernames = vec!["alice".to_string()];
+        let quota = 3;
+
+        // Encrypt
+        let encrypted = encrypt_image(image_data.clone(), usernames.clone(), quota)
+            .await
+            .unwrap();
+
+        // First view - should succeed
+        let (updated1, meta1, success1) = update_view_count(&encrypted).await.unwrap();
+        assert!(success1);
+        assert_eq!(meta1.viewed, 1);
+        assert!(can_view(&meta1)); // 1 < 3, can still view
+
+        // Second view - should succeed
+        let (updated2, meta2, success2) = update_view_count(&updated1).await.unwrap();
+        assert!(success2);
+        assert_eq!(meta2.viewed, 2);
+        assert!(can_view(&meta2)); // 2 < 3, can still view
+
+        // Third view - should succeed (last view)
+        let (updated3, meta3, success3) = update_view_count(&updated2).await.unwrap();
+        assert!(success3);
+        assert_eq!(meta3.viewed, 3);
+        assert!(!can_view(&meta3)); // 3 >= 3, cannot view anymore
+
+        // Fourth view - should fail (quota exhausted)
+        let (_updated4, meta4, success4) = update_view_count(&updated3).await.unwrap();
+        assert!(!success4);
+        assert_eq!(meta4.viewed, 3); // Stayed at 3
+    }
+
+    #[tokio::test]
+    async fn test_remaining_views() {
+        let metadata = ImageMetadata {
+            usernames: vec!["alice".to_string()],
+            quota: 5,
+            viewed: 2,
+        };
+        assert_eq!(remaining_views(&metadata), 3);
+
+        let metadata_exhausted = ImageMetadata {
+            usernames: vec!["alice".to_string()],
+            quota: 5,
+            viewed: 5,
+        };
+        assert_eq!(remaining_views(&metadata_exhausted), 0);
     }
 }

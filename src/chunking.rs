@@ -241,7 +241,7 @@ mod tests {
         for (i, chunk) in chunks.iter().enumerate() {
             match chunk {
                 ChunkedMessage::MultiPacket { chunk_index, total_chunks, data: encoded_data, .. } => {
-                    assert_eq!(*chunk_index, i as u32);
+                    assert_eq!(*chunk_index, i as u16);
                     assert_eq!(*total_chunks, 3);
                     // Decode and verify the original data size
                     let decoded = general_purpose::STANDARD.decode(encoded_data).unwrap();
