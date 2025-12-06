@@ -148,6 +148,21 @@ impl FireBaseClient {
         Ok(None)
     }
 
+    /// Find all users that match the given username (returns Vec of (id, UserInfo)).
+    pub async fn find_users_by_username(&self, username: &str) -> Result<Vec<(String, UserInfo)>, reqwest::Error>
+    {
+        let url = format!("{}/users.json?orderBy=\"username\"&equalTo=\"{}\"", self.base_url, username);
+        let resp = self.client.get(&url).send().await?;
+        let users_map = resp.json::<Option<std::collections::HashMap<String, UserInfo>>>().await?;
+        let mut results = Vec::new();
+        if let Some(users) = users_map {
+            for (id, info) in users {
+                results.push((id, info));
+            }
+        }
+        Ok(results)
+    }
+
     /// Get user by ID, returns None if user doesn't exist
     pub async fn get_user(&self, id: &str) -> Result<Option<UserInfo>, reqwest::Error> {
         let url = format!("{}/users/{}.json", self.base_url, id);

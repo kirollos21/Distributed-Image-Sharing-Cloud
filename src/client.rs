@@ -580,6 +580,61 @@ impl Client {
         }
     }
 
+    /// Send a text note to a user via nodes (replicated to all nodes)
+    pub async fn send_note(
+        &self,
+        note_id: String,
+        from_id: u8,
+        to_id: u8,
+        from_username: String,
+        content: String,
+        timestamp: i64,
+    ) -> Result<String, String> {
+        let message = Message::SendNote {
+            note_id: note_id.clone(),
+            from_id,
+            to_id,
+            from_username: from_username.clone(),
+            content: content.clone(),
+            timestamp,
+        };
+
+        info!("[Client {}] Sending note {} from {} to {} (replicating to {} nodes)",
+              self.id, note_id, from_username, to_id, self.cloud_addresses.len());
+
+        let mut success_count = 0;
+        let mut last_error = String::new();
+
+        for address in &self.cloud_addresses {
+            match Self::send_to_node(self.id, address, message.clone()).await {
+                Ok(Message::SendNoteResponse { success, note_id: _, error }) => {
+                    if success {
+                        success_count += 1;
+                        debug!("[Client {}] Note replicated to {}", self.id, address);
+                    } else {
+                        last_error = error.unwrap_or_else(|| "Send failed".to_string());
+                        warn!("[Client {}] Node {} rejected note: {}", self.id, address, last_error);
+                    }
+                }
+                Ok(_) => {
+                    last_error = "Unexpected response from server".to_string();
+                    warn!("[Client {}] Unexpected response from {}", self.id, address);
+                }
+                Err(e) => {
+                    last_error = e.clone();
+                    warn!("[Client {}] Failed to send to {}: {}", self.id, address, e);
+                }
+            }
+        }
+
+        if success_count > 0 {
+            info!("[Client {}] Successfully sent note {} to {}/{} nodes", self.id, note_id, success_count, self.cloud_addresses.len());
+            Ok(to_id.to_string())
+        } else {
+            Err(format!("Failed to send to any node. Last error: {}", last_error))
+        }
+    }
+
     /// Query received images for a username
     pub async fn query_received_images(
         &self,

@@ -2137,25 +2137,58 @@ impl ClientAppV2 {
         let to_user_id = user_id.to_string();
         let note_content = content.to_string();
         let runtime = self.runtime.as_ref().unwrap().clone();
-        
+
         let promise = Promise::spawn_thread("send_note", move || {
-            runtime.block_on(async {
-                let firebase = FireBaseClient::new();
+            runtime.block_on(async move {
+                // Build note id and timestamp
                 let note_id = format!("note_{}_{}", chrono::Utc::now().timestamp_millis(), rand::random::<u16>());
-                
-                let note = NoteMeta {
-                    note_id,
-                    from_user: from_username,
-                    content: note_content,
-                    timestamp: chrono::Utc::now().timestamp(),
-                };
-                
-                firebase.add_note(&to_user_id, &note).await
-                    .map(|_| to_user_id.clone())
-                    .map_err(|e| format!("Failed to send note: {}", e))
+                let ts = chrono::Utc::now().timestamp();
+
+                // Try to parse numeric IDs for node message routing
+                // Extract numeric portion from "username#id" if present
+                let from_id_num = from_username.rsplitn(2, '#').next().and_then(|s| s.parse::<u8>().ok());
+                let to_id_num = to_user_id.parse::<u8>().unwrap_or(0);
+
+                // If we have a valid numeric from_id and to_id, send via nodes
+                if from_id_num.is_some() && to_id_num != 0 {
+                    let client = match crate::client::Client::from_firebase(0).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            // Fallback to Firebase direct write
+                            let firebase = FireBaseClient::new();
+                            let note = NoteMeta {
+                                note_id: note_id.clone(),
+                                from_user: from_username.clone(),
+                                content: note_content.clone(),
+                                timestamp: ts,
+                            };
+                            return firebase.add_note(&to_user_id, &note).await
+                                .map(|_| to_user_id.clone())
+                                .map_err(|e| format!("Failed to send note (fallback): {}", e));
+                        }
+                    };
+
+                    let from_id_u8 = from_id_num.unwrap();
+                    match client.send_note(note_id.clone(), from_id_u8, to_id_num, from_username.clone(), note_content.clone(), ts).await {
+                        Ok(toid) => Ok(toid),
+                        Err(e) => Err(format!("Failed to send note via nodes: {}", e)),
+                    }
+                } else {
+                    // IDs are not numeric -- fallback to direct Firebase write
+                    let firebase = FireBaseClient::new();
+                    let note = NoteMeta {
+                        note_id: note_id.clone(),
+                        from_user: from_username.clone(),
+                        content: note_content.clone(),
+                        timestamp: ts,
+                    };
+                    firebase.add_note(&to_user_id, &note).await
+                        .map(|_| to_user_id.clone())
+                        .map_err(|e| format!("Failed to send note (fallback): {}", e))
+                }
             })
         });
-        
+
         self.send_note_in_progress = Some(promise);
     }
     
@@ -2178,24 +2211,32 @@ impl ClientAppV2 {
     fn search_users(&mut self) {
         let query = self.search_query.trim().to_string();
         let runtime = self.runtime.as_ref().unwrap().clone();
+        let current_user_id = self.session.user_id.clone();
 
         let promise = Promise::spawn_thread("search_users", move || {
             runtime.block_on(async move {
                 let firebase = FireBaseClient::new();
                 
-                // Search by username
+                // Search by username (return all matches)
                 let mut results = Vec::new();
-                
-                if let Ok(Some((id, info))) = firebase.find_user_by_username(&query).await {
-                    // Get gallery for this user
-                    let gallery = firebase.get_user_gallery(&id).await.unwrap_or_default();
-                    results.push(UserSearchResult {
-                        username: info.username,
-                        user_id: id,
-                        status: format!("{:?}", info.status),
-                        last_seen: info.last_seen,
-                        gallery,
-                    });
+
+                if let Ok(matches) = firebase.find_users_by_username(&query).await {
+                    for (id, info) in matches {
+                        // Skip the currently logged-in user
+                        if id == current_user_id {
+                            continue;
+                        }
+
+                        // Get gallery for this user
+                        let gallery = firebase.get_user_gallery(&id).await.unwrap_or_default();
+                        results.push(UserSearchResult {
+                            username: info.username,
+                            user_id: id,
+                            status: format!("{:?}", info.status),
+                            last_seen: info.last_seen,
+                            gallery,
+                        });
+                    }
                 }
                 
                 // Also try searching by ID
