@@ -398,16 +398,16 @@ impl eframe::App for ClientAppV2 {
         // Set dark theme
         ctx.set_visuals(egui::Visuals::dark());
         
-        // Heartbeat every 30 seconds + poll for images every 10 seconds
+        // Heartbeat every 70 seconds (for "last seen" info) + poll for images every 30 seconds
         if self.session.is_logged_in {
             let now = std::time::Instant::now();
-            if self.last_heartbeat.map_or(true, |t| now.duration_since(t).as_secs() >= 30) {
+            if self.last_heartbeat.map_or(true, |t| now.duration_since(t).as_secs() >= 70) {
                 self.send_heartbeat();
                 self.last_heartbeat = Some(now);
             }
             
-            // Poll for pending images every 10 seconds
-            if self.last_poll.map_or(true, |t| now.duration_since(t).as_secs() >= 10) {
+            // Poll for pending images every 30 seconds
+            if self.last_poll.map_or(true, |t| now.duration_since(t).as_secs() >= 30) {
                 self.poll_for_pending_images();
                 self.last_poll = Some(now);
             }
@@ -1211,45 +1211,73 @@ impl ClientAppV2 {
                             });
                         });
                 } else {
-                    // Show inbox grid
-                    let columns = 3;
-                    egui::Grid::new("inbox_grid")
-                        .num_columns(columns)
-                        .spacing([15.0, 15.0])
-                        .show(ui, |ui| {
+                    // Show inbox grid using ScrollArea for many images
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(15.0, 15.0);
+                            
                             for (i, image) in self.received_images.iter().enumerate() {
                                 egui::Frame::default()
                                     .fill(AppColors::BG_CARD)
                                     .rounding(Rounding::same(10.0))
-                                    .inner_margin(egui::Margin::same(10.0))
+                                    .inner_margin(egui::Margin::same(12.0))
                                     .show(ui, |ui| {
-                                        ui.set_width(150.0);
+                                        ui.set_min_width(160.0);
+                                        ui.set_max_width(160.0);
                                         
-                                        // Placeholder for image
-                                        ui.add_sized([130.0, 100.0], egui::Label::new(
-                                            RichText::new("📨").size(40.0)
-                                        ));
-                                        
-                                        ui.add_space(5.0);
-                                        ui.label(RichText::new(format!("From: {}", image.from_user))
-                                            .size(11.0)
-                                            .color(AppColors::TEXT_SECONDARY));
-                                        ui.label(RichText::new(format!("Views: {}/{}", image.remaining_views, image.max_views))
-                                            .size(11.0)
-                                            .color(if image.remaining_views > 0 { AppColors::SUCCESS } else { AppColors::ERROR }));
-                                        
-                                        if ui.add_enabled(image.remaining_views > 0, 
-                                            egui::Button::new("View").small()).clicked() {
-                                            self.selected_received_image = Some(i);
-                                            // TODO: Implement view_cached_image() to decrypt and show
-                                        }
+                                        ui.vertical(|ui| {
+                                            // Image placeholder
+                                            ui.vertical_centered(|ui| {
+                                                ui.add_sized([120.0, 90.0], egui::Label::new(
+                                                    RichText::new("📨").size(36.0)
+                                                ));
+                                            });
+                                            
+                                            ui.add_space(8.0);
+                                            ui.separator();
+                                            ui.add_space(6.0);
+                                            
+                                            // Sender info
+                                            ui.label(RichText::new("From:")
+                                                .size(10.0)
+                                                .color(AppColors::TEXT_SECONDARY));
+                                            ui.label(RichText::new(&image.from_user)
+                                                .size(12.0)
+                                                .color(AppColors::TEXT_PRIMARY));
+                                            
+                                            ui.add_space(4.0);
+                                            
+                                            // Views counter
+                                            let views_color = if image.remaining_views > 0 { 
+                                                AppColors::SUCCESS 
+                                            } else { 
+                                                AppColors::ERROR 
+                                            };
+                                            ui.label(RichText::new(format!("Views: {}/{}", image.remaining_views, image.max_views))
+                                                .size(11.0)
+                                                .color(views_color));
+                                            
+                                            ui.add_space(8.0);
+                                            
+                                            // View button - full width
+                                            ui.vertical_centered(|ui| {
+                                                let btn = egui::Button::new(
+                                                    RichText::new("👁 View Image").size(12.0)
+                                                )
+                                                .min_size(Vec2::new(130.0, 28.0))
+                                                .fill(if image.remaining_views > 0 { AppColors::PRIMARY } else { AppColors::BG_INPUT })
+                                                .rounding(Rounding::same(6.0));
+                                                
+                                                if ui.add_enabled(image.remaining_views > 0, btn).clicked() {
+                                                    self.selected_received_image = Some(i);
+                                                    // TODO: Implement view_cached_image() to decrypt and show
+                                                }
+                                            });
+                                        });
                                     });
-                                
-                                if (i + 1) % columns == 0 {
-                                    ui.end_row();
-                                }
                             }
                         });
+                    });
                 }
             });
         });

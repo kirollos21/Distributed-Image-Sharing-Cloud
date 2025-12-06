@@ -219,6 +219,35 @@ impl Client {
         Err("All nodes failed to respond".to_string())
     }
 
+    /// Send message to a node without waiting for response (fire and forget)
+    async fn send_to_node_no_response(
+        client_id: usize,
+        address: &str,
+        message: Message,
+    ) -> Result<(), String> {
+        debug!("[Client {}] send_to_node_no_response: Sending to {}", client_id, address);
+
+        // Create UDP socket
+        let socket = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(format!("Socket creation failed: {}", e));
+            }
+        };
+
+        // Serialize and send message
+        let message_bytes = serde_json::to_vec(&message).map_err(|e| e.to_string())?;
+        let chunks = ChunkedMessage::fragment(message_bytes);
+
+        for chunk in chunks {
+            let chunk_bytes = serde_json::to_vec(&chunk).map_err(|e| e.to_string())?;
+            socket.send_to(&chunk_bytes, address).await.map_err(|e| format!("Send error: {}", e))?;
+        }
+
+        debug!("[Client {}] Fire-and-forget message sent to {}", client_id, address);
+        Ok(())
+    }
+
     /// Send message to a specific node
     async fn send_to_node(
         client_id: usize,
@@ -378,25 +407,25 @@ impl Client {
         self.send_with_retry(message).await
     }
 
-    /// Send heartbeat via node (node updates Firebase)
+    /// Send heartbeat via node (node updates Firebase) - fire and forget
     pub async fn client_heartbeat(&self, user_id: String) {
         let message = Message::ClientHeartbeat { user_id };
 
-        // Fire and forget to first available node
+        // Fire and forget to first available node (no response expected)
         for address in &self.cloud_addresses {
-            if Self::send_to_node(self.id, address, message.clone()).await.is_ok() {
+            if Self::send_to_node_no_response(self.id, address, message.clone()).await.is_ok() {
                 return;
             }
         }
     }
 
-    /// Logout via node (node updates Firebase)
+    /// Logout via node (node updates Firebase) - fire and forget
     pub async fn client_logout(&self, user_id: String) {
         let message = Message::ClientLogout { user_id };
 
-        // Fire and forget to first available node
+        // Fire and forget to first available node (no response expected)
         for address in &self.cloud_addresses {
-            if Self::send_to_node(self.id, address, message.clone()).await.is_ok() {
+            if Self::send_to_node_no_response(self.id, address, message.clone()).await.is_ok() {
                 return;
             }
         }
