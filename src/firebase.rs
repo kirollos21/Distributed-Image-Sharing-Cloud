@@ -375,6 +375,14 @@ impl FireBaseClient {
         }
     }
 
+    /// Get a specific received image for a user from Firebase
+    pub async fn get_received_image(&self, user_id: &str, image_id: &str) -> Result<Option<ReceivedImageMeta>, reqwest::Error> {
+        let url = format!("{}/received_images/{}/{}.json", self.base_url, user_id, image_id);
+        let resp = self.client.get(&url).send().await?;
+        let image_meta = resp.json::<Option<ReceivedImageMeta>>().await?;
+        Ok(image_meta)
+    }
+
     /// Update view count for a received image
     pub async fn update_received_image_views(&self, user_id: &str, image_id: &str, remaining_views: u8) -> Result<(), reqwest::Error> {
         let url = format!("{}/received_images/{}/{}/remaining_views.json", self.base_url, user_id, image_id);

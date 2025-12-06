@@ -9,6 +9,7 @@ use egui::{Color32, RichText, Vec2, Rounding};
 use poll_promise::Promise;
 use std::sync::Arc;
 use std::sync::mpsc;
+use base64::Engine;
 
 // ============================================================================
 // App State
@@ -99,6 +100,8 @@ pub struct ClientAppV2 {
     note_delete_in_progress: Option<Promise<Result<String, String>>>,  // note_id being deleted
     // Incoming note channel (from local UDP listener)
     incoming_note_rx: Option<mpsc::Receiver<NoteMeta>>,
+    // Incoming image channel (from local UDP listener for direct delivery)
+    incoming_image_rx: Option<mpsc::Receiver<ReceivedImageMeta>>,
     
     // Settings state
     new_username_input: String,
@@ -255,6 +258,7 @@ impl ClientAppV2 {
             notes_loading: None,
             note_delete_in_progress: None,
             incoming_note_rx: None,
+            incoming_image_rx: None,
             new_username_input: String::new(),
             username_change_in_progress: None,
             settings_message: None,
@@ -301,29 +305,47 @@ impl ClientAppV2 {
         self.auth_error = None;
         self.auth_success = None;
 
-        // Prepare local_addr and start UDP listener so nodes can forward notes directly to this client.
+        // Prepare local_addr and start UDP listener so nodes can forward notes and images directly to this client.
         // Try default port 8009 first, otherwise pick an ephemeral port.
-        let (tx, rx) = mpsc::channel::<NoteMeta>();
+        let (note_tx, note_rx) = mpsc::channel::<NoteMeta>();
+        let (image_tx, image_rx) = mpsc::channel::<ReceivedImageMeta>();
         let mut local_addr = get_local_ip();
         if let Ok(sock) = std::net::UdpSocket::bind(("0.0.0.0", 8009)) {
             if let Ok(addr) = sock.local_addr() {
                 local_addr = format!("{}:{}", local_addr, addr.port());
             }
-            let tx_clone = tx.clone();
+            let note_tx_clone = note_tx.clone();
+            let image_tx_clone = image_tx.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 65536];
                 loop {
                     match sock.recv_from(&mut buf) {
                         Ok((n, _src)) => {
                             if let Ok(msg) = serde_json::from_slice::<Message>(&buf[..n]) {
-                                if let Message::SendNote { note_id, from_username, content, timestamp, .. } = msg {
-                                    let note = NoteMeta {
-                                        note_id: note_id.clone(),
-                                        from_user: from_username.clone(),
-                                        content: content.clone(),
-                                        timestamp,
-                                    };
-                                    let _ = tx_clone.send(note);
+                                match msg {
+                                    Message::SendNote { note_id, from_username, content, timestamp, .. } => {
+                                        let note = NoteMeta {
+                                            note_id: note_id.clone(),
+                                            from_user: from_username.clone(),
+                                            content: content.clone(),
+                                            timestamp,
+                                        };
+                                        let _ = note_tx_clone.send(note);
+                                    }
+                                    Message::SendImage { from_username, encrypted_image, max_views, image_id, .. } => {
+                                        // Handle directly delivered image
+                                        let timestamp = chrono::Utc::now().timestamp();
+                                        let image_meta = ReceivedImageMeta {
+                                            image_id: image_id.clone(),
+                                            from_user: from_username.clone(),
+                                            remaining_views: max_views,
+                                            max_views,
+                                            received_at: timestamp,
+                                            encrypted_data_base64: base64::engine::general_purpose::STANDARD.encode(&encrypted_image),
+                                        };
+                                        let _ = image_tx_clone.send(image_meta);
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -334,26 +356,44 @@ impl ClientAppV2 {
                     }
                 }
             });
-            self.incoming_note_rx = Some(rx);
+            self.incoming_note_rx = Some(note_rx);
+            self.incoming_image_rx = Some(image_rx);
         } else if let Ok(sock) = std::net::UdpSocket::bind(("0.0.0.0", 0)) {
             if let Ok(addr) = sock.local_addr() {
                 local_addr = format!("{}:{}", local_addr, addr.port());
             }
-            let tx_clone = tx.clone();
+            let note_tx_clone = note_tx.clone();
+            let image_tx_clone = image_tx.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 65536];
                 loop {
                     match sock.recv_from(&mut buf) {
                         Ok((n, _src)) => {
                             if let Ok(msg) = serde_json::from_slice::<Message>(&buf[..n]) {
-                                if let Message::SendNote { note_id, from_username, content, timestamp, .. } = msg {
-                                    let note = NoteMeta {
-                                        note_id: note_id.clone(),
-                                        from_user: from_username.clone(),
-                                        content: content.clone(),
-                                        timestamp,
-                                    };
-                                    let _ = tx_clone.send(note);
+                                match msg {
+                                    Message::SendNote { note_id, from_username, content, timestamp, .. } => {
+                                        let note = NoteMeta {
+                                            note_id: note_id.clone(),
+                                            from_user: from_username.clone(),
+                                            content: content.clone(),
+                                            timestamp,
+                                        };
+                                        let _ = note_tx_clone.send(note);
+                                    }
+                                    Message::SendImage { from_username, encrypted_image, max_views, image_id, .. } => {
+                                        // Handle directly delivered image
+                                        let timestamp = chrono::Utc::now().timestamp();
+                                        let image_meta = ReceivedImageMeta {
+                                            image_id: image_id.clone(),
+                                            from_user: from_username.clone(),
+                                            remaining_views: max_views,
+                                            max_views,
+                                            received_at: timestamp,
+                                            encrypted_data_base64: base64::engine::general_purpose::STANDARD.encode(&encrypted_image),
+                                        };
+                                        let _ = image_tx_clone.send(image_meta);
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -364,7 +404,8 @@ impl ClientAppV2 {
                     }
                 }
             });
-            self.incoming_note_rx = Some(rx);
+            self.incoming_note_rx = Some(note_rx);
+            self.incoming_image_rx = Some(image_rx);
         } else {
             eprintln!("Failed to bind UDP listener on default and ephemeral ports");
         }
@@ -844,10 +885,10 @@ impl eframe::App for ClientAppV2 {
         // Set dark theme
         ctx.set_visuals(egui::Visuals::dark());
         
-        // Heartbeat every 70 seconds (for "last seen" info) + poll for images every 30 seconds
+        // Heartbeat every 10 seconds (for "last seen" info and online status) + poll for images every 30 seconds
         if self.session.is_logged_in {
             let now = std::time::Instant::now();
-            if self.last_heartbeat.map_or(true, |t| now.duration_since(t).as_secs() >= 70) {
+            if self.last_heartbeat.map_or(true, |t| now.duration_since(t).as_secs() >= 10) {
                 self.send_heartbeat();
                 self.last_heartbeat = Some(now);
                 
@@ -873,6 +914,44 @@ impl eframe::App for ClientAppV2 {
                 while let Ok(note) = rx.try_recv() {
                     // Prepend to notes list so newest appear first
                     self.notes.insert(0, note);
+                }
+            }
+
+            // Process incoming images from UDP listener (direct delivery)
+            if let Some(rx) = &self.incoming_image_rx {
+                while let Ok(image_meta) = rx.try_recv() {
+                    // Save to local cache
+                    let user_id = &self.session.user_id;
+                    let cache_dir = Self::get_user_cache_dir(user_id);
+                    
+                    // Save encrypted data to file
+                    let filename = format!("{}_{}.enc", image_meta.from_user.replace('#', "_"), image_meta.image_id);
+                    let file_path = cache_dir.join(&filename);
+                    
+                    if let Ok(encrypted_data) = base64::engine::general_purpose::STANDARD.decode(&image_meta.encrypted_data_base64) {
+                        if let Ok(_) = std::fs::write(&file_path, &encrypted_data) {
+                            // Save metadata
+                            let meta_path = cache_dir.join(format!("{}.meta.json", filename));
+                            let _ = std::fs::write(&meta_path, serde_json::to_string(&image_meta).unwrap_or_default());
+                            
+                            // Add to received_images list
+                            let received_image = ReceivedImage {
+                                filename: filename.clone(),
+                                from_user: image_meta.from_user.clone(),
+                                remaining_views: image_meta.remaining_views,
+                                max_views: image_meta.max_views,
+                                received_at: image_meta.received_at,
+                                file_path: file_path.to_string_lossy().to_string(),
+                                image_id: image_meta.image_id.clone(),
+                            };
+                            
+                            // Prepend to inbox so newest appears first
+                            self.received_images.insert(0, received_image);
+                            
+                            eprintln!("[DIRECT DELIVERY] Received image {} from {} - added to inbox!", 
+                                     image_meta.image_id, image_meta.from_user);
+                        }
+                    }
                 }
             }
         }

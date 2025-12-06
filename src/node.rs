@@ -17,17 +17,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use std::path::Path;
 use base64::Engine;
 
-/// Stored image data
-#[derive(Clone, Debug)]
-pub struct StoredImage {
-    pub image_id: String,
-    pub from_username: String,
-    pub encrypted_data: Vec<u8>,
-    pub remaining_views: u8,
-    pub max_views: u8,
-    pub timestamp: i64,
-}
-
 /// Cached load information for a peer node
 #[derive(Clone, Debug)]
 pub struct CachedLoadInfo {
@@ -47,7 +36,7 @@ pub struct CloudNode {
     pub peer_addresses: HashMap<NodeId, String>,
     pub processed_requests: Arc<RwLock<usize>>, // Total completed (for metrics only)
     pub active_sessions: Arc<RwLock<HashMap<String, String>>>, // username -> client_id
-    pub stored_images: Arc<RwLock<HashMap<String, Vec<StoredImage>>>>, // username -> list of images
+    pub client_heartbeats: Arc<RwLock<HashMap<String, Instant>>>, // user_id -> last heartbeat time
     pub chunk_reassembler: Arc<Mutex<ChunkReassembler>>, // For reassembling multi-packet messages
     pub in_flight_requests: Arc<RwLock<HashSet<String>>>, // Track active request IDs to prevent duplicates
     pub chunk_cache: Arc<RwLock<HashMap<String, Vec<ChunkedMessage>>>>, // Cache sent chunks for retransmission
@@ -70,7 +59,7 @@ impl CloudNode {
             peer_addresses,
             processed_requests: Arc::new(RwLock::new(0)),
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
-            stored_images: Arc::new(RwLock::new(HashMap::new())),
+            client_heartbeats: Arc::new(RwLock::new(HashMap::new())),
             chunk_reassembler: Arc::new(Mutex::new(ChunkReassembler::new())),
             in_flight_requests: Arc::new(RwLock::new(HashSet::new())),
             chunk_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -137,6 +126,12 @@ impl CloudNode {
         let self_clone = self.clone();
         tokio::spawn(async move {
             self_clone.load_monitoring_task().await;
+        });
+
+        // Start client online tracking task (check every 15 seconds, mark offline after 30s)
+        let self_clone = self.clone();
+        tokio::spawn(async move {
+            self_clone.client_online_tracking_task().await;
         });
 
         // Receive incoming datagrams
@@ -690,23 +685,10 @@ impl CloudNode {
                 max_views,
                 image_id,
             } => {
-                let mut stored = self.stored_images.write().await;
                 let timestamp = chrono::Utc::now().timestamp();
                 let firebase = FireBaseClient::new();
 
                 for username in to_usernames {
-                    let image = StoredImage {
-                        image_id: image_id.clone(),
-                        from_username: from_username.clone(),
-                        encrypted_data: encrypted_image.clone(),
-                        remaining_views: max_views,
-                        max_views,
-                        timestamp,
-                    };
-
-                    stored.entry(username.clone()).or_insert_with(Vec::new).push(image);
-                    
-                    // Upload to Firebase for cross-device sync
                     // Extract user_id from username (format: "name#id")
                     let user_id = if username.contains('#') {
                         username.rsplit('#').next().unwrap_or(&username).to_string()
@@ -714,6 +696,7 @@ impl CloudNode {
                         username.clone()
                     };
                     
+                    // Upload to Firebase for persistence
                     let firebase_meta = ReceivedImageMeta {
                         image_id: image_id.clone(),
                         from_user: from_username.clone(),
@@ -730,9 +713,58 @@ impl CloudNode {
                         info!("[Node {}] Uploaded image {} to Firebase for user {}", 
                               self.id, image_id, user_id);
                     }
+
+                    // Check if recipient is online and send directly
+                    match firebase.get_user_ip(&user_id).await {
+                        Ok(Some(ip_str)) => {
+                            // Check if we've received a heartbeat recently (within 30 seconds)
+                            let is_online = {
+                                let heartbeats = self.client_heartbeats.read().await;
+                                heartbeats.get(&user_id)
+                                    .map(|last_beat| last_beat.elapsed().as_secs() < 30)
+                                    .unwrap_or(false)
+                            };
+
+                            if is_online {
+                                if let Ok(addr) = ip_str.parse::<SocketAddr>() {
+                                    // Send image directly to online recipient
+                                    let send_msg = Message::SendImage {
+                                        from_username: from_username.clone(),
+                                        to_usernames: vec![username.clone()],
+                                        encrypted_image: encrypted_image.clone(),
+                                        max_views,
+                                        image_id: image_id.clone(),
+                                    };
+
+                                    match self.send_response_to_client(addr, send_msg).await {
+                                        Ok(()) => {
+                                            info!("[Node {}] Sent image {} directly to online user {} at {}",
+                                                  self.id, image_id, user_id, ip_str);
+                                        }
+                                        Err(e) => {
+                                            warn!("[Node {}] Failed to send image {} to {} at {}: {}",
+                                                  self.id, image_id, user_id, ip_str, e);
+                                        }
+                                    }
+                                } else {
+                                    debug!("[Node {}] Recipient IP '{}' could not be parsed", self.id, ip_str);
+                                }
+                            } else {
+                                debug!("[Node {}] Recipient {} is offline (no recent heartbeat), image stored in Firebase",
+                                      self.id, user_id);
+                            }
+                        }
+                        Ok(None) => {
+                            debug!("[Node {}] No IP recorded for recipient {}", self.id, user_id);
+                        }
+                        Err(e) => {
+                            warn!("[Node {}] Error fetching recipient IP for {}: {}", self.id, user_id, e);
+                        }
+                    }
                 }
 
-                info!("[Node {}] Stored image {} from {}", self.id, image_id, from_username);
+                info!("[Node {}] Processed image {} from {} (saved to Firebase, sent to online recipients)",
+                      self.id, image_id, from_username);
 
                 Some(Message::SendImageResponse {
                     success: true,
@@ -742,21 +774,32 @@ impl CloudNode {
             }
 
             Message::QueryReceivedImages { username } => {
-                let stored = self.stored_images.read().await;
-                let images = stored
-                    .get(&username)
-                    .map(|imgs| {
-                        imgs.iter()
+                // Fetch from Firebase instead of node memory
+                let user_id = if username.contains('#') {
+                    username.rsplit('#').next().unwrap_or(&username).to_string()
+                } else {
+                    username.clone()
+                };
+
+                let firebase = FireBaseClient::new();
+                let images = match firebase.get_received_images(&user_id).await {
+                    Ok(firebase_images) => {
+                        firebase_images.into_iter()
                             .filter(|img| img.remaining_views > 0)
                             .map(|img| ReceivedImageInfo {
-                                image_id: img.image_id.clone(),
-                                from_username: img.from_username.clone(),
+                                image_id: img.image_id,
+                                from_username: img.from_user,
                                 remaining_views: img.remaining_views,
-                                timestamp: img.timestamp,
+                                timestamp: img.received_at,
                             })
                             .collect()
-                    })
-                    .unwrap_or_default();
+                    }
+                    Err(e) => {
+                        warn!("[Node {}] Failed to fetch images from Firebase for {}: {}",
+                              self.id, user_id, e);
+                        vec![]
+                    }
+                };
 
                 Some(Message::QueryReceivedImagesResponse { images })
             }
@@ -892,22 +935,51 @@ impl CloudNode {
             }
 
             Message::ViewImage { username, image_id } => {
-                let mut stored = self.stored_images.write().await;
+                // Fetch from Firebase instead of node memory
+                let user_id = if username.contains('#') {
+                    username.rsplit('#').next().unwrap_or(&username).to_string()
+                } else {
+                    username.clone()
+                };
 
-                if let Some(user_images) = stored.get_mut(&username) {
-                    if let Some(img) = user_images.iter_mut().find(|i| i.image_id == image_id) {
-                        if img.remaining_views > 0 {
-                            img.remaining_views -= 1;
-                            info!(
-                                "[Node {}] User {} viewed image {} (remaining: {})",
-                                self.id, username, image_id, img.remaining_views
-                            );
-                            Some(Message::ViewImageResponse {
-                                success: true,
-                                image_data: Some(img.encrypted_data.clone()),
-                                remaining_views: Some(img.remaining_views),
-                                error: None,
-                            })
+                let firebase = FireBaseClient::new();
+                
+                // Get the image from Firebase
+                match firebase.get_received_image(&user_id, &image_id).await {
+                    Ok(Some(mut image_meta)) => {
+                        if image_meta.remaining_views > 0 {
+                            // Decrement view count
+                            image_meta.remaining_views -= 1;
+                            
+                            // Update in Firebase
+                            if let Err(e) = firebase.update_received_image_views(&user_id, &image_id, image_meta.remaining_views).await {
+                                warn!("[Node {}] Failed to update view count in Firebase: {}", self.id, e);
+                            }
+                            
+                            // Decode base64 encrypted data
+                            match base64::engine::general_purpose::STANDARD.decode(&image_meta.encrypted_data_base64) {
+                                Ok(encrypted_data) => {
+                                    info!(
+                                        "[Node {}] User {} viewed image {} (remaining: {})",
+                                        self.id, username, image_id, image_meta.remaining_views
+                                    );
+                                    Some(Message::ViewImageResponse {
+                                        success: true,
+                                        image_data: Some(encrypted_data),
+                                        remaining_views: Some(image_meta.remaining_views),
+                                        error: None,
+                                    })
+                                }
+                                Err(e) => {
+                                    error!("[Node {}] Failed to decode image data: {}", self.id, e);
+                                    Some(Message::ViewImageResponse {
+                                        success: false,
+                                        image_data: None,
+                                        remaining_views: None,
+                                        error: Some("Failed to decode image data".to_string()),
+                                    })
+                                }
+                            }
                         } else {
                             Some(Message::ViewImageResponse {
                                 success: false,
@@ -916,7 +988,8 @@ impl CloudNode {
                                 error: Some("No views remaining".to_string()),
                             })
                         }
-                    } else {
+                    }
+                    Ok(None) => {
                         Some(Message::ViewImageResponse {
                             success: false,
                             image_data: None,
@@ -924,13 +997,15 @@ impl CloudNode {
                             error: Some("Image not found".to_string()),
                         })
                     }
-                } else {
-                    Some(Message::ViewImageResponse {
-                        success: false,
-                        image_data: None,
-                        remaining_views: None,
-                        error: Some("No images for this user".to_string()),
-                    })
+                    Err(e) => {
+                        error!("[Node {}] Failed to fetch image from Firebase: {}", self.id, e);
+                        Some(Message::ViewImageResponse {
+                            success: false,
+                            image_data: None,
+                            remaining_views: None,
+                            error: Some(format!("Database error: {}", e)),
+                        })
+                    }
                 }
             }
 
@@ -1006,9 +1081,19 @@ impl CloudNode {
 
             Message::ClientHeartbeat { user_id } => {
                 debug!("[Node {}] ClientHeartbeat from user_id: {}", self.id, user_id);
+                
+                // Track heartbeat for online status detection
+                {
+                    let mut heartbeats = self.client_heartbeats.write().await;
+                    heartbeats.insert(user_id.clone(), Instant::now());
+                }
+                
+                // Update Firebase last_seen and set status to Online
                 let firebase = FireBaseClient::new();
                 let now = chrono::Utc::now().timestamp();
                 let _ = firebase.update_last_seen(&user_id, now).await;
+                let _ = firebase.update_user_status(&user_id, &UserStatus::Online).await;
+                
                 // No response needed for heartbeat
                 None
             }
@@ -1798,6 +1883,54 @@ impl CloudNode {
         }
     }
 
+    /// Client online tracking task - checks heartbeats every 15 seconds
+    /// Marks clients as offline in Firebase if no heartbeat received for 30 seconds
+    async fn client_online_tracking_task(&self) {
+        // Wait for system to stabilize
+        sleep(Duration::from_secs(10)).await;
+
+        let mut interval = interval(Duration::from_secs(15));
+
+        loop {
+            interval.tick().await;
+
+            let firebase = FireBaseClient::new();
+            let now = Instant::now();
+
+            // Get all tracked clients
+            let heartbeats = self.client_heartbeats.read().await.clone();
+
+            for (user_id, last_heartbeat) in heartbeats.iter() {
+                let elapsed = now.duration_since(*last_heartbeat).as_secs();
+
+                if elapsed >= 30 {
+                    // Client is offline - no heartbeat for 30+ seconds
+                    debug!("[Node {}] Client {} is offline (no heartbeat for {}s)", 
+                          self.id, user_id, elapsed);
+                    
+                    // Update status in Firebase
+                    if let Err(e) = firebase.update_user_status(user_id, &UserStatus::Offline).await {
+                        warn!("[Node {}] Failed to mark user {} as offline in Firebase: {}", 
+                              self.id, user_id, e);
+                    }
+                }
+            }
+
+            // Clean up very old entries (over 5 minutes)
+            let mut heartbeats_mut = self.client_heartbeats.write().await;
+            heartbeats_mut.retain(|user_id, last_beat| {
+                let elapsed = now.duration_since(*last_beat).as_secs();
+                if elapsed > 300 {
+                    debug!("[Node {}] Removing stale heartbeat tracking for user {} ({}s old)", 
+                          self.id, user_id, elapsed);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+    }
+
     /// Periodic election task - re-elects coordinator every 60 seconds
     /// The coordinator handles ALL requests during its 60-second term
     async fn periodic_election_task(&self) {
@@ -2027,7 +2160,7 @@ impl Clone for CloudNode {
             peer_addresses: self.peer_addresses.clone(),
             processed_requests: Arc::clone(&self.processed_requests),
             active_sessions: Arc::clone(&self.active_sessions),
-            stored_images: Arc::clone(&self.stored_images),
+            client_heartbeats: Arc::clone(&self.client_heartbeats),
             chunk_reassembler: Arc::clone(&self.chunk_reassembler),
             in_flight_requests: Arc::clone(&self.in_flight_requests),
             chunk_cache: Arc::clone(&self.chunk_cache),
