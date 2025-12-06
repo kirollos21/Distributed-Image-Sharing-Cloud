@@ -618,77 +618,84 @@ impl ClientAppV2 {
             None => return,
         };
         
-        if image.remaining_views == 0 {
-            self.view_error = Some("No views remaining".to_string());
-            return;
-        }
-        
+        let exhausted = image.remaining_views == 0;
+
         let file_path = image.file_path.clone();
         let meta_path = std::path::PathBuf::from(&file_path).with_extension("meta.json");
         let user_id = self.session.user_id.clone();
         let image_id = image.image_id.clone();
-        
-        // Return type: (decrypted_image, remaining_views, firebase_update_success, pending_update)
-        let promise = Promise::spawn_thread("view_image", move || {
-            // Read encrypted image from disk
-            let encrypted_data = std::fs::read(&file_path)
-                .map_err(|e| format!("Failed to read image: {}", e))?;
-            
-            // Update view count and get the updated encrypted image
-            let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| format!("Failed to create runtime: {}", e))?;
-            
-            let (updated_encrypted, metadata, success) = rt.block_on(async {
-                crate::encryption::update_view_count(&encrypted_data).await
-            })?;
-            
-            if !success {
-                return Err("View quota exhausted".to_string());
-            }
-            
-            // Save the updated encrypted image back to disk
-            std::fs::write(&file_path, &updated_encrypted)
-                .map_err(|e| format!("Failed to update image file: {}", e))?;
-            
-            // Update metadata file with new view count
-            let remaining = metadata.quota - metadata.viewed;
-            if let Ok(meta_content) = std::fs::read_to_string(&meta_path) {
-                if let Ok(mut meta) = serde_json::from_str::<ImageCacheMeta>(&meta_content) {
-                    meta.remaining_views = remaining;
-                    let _ = std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap_or_default());
+
+        // Return type: (image_bytes_to_display, remaining_views, pending_update)
+        let promise = if !exhausted {
+            Promise::spawn_thread("view_image", move || {
+                // Read encrypted image from disk
+                let encrypted_data = std::fs::read(&file_path)
+                    .map_err(|e| format!("Failed to read image: {}", e))?;
+
+                // Update view count and get the updated encrypted image
+                let rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| format!("Failed to create runtime: {}", e))?;
+
+                let (updated_encrypted, metadata, success) = rt.block_on(async {
+                    crate::encryption::update_view_count(&encrypted_data).await
+                })?;
+
+                if !success {
+                    return Err("View quota exhausted".to_string());
                 }
-            }
-            
-            // Try to update Firebase (may fail if offline)
-            let firebase_success = rt.block_on(async {
-                let firebase = FireBaseClient::new();
-                let result = if remaining > 0 {
-                    firebase.update_received_image_views(&user_id, &image_id, remaining).await
+
+                // Save the updated encrypted image back to disk
+                std::fs::write(&file_path, &updated_encrypted)
+                    .map_err(|e| format!("Failed to update image file: {}", e))?;
+
+                // Update metadata file with new view count
+                let remaining = metadata.quota - metadata.viewed;
+                if let Ok(meta_content) = std::fs::read_to_string(&meta_path) {
+                    if let Ok(mut meta) = serde_json::from_str::<ImageCacheMeta>(&meta_content) {
+                        meta.remaining_views = remaining;
+                        let _ = std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap_or_default());
+                    }
+                }
+
+                // Try to update Firebase (may fail if offline)
+                let firebase_success = rt.block_on(async {
+                    let firebase = FireBaseClient::new();
+                    let result = if remaining > 0 {
+                        firebase.update_received_image_views(&user_id, &image_id, remaining).await
+                    } else {
+                        firebase.delete_received_image(&user_id, &image_id).await
+                    };
+                    result.is_ok()
+                });
+
+                // Create pending update if Firebase failed
+                let pending_update = if !firebase_success {
+                    Some(PendingFirebaseUpdate {
+                        user_id: user_id.clone(),
+                        image_id: image_id.clone(),
+                        remaining_views: remaining,
+                        should_delete: remaining == 0,
+                    })
                 } else {
-                    firebase.delete_received_image(&user_id, &image_id).await
+                    None
                 };
-                result.is_ok()
-            });
-            
-            // Create pending update if Firebase failed
-            let pending_update = if !firebase_success {
-                Some(PendingFirebaseUpdate {
-                    user_id: user_id.clone(),
-                    image_id: image_id.clone(),
-                    remaining_views: remaining,
-                    should_delete: remaining == 0,
-                })
-            } else {
-                None
-            };
-            
-            // Decrypt to get the viewable image
-            let (decrypted_image, _) = rt.block_on(async {
-                crate::encryption::decrypt_image(updated_encrypted).await
-            })?;
-            
-            Ok((decrypted_image, remaining, pending_update))
-        });
+
+                // Decrypt to get the viewable image
+                let (decrypted_image, _) = rt.block_on(async {
+                    crate::encryption::decrypt_image(updated_encrypted).await
+                })?;
+
+                Ok((decrypted_image, remaining, pending_update))
+            })
+        } else {
+            // Quota exhausted: show the encrypted image file as-is (no decrypt or view-count update)
+            Promise::spawn_thread("view_encrypted", move || {
+                let encrypted_data = std::fs::read(&file_path)
+                    .map_err(|e| format!("Failed to read image: {}", e))?;
+                // remaining_views is zero
+                Ok((encrypted_data, 0u8, None))
+            })
+        };
         
         self.viewing_in_progress = Some(promise);
         self.selected_received_image = Some(index);
@@ -711,7 +718,7 @@ impl ClientAppV2 {
                         self.save_pending_updates();
                     }
                     
-                    // Load the decrypted image as a texture
+                    // Load the image bytes (decrypted or encrypted) as a texture
                     if let Ok(img) = image::load_from_memory(&image_data) {
                         let rgba = img.to_rgba8();
                         let size = [rgba.width() as usize, rgba.height() as usize];
@@ -720,7 +727,12 @@ impl ClientAppV2 {
                         let texture = ctx.load_texture("viewed_image", color_image, egui::TextureOptions::default());
                         self.viewing_image_texture = Some(texture);
                         self.viewing_image = Some(image_data);
-                        self.view_error = None;
+                        // If remaining views is zero, show a notice that this is the encrypted image
+                        if remaining_views == 0 {
+                            self.view_error = Some("Quota exhausted — showing encrypted image (original hidden)".to_string());
+                        } else {
+                            self.view_error = None;
+                        }
                         
                         // Update remaining views in our list
                         if let Some(idx) = self.selected_received_image {
