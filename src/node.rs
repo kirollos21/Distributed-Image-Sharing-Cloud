@@ -735,12 +735,38 @@ impl CloudNode {
             }
 
             Message::CheckUsernameAvailable { username } => {
-                // Check Firebase for user existence
+                // username is in format "name#id" (e.g., "potato#2")
+                // We need to check if the user ID exists AND the username matches
                 let firebase = FireBaseClient::new();
-                let is_available = match firebase.check_username_available(&username).await {
-                    Ok(available) => available,
+                
+                // Parse the username#id format
+                let (expected_username, user_id) = if username.contains('#') {
+                    let parts: Vec<&str> = username.rsplitn(2, '#').collect();
+                    if parts.len() == 2 {
+                        (parts[1].to_string(), parts[0].to_string())  // rsplitn reverses order
+                    } else {
+                        (username.clone(), username.clone())
+                    }
+                } else {
+                    (username.clone(), username.clone())
+                };
+                
+                // Check if user exists by ID in Firebase and username matches
+                let is_available = match firebase.get_user(&user_id).await {
+                    Ok(Some(user_info)) => {
+                        // User exists, check if username matches
+                        if user_info.username == expected_username {
+                            false  // User exists with matching username, NOT available (taken)
+                        } else {
+                            // ID exists but username doesn't match
+                            info!("[Node {}] User ID {} exists but username '{}' doesn't match '{}'", 
+                                  self.id, user_id, expected_username, user_info.username);
+                            true  // Treat as "not found" since the combo is invalid
+                        }
+                    }
+                    Ok(None) => true,      // User doesn't exist, username IS available
                     Err(e) => {
-                        warn!("[Node {}] Firebase error checking username: {}", self.id, e);
+                        warn!("[Node {}] Firebase error checking user: {}", self.id, e);
                         // Fallback to local file if Firebase fails
                         !Self::user_exists_in_file(&username).await
                     }
