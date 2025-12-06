@@ -655,6 +655,56 @@ impl Client {
         Err(format!("Image not found on any node. Last error: {}", last_error))
     }
 
+    /// Download an image in encrypted form (for local caching)
+    /// Returns the encrypted data without decrypting it
+    pub async fn download_image_encrypted(
+        &self,
+        username: String,
+        image_id: String,
+    ) -> Result<Vec<u8>, String> {
+        let message = Message::ViewImage {
+            username: username.clone(),
+            image_id: image_id.clone(),
+        };
+
+        info!("[Client {}] Downloading encrypted image {} for: {}", self.id, image_id, username);
+
+        // Try nodes until one succeeds
+        let mut last_error = String::new();
+
+        for address in &self.cloud_addresses {
+            match Self::send_to_node(self.id, address, message.clone()).await {
+                Ok(Message::ViewImageResponse {
+                    success,
+                    image_data,
+                    remaining_views: _,
+                    error,
+                }) => {
+                    if success {
+                        let encrypted_data = image_data.ok_or_else(|| "No image data returned".to_string())?;
+                        info!("[Client {}] Downloaded encrypted image {} ({} bytes)",
+                              self.id, image_id, encrypted_data.len());
+                        return Ok(encrypted_data);
+                    } else {
+                        last_error = error.unwrap_or_else(|| "Image not found on this node".to_string());
+                        warn!("[Client {}] Image {} not on {}: {}", self.id, image_id, address, last_error);
+                        continue;
+                    }
+                }
+                Ok(_) => {
+                    last_error = "Unexpected response from server".to_string();
+                    continue;
+                }
+                Err(e) => {
+                    last_error = format!("Connection failed: {}", e);
+                    continue;
+                }
+            }
+        }
+
+        Err(format!("Image not found on any node. Last error: {}", last_error))
+    }
+
     /// Generate a random test image
     fn generate_test_image(size_kb: usize) -> Vec<u8> {
         let mut rng = rand::thread_rng();

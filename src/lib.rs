@@ -6,5 +6,6 @@ pub mod messages;
 pub mod metrics;
 pub mod node;
 pub mod gui_client;
+pub mod gui_client_v2;
 pub mod gui_server;
 pub mod firebase;

@@ -40,5 +40,9 @@ name = "client-gui"
 path = "src/bin/client_gui.rs"
 
 [[bin]]
+name = "client-gui-v2"
+path = "src/bin/client_gui_v2.rs"
+
+[[bin]]
 name = "server-gui"
 path = "src/bin/server_gui.rs"
