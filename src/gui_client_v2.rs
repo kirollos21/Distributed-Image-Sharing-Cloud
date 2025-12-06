@@ -2,7 +2,7 @@
 // Features: Login, Register, Send Images, Inbox, My Gallery, Browse Users, Settings
 
 use crate::client::Client;
-use crate::firebase::{FireBaseClient, UserInfo, UserStatus};
+use crate::firebase::{FireBaseClient, UserInfo, UserStatus, ReceivedImageMeta};
 use crate::messages::Message;
 use eframe::egui;
 use egui::{Color32, RichText, Vec2, Rounding};
@@ -70,6 +70,9 @@ pub struct ClientAppV2 {
     received_images_loading: bool,
     selected_received_image: Option<usize>,
     viewing_image: Option<Vec<u8>>,  // Decrypted image being viewed
+    viewing_image_texture: Option<egui::TextureHandle>,  // Texture for display
+    viewing_in_progress: Option<Promise<Result<(Vec<u8>, u8), String>>>,  // (decrypted_data, remaining_views)
+    view_error: Option<String>,
     
     // My Gallery state (public pixelated images - max 5)
     my_gallery: Vec<String>,           // Base64 data URLs of pixelated images
@@ -84,6 +87,7 @@ pub struct ClientAppV2 {
     search_query: String,
     search_results: Vec<UserSearchResult>,
     search_in_progress: Option<Promise<Result<Vec<UserSearchResult>, String>>>,
+    search_gallery_textures: std::collections::HashMap<String, Vec<egui::TextureHandle>>,  // user_id -> textures
     
     // Settings state
     new_username_input: String,
@@ -105,6 +109,7 @@ pub struct ReceivedImage {
     pub max_views: u8,
     pub received_at: i64,
     pub file_path: String,
+    pub image_id: String,
 }
 
 #[derive(Clone)]
@@ -113,6 +118,7 @@ pub struct UserSearchResult {
     pub user_id: String,
     pub status: String,
     pub last_seen: i64,
+    pub gallery: Vec<String>,  // Base64 data URLs of pixelated gallery images
 }
 
 // ============================================================================
@@ -206,6 +212,9 @@ impl ClientAppV2 {
             received_images_loading: false,
             selected_received_image: None,
             viewing_image: None,
+            viewing_image_texture: None,
+            viewing_in_progress: None,
+            view_error: None,
             my_gallery: Vec::new(),
             my_gallery_loaded: false,
             my_gallery_loading: None,
@@ -216,6 +225,7 @@ impl ClientAppV2 {
             search_query: String::new(),
             search_results: Vec::new(),
             search_in_progress: None,
+            search_gallery_textures: std::collections::HashMap::new(),
             new_username_input: String::new(),
             username_change_in_progress: None,
             settings_message: None,
@@ -278,9 +288,11 @@ impl ClientAppV2 {
 
         let promise = Promise::spawn_thread("poll_images", move || {
             let cache_dir = Self::get_user_cache_dir(&user_id);
+            let user_id_clone = user_id.clone();
             
             runtime.block_on(async move {
                 let client = Client::new(0, cloud_addresses.clone());
+                let firebase = FireBaseClient::new();
                 
                 // Query for received images from node
                 match client.query_received_images(username.clone()).await {
@@ -305,12 +317,23 @@ impl ClientAppV2 {
                                             image_id: img_info.image_id.clone(),
                                         };
                                         
-                                        // Save encrypted image
+                                        // Save encrypted image locally
                                         if std::fs::write(&file_path, &encrypted_data).is_ok() {
-                                            // Save metadata
+                                            // Save metadata locally
                                             let meta_path = file_path.with_extension("meta.json");
                                             let _ = std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap_or_default());
                                             saved_count += 1;
+                                            
+                                            // Also upload to Firebase for cross-device sync
+                                            let firebase_meta = ReceivedImageMeta {
+                                                image_id: img_info.image_id.clone(),
+                                                from_user: img_info.from_username.clone(),
+                                                remaining_views: img_info.remaining_views,
+                                                max_views: img_info.remaining_views,
+                                                received_at: img_info.timestamp,
+                                                encrypted_data_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &encrypted_data),
+                                            };
+                                            let _ = firebase.add_received_image(&user_id_clone, &firebase_meta).await;
                                         }
                                     }
                                     Err(_) => {}
@@ -349,6 +372,7 @@ impl ClientAppV2 {
                                 max_views: meta.max_views,
                                 received_at: meta.received_at,
                                 file_path: path.to_string_lossy().to_string(),
+                                image_id: meta.image_id,
                             });
                         }
                     }
@@ -358,6 +382,50 @@ impl ClientAppV2 {
         
         // Sort by received time (newest first)
         self.received_images.sort_by(|a, b| b.received_at.cmp(&a.received_at));
+    }
+
+    /// Sync received images from Firebase (for cross-device access)
+    /// Downloads any images stored in Firebase that aren't in the local cache
+    fn sync_from_firebase(&mut self) {
+        let user_id = self.session.user_id.clone();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        
+        // Run sync in background thread (fire-and-forget)
+        std::thread::spawn(move || {
+            let cache_dir = Self::get_user_cache_dir(&user_id);
+            
+            runtime.block_on(async move {
+                let firebase = FireBaseClient::new();
+                
+                // Get all images from Firebase
+                if let Ok(firebase_images) = firebase.get_received_images(&user_id).await {
+                    for img in firebase_images {
+                        // Check if we already have this image locally
+                        let filename = format!("{}_{}.enc", img.from_user.replace('#', "_"), img.image_id);
+                        let file_path = cache_dir.join(&filename);
+                        
+                        if !file_path.exists() {
+                            // Decode and save to local cache
+                            if let Ok(encrypted_data) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &img.encrypted_data_base64) {
+                                // Save encrypted image
+                                if std::fs::write(&file_path, &encrypted_data).is_ok() {
+                                    // Save metadata
+                                    let meta = ImageCacheMeta {
+                                        from_user: img.from_user.clone(),
+                                        remaining_views: img.remaining_views,
+                                        max_views: img.max_views,
+                                        received_at: img.received_at,
+                                        image_id: img.image_id.clone(),
+                                    };
+                                    let meta_path = file_path.with_extension("meta.json");
+                                    let _ = std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap_or_default());
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        });
     }
 
     fn process_poll_result(&mut self) {
@@ -376,6 +444,128 @@ impl ClientAppV2 {
             }
             self.poll_in_progress = None;
         }
+    }
+
+    /// View a cached image - decrypt it and update view count
+    fn view_cached_image(&mut self, index: usize) {
+        if self.viewing_in_progress.is_some() {
+            return; // Already viewing
+        }
+        
+        let image = match self.received_images.get(index) {
+            Some(img) => img.clone(),
+            None => return,
+        };
+        
+        if image.remaining_views == 0 {
+            self.view_error = Some("No views remaining".to_string());
+            return;
+        }
+        
+        let file_path = image.file_path.clone();
+        let meta_path = std::path::PathBuf::from(&file_path).with_extension("meta.json");
+        let user_id = self.session.user_id.clone();
+        let image_id = image.image_id.clone();
+        
+        let promise = Promise::spawn_thread("view_image", move || {
+            // Read encrypted image from disk
+            let encrypted_data = std::fs::read(&file_path)
+                .map_err(|e| format!("Failed to read image: {}", e))?;
+            
+            // Update view count and get the updated encrypted image
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| format!("Failed to create runtime: {}", e))?;
+            
+            let (updated_encrypted, metadata, success) = rt.block_on(async {
+                crate::encryption::update_view_count(&encrypted_data).await
+            })?;
+            
+            if !success {
+                return Err("View quota exhausted".to_string());
+            }
+            
+            // Save the updated encrypted image back to disk
+            std::fs::write(&file_path, &updated_encrypted)
+                .map_err(|e| format!("Failed to update image file: {}", e))?;
+            
+            // Update metadata file with new view count
+            let remaining = metadata.quota - metadata.viewed;
+            if let Ok(meta_content) = std::fs::read_to_string(&meta_path) {
+                if let Ok(mut meta) = serde_json::from_str::<ImageCacheMeta>(&meta_content) {
+                    meta.remaining_views = remaining;
+                    let _ = std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap_or_default());
+                }
+            }
+            
+            // Update Firebase with new view count (for cross-device sync)
+            rt.block_on(async {
+                let firebase = FireBaseClient::new();
+                if remaining > 0 {
+                    let _ = firebase.update_received_image_views(&user_id, &image_id, remaining).await;
+                } else {
+                    // No views left, delete from Firebase
+                    let _ = firebase.delete_received_image(&user_id, &image_id).await;
+                }
+            });
+            
+            // Decrypt to get the viewable image
+            let (decrypted_image, _) = rt.block_on(async {
+                crate::encryption::decrypt_image(updated_encrypted).await
+            })?;
+            
+            Ok((decrypted_image, remaining))
+        });
+        
+        self.viewing_in_progress = Some(promise);
+        self.selected_received_image = Some(index);
+    }
+
+    /// Process viewing result
+    fn process_view_result(&mut self, ctx: &egui::Context) {
+        let result = if let Some(promise) = &self.viewing_in_progress {
+            promise.ready().cloned()
+        } else {
+            None
+        };
+
+        if let Some(res) = result {
+            match res {
+                Ok((image_data, remaining_views)) => {
+                    // Load the decrypted image as a texture
+                    if let Ok(img) = image::load_from_memory(&image_data) {
+                        let rgba = img.to_rgba8();
+                        let size = [rgba.width() as usize, rgba.height() as usize];
+                        let pixels = rgba.into_raw();
+                        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                        let texture = ctx.load_texture("viewed_image", color_image, egui::TextureOptions::default());
+                        self.viewing_image_texture = Some(texture);
+                        self.viewing_image = Some(image_data);
+                        self.view_error = None;
+                        
+                        // Update remaining views in our list
+                        if let Some(idx) = self.selected_received_image {
+                            if let Some(img) = self.received_images.get_mut(idx) {
+                                img.remaining_views = remaining_views;
+                            }
+                        }
+                    } else {
+                        self.view_error = Some("Failed to decode image".to_string());
+                    }
+                }
+                Err(e) => {
+                    self.view_error = Some(e);
+                }
+            }
+            self.viewing_in_progress = None;
+        }
+    }
+
+    /// Close the image viewer
+    fn close_image_viewer(&mut self) {
+        self.viewing_image = None;
+        self.viewing_image_texture = None;
+        self.selected_received_image = None;
+        self.view_error = None;
     }
 }
 
@@ -414,6 +604,9 @@ impl eframe::App for ClientAppV2 {
             
             // Process poll results
             self.process_poll_result();
+            
+            // Process view image results
+            self.process_view_result(ctx);
         }
 
         // Main panel with dark background
@@ -427,6 +620,11 @@ impl eframe::App for ClientAppV2 {
                 }
             });
 
+        // Image viewer popup window
+        if self.viewing_image.is_some() || self.viewing_in_progress.is_some() {
+            self.render_image_viewer(ctx);
+        }
+
         // Request repaint for async operations
         if self.auth_in_progress.is_some() 
             || self.send_in_progress.is_some() 
@@ -435,6 +633,7 @@ impl eframe::App for ClientAppV2 {
             || self.recipient_check.is_some()
             || self.username_change_in_progress.is_some()
             || self.poll_in_progress.is_some()
+            || self.viewing_in_progress.is_some()
         {
             ctx.request_repaint();
         }
@@ -694,6 +893,9 @@ impl ClientAppV2 {
                             self.current_page = Page::SendImage;
                             self.username_input.clear();
                             self.password_input.clear();
+                            
+                            // Sync images from Firebase for cross-device access
+                            self.sync_from_firebase();
                             
                             // Load any cached images for this user
                             self.load_cached_images();
@@ -1211,73 +1413,77 @@ impl ClientAppV2 {
                             });
                         });
                 } else {
-                    // Show inbox grid using ScrollArea for many images
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing = Vec2::new(15.0, 15.0);
-                            
-                            for (i, image) in self.received_images.iter().enumerate() {
+                    // Show inbox as a simple grid
+                    let available_width = ui.available_width();
+                    let card_width = 170.0;
+                    let columns = ((available_width / card_width) as usize).max(1);
+                    
+                    // Clone data to avoid borrow issues
+                    let images_data: Vec<(usize, String, u8, u8)> = self.received_images
+                        .iter()
+                        .enumerate()
+                        .map(|(i, img)| (i, img.from_user.clone(), img.remaining_views, img.max_views))
+                        .collect();
+                    
+                    let viewing_in_progress = self.viewing_in_progress.is_some();
+                    let mut clicked_view: Option<usize> = None;
+                    
+                    egui::Grid::new("inbox_grid")
+                        .num_columns(columns)
+                        .spacing([12.0, 12.0])
+                        .show(ui, |ui| {
+                            for (i, from_user, remaining_views, max_views) in &images_data {
                                 egui::Frame::default()
                                     .fill(AppColors::BG_CARD)
-                                    .rounding(Rounding::same(10.0))
-                                    .inner_margin(egui::Margin::same(12.0))
+                                    .rounding(Rounding::same(8.0))
+                                    .inner_margin(egui::Margin::same(10.0))
                                     .show(ui, |ui| {
-                                        ui.set_min_width(160.0);
-                                        ui.set_max_width(160.0);
+                                        ui.set_width(150.0);
                                         
-                                        ui.vertical(|ui| {
-                                            // Image placeholder
-                                            ui.vertical_centered(|ui| {
-                                                ui.add_sized([120.0, 90.0], egui::Label::new(
-                                                    RichText::new("📨").size(36.0)
-                                                ));
-                                            });
-                                            
-                                            ui.add_space(8.0);
-                                            ui.separator();
-                                            ui.add_space(6.0);
-                                            
-                                            // Sender info
-                                            ui.label(RichText::new("From:")
-                                                .size(10.0)
-                                                .color(AppColors::TEXT_SECONDARY));
-                                            ui.label(RichText::new(&image.from_user)
-                                                .size(12.0)
-                                                .color(AppColors::TEXT_PRIMARY));
-                                            
-                                            ui.add_space(4.0);
-                                            
-                                            // Views counter
-                                            let views_color = if image.remaining_views > 0 { 
-                                                AppColors::SUCCESS 
-                                            } else { 
-                                                AppColors::ERROR 
-                                            };
-                                            ui.label(RichText::new(format!("Views: {}/{}", image.remaining_views, image.max_views))
-                                                .size(11.0)
-                                                .color(views_color));
-                                            
-                                            ui.add_space(8.0);
-                                            
-                                            // View button - full width
-                                            ui.vertical_centered(|ui| {
-                                                let btn = egui::Button::new(
-                                                    RichText::new("👁 View Image").size(12.0)
-                                                )
-                                                .min_size(Vec2::new(130.0, 28.0))
-                                                .fill(if image.remaining_views > 0 { AppColors::PRIMARY } else { AppColors::BG_INPUT })
-                                                .rounding(Rounding::same(6.0));
-                                                
-                                                if ui.add_enabled(image.remaining_views > 0, btn).clicked() {
-                                                    self.selected_received_image = Some(i);
-                                                    // TODO: Implement view_cached_image() to decrypt and show
-                                                }
-                                            });
+                                        // Image placeholder
+                                        ui.vertical_centered(|ui| {
+                                            ui.label(RichText::new("📨").size(32.0));
                                         });
+                                        
+                                        ui.add_space(6.0);
+                                        
+                                        // Sender info
+                                        ui.label(RichText::new(format!("From: {}", from_user))
+                                            .size(11.0)
+                                            .color(AppColors::TEXT_SECONDARY));
+                                        
+                                        // Views counter
+                                        let views_color = if *remaining_views > 0 { 
+                                            AppColors::SUCCESS 
+                                        } else { 
+                                            AppColors::ERROR 
+                                        };
+                                        ui.label(RichText::new(format!("Views: {}/{}", remaining_views, max_views))
+                                            .size(11.0)
+                                            .color(views_color));
+                                        
+                                        ui.add_space(6.0);
+                                        
+                                        // View button
+                                        if ui.add_enabled(
+                                            *remaining_views > 0 && !viewing_in_progress,
+                                            egui::Button::new("👁 View")
+                                                .min_size(Vec2::new(140.0, 24.0))
+                                        ).clicked() {
+                                            clicked_view = Some(*i);
+                                        }
                                     });
+                                
+                                if (i + 1) % columns == 0 {
+                                    ui.end_row();
+                                }
                             }
                         });
-                    });
+                    
+                    // Handle view click after loop
+                    if let Some(idx) = clicked_view {
+                        self.view_cached_image(idx);
+                    }
                 }
             });
         });
@@ -1587,41 +1793,89 @@ impl ClientAppV2 {
                 
                 // Show results
                 if !self.search_results.is_empty() {
-                    for user in &self.search_results {
+                    // Clone results to avoid borrow issues
+                    let results_clone: Vec<UserSearchResult> = self.search_results.clone();
+                    let mut add_recipient: Option<String> = None;
+                    
+                    for user in &results_clone {
                         egui::Frame::default()
                             .fill(AppColors::BG_CARD)
                             .rounding(Rounding::same(8.0))
                             .inner_margin(egui::Margin::same(15.0))
                             .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    // Status indicator
-                                    let status_color = match user.status.as_str() {
-                                        "Online" => AppColors::SUCCESS,
-                                        "Idle" => AppColors::WARNING,
-                                        _ => AppColors::TEXT_SECONDARY,
-                                    };
-                                    ui.label(RichText::new("●").color(status_color));
-                                    
-                                    ui.label(RichText::new(format!("{}#{}", user.username, user.user_id))
-                                        .size(15.0)
-                                        .color(AppColors::TEXT_PRIMARY)
-                                        .strong());
-                                    
-                                    ui.label(RichText::new(format!("({})", user.status))
-                                        .size(12.0)
-                                        .color(AppColors::TEXT_SECONDARY));
-                                    
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        let user_tag = format!("{}#{}", user.username, user.user_id);
-                                        if ui.small_button("➕ Add to Send").clicked() {
-                                            if !self.recipients.contains(&user_tag) {
-                                                self.recipients.push(user_tag);
+                                ui.vertical(|ui| {
+                                    ui.horizontal(|ui| {
+                                        // Status indicator
+                                        let status_color = match user.status.as_str() {
+                                            "Online" => AppColors::SUCCESS,
+                                            "Idle" => AppColors::WARNING,
+                                            _ => AppColors::TEXT_SECONDARY,
+                                        };
+                                        ui.label(RichText::new("●").color(status_color));
+                                        
+                                        ui.label(RichText::new(format!("{}#{}", user.username, user.user_id))
+                                            .size(15.0)
+                                            .color(AppColors::TEXT_PRIMARY)
+                                            .strong());
+                                        
+                                        ui.label(RichText::new(format!("({})", user.status))
+                                            .size(12.0)
+                                            .color(AppColors::TEXT_SECONDARY));
+                                        
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            let user_tag = format!("{}#{}", user.username, user.user_id);
+                                            if ui.small_button("➕ Add to Send").clicked() {
+                                                add_recipient = Some(user_tag);
                                             }
-                                        }
+                                        });
                                     });
+                                    
+                                    // Show gallery preview if user has gallery images
+                                    if !user.gallery.is_empty() {
+                                        ui.add_space(10.0);
+                                        ui.label(RichText::new(format!("📷 Gallery ({} images)", user.gallery.len()))
+                                            .size(12.0)
+                                            .color(AppColors::TEXT_SECONDARY));
+                                        ui.add_space(5.0);
+                                        
+                                        ui.horizontal(|ui| {
+                                            // Load/create textures for this user's gallery if not already cached
+                                            let user_id = user.user_id.clone();
+                                            let gallery = user.gallery.clone();
+                                            
+                                            if !self.search_gallery_textures.contains_key(&user_id) {
+                                                // Load textures from base64 data
+                                                let mut textures = Vec::new();
+                                                for (idx, data_url) in gallery.iter().enumerate() {
+                                                    if let Some(texture) = load_texture_from_data_url_with_name(ui.ctx(), data_url, &format!("search_gallery_{}_{}", user_id, idx)) {
+                                                        textures.push(texture);
+                                                    }
+                                                }
+                                                self.search_gallery_textures.insert(user_id.clone(), textures);
+                                            }
+                                            
+                                            // Display cached textures
+                                            if let Some(textures) = self.search_gallery_textures.get(&user_id) {
+                                                for texture in textures.iter().take(5) {
+                                                    let size = Vec2::new(60.0, 60.0);
+                                                    let image = egui::Image::new(texture)
+                                                        .fit_to_exact_size(size)
+                                                        .rounding(Rounding::same(4.0));
+                                                    ui.add(image);
+                                                }
+                                            }
+                                        });
+                                    }
                                 });
                             });
                         ui.add_space(8.0);
+                    }
+                    
+                    // Apply deferred action
+                    if let Some(user_tag) = add_recipient {
+                        if !self.recipients.contains(&user_tag) {
+                            self.recipients.push(user_tag);
+                        }
                     }
                 }
             });
@@ -1640,11 +1894,14 @@ impl ClientAppV2 {
                 let mut results = Vec::new();
                 
                 if let Ok(Some((id, info))) = firebase.find_user_by_username(&query).await {
+                    // Get gallery for this user
+                    let gallery = firebase.get_user_gallery(&id).await.unwrap_or_default();
                     results.push(UserSearchResult {
                         username: info.username,
                         user_id: id,
                         status: format!("{:?}", info.status),
                         last_seen: info.last_seen,
+                        gallery,
                     });
                 }
                 
@@ -1652,11 +1909,14 @@ impl ClientAppV2 {
                 if let Ok(Some(info)) = firebase.get_user(&query).await {
                     let already_added = results.iter().any(|r| r.user_id == query);
                     if !already_added {
+                        // Get gallery for this user
+                        let gallery = firebase.get_user_gallery(&query).await.unwrap_or_default();
                         results.push(UserSearchResult {
                             username: info.username,
                             user_id: query.clone(),
                             status: format!("{:?}", info.status),
                             last_seen: info.last_seen,
+                            gallery,
                         });
                     }
                 }
@@ -1831,6 +2091,98 @@ impl ClientAppV2 {
             }
         }
     }
+
+    // ========================================================================
+    // Image Viewer Popup
+    // ========================================================================
+    
+    fn render_image_viewer(&mut self, ctx: &egui::Context) {
+        let screen_rect = ctx.screen_rect();
+        
+        // Gather data to avoid borrow issues
+        let is_loading = self.viewing_in_progress.is_some();
+        let error_msg = self.view_error.clone();
+        let texture = self.viewing_image_texture.clone();
+        let image_info = self.selected_received_image
+            .and_then(|idx| self.received_images.get(idx))
+            .map(|img| (img.from_user.clone(), img.remaining_views));
+        
+        let mut should_close = false;
+        
+        egui::Window::new("Image Viewer")
+            .collapsible(false)
+            .resizable(true)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_size([screen_rect.width() * 0.7, screen_rect.height() * 0.8])
+            .show(ctx, |ui| {
+                // Loading state
+                if is_loading {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(50.0);
+                        ui.spinner();
+                        ui.add_space(10.0);
+                        ui.label("Decrypting image...");
+                    });
+                    return;
+                }
+                
+                // Error state
+                if let Some(error) = &error_msg {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(20.0);
+                        ui.label(RichText::new("❌ Error").size(24.0).color(AppColors::ERROR));
+                        ui.add_space(10.0);
+                        ui.label(RichText::new(error).color(AppColors::ERROR));
+                        ui.add_space(20.0);
+                        if ui.button("Close").clicked() {
+                            should_close = true;
+                        }
+                    });
+                    return;
+                }
+                
+                // Show the image
+                if let Some(tex) = &texture {
+                    ui.vertical_centered(|ui| {
+                        // Header with info
+                        if let Some((from_user, remaining_views)) = &image_info {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(format!("From: {}", from_user))
+                                    .size(14.0)
+                                    .color(AppColors::TEXT_SECONDARY));
+                                ui.separator();
+                                let views_color = if *remaining_views > 0 { AppColors::SUCCESS } else { AppColors::WARNING };
+                                ui.label(RichText::new(format!("Views remaining: {}", remaining_views))
+                                    .size(14.0)
+                                    .color(views_color));
+                            });
+                            ui.add_space(10.0);
+                        }
+                        
+                        // Display the image, scaled to fit
+                        let available = ui.available_size();
+                        let tex_size = tex.size_vec2();
+                        let scale = (available.x / tex_size.x).min(available.y / tex_size.y).min(1.0);
+                        let display_size = tex_size * scale * 0.9;
+                        
+                        ui.add(egui::Image::new(tex).max_size(display_size));
+                        
+                        ui.add_space(15.0);
+                        
+                        // Close button
+                        if ui.add(egui::Button::new(RichText::new("✖ Close").size(14.0))
+                            .min_size(Vec2::new(100.0, 30.0))
+                            .fill(AppColors::ERROR)).clicked() {
+                            should_close = true;
+                        }
+                    });
+                }
+            });
+        
+        if should_close {
+            self.close_image_viewer();
+        }
+    }
 }
 
 // ============================================================================
@@ -1839,6 +2191,11 @@ impl ClientAppV2 {
 
 /// Load a texture from a base64 data URL
 fn load_texture_from_data_url(ctx: &egui::Context, data_url: &str, idx: usize) -> Option<egui::TextureHandle> {
+    load_texture_from_data_url_with_name(ctx, data_url, &format!("gallery_{}", idx))
+}
+
+/// Load a texture from a base64 data URL with a custom name
+fn load_texture_from_data_url_with_name(ctx: &egui::Context, data_url: &str, name: &str) -> Option<egui::TextureHandle> {
     // Parse data URL: data:image/png;base64,<data>
     if let Some(base64_data) = data_url.strip_prefix("data:image/png;base64,") {
         if let Ok(bytes) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64_data) {
@@ -1847,7 +2204,7 @@ fn load_texture_from_data_url(ctx: &egui::Context, data_url: &str, idx: usize) -
                 let size = [rgba.width() as usize, rgba.height() as usize];
                 let pixels = rgba.into_raw();
                 let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-                return Some(ctx.load_texture(format!("gallery_{}", idx), color_image, egui::TextureOptions::default()));
+                return Some(ctx.load_texture(name.to_string(), color_image, egui::TextureOptions::default()));
             }
         }
     }

@@ -338,4 +338,50 @@ impl FireBaseClient {
             None => Ok(true),      // Username is available
         }
     }
+
+    // ==================== RECEIVED IMAGES OPERATIONS ====================
+
+    /// Store received image metadata in Firebase for a user
+    pub async fn add_received_image(&self, user_id: &str, image_meta: &ReceivedImageMeta) -> Result<(), reqwest::Error> {
+        let url = format!("{}/received_images/{}/{}.json", self.base_url, user_id, image_meta.image_id);
+        self.client.put(&url).json(image_meta).send().await?;
+        Ok(())
+    }
+
+    /// Get all received images for a user from Firebase
+    pub async fn get_received_images(&self, user_id: &str) -> Result<Vec<ReceivedImageMeta>, reqwest::Error> {
+        let url = format!("{}/received_images/{}.json", self.base_url, user_id);
+        let resp = self.client.get(&url).send().await?;
+        let images_map = resp.json::<Option<HashMap<String, ReceivedImageMeta>>>().await?;
+        
+        match images_map {
+            Some(map) => Ok(map.into_values().collect()),
+            None => Ok(vec![]),
+        }
+    }
+
+    /// Update view count for a received image
+    pub async fn update_received_image_views(&self, user_id: &str, image_id: &str, remaining_views: u8) -> Result<(), reqwest::Error> {
+        let url = format!("{}/received_images/{}/{}/remaining_views.json", self.base_url, user_id, image_id);
+        self.client.put(&url).json(&remaining_views).send().await?;
+        Ok(())
+    }
+
+    /// Delete a received image record (when views exhausted)
+    pub async fn delete_received_image(&self, user_id: &str, image_id: &str) -> Result<(), reqwest::Error> {
+        let url = format!("{}/received_images/{}/{}.json", self.base_url, user_id, image_id);
+        self.client.delete(&url).send().await?;
+        Ok(())
+    }
+}
+
+/// Metadata for received images stored in Firebase
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceivedImageMeta {
+    pub image_id: String,
+    pub from_user: String,
+    pub remaining_views: u8,
+    pub max_views: u8,
+    pub received_at: i64,
+    pub encrypted_data_base64: String,  // Store the encrypted image data
 }
