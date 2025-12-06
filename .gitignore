@@ -3,6 +3,7 @@
 **/*.rs.bk
 Cargo.lock
 
+
 # Logs
 *.log
 .node_pids
@@ -17,3 +18,4 @@ Cargo.lock
 # OS
 .DS_Store
 Thumbs.db
+received_images/
