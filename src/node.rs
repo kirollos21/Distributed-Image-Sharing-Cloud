@@ -735,8 +735,16 @@ impl CloudNode {
             }
 
             Message::CheckUsernameAvailable { username } => {
-                // Check centralized users.txt file
-                let is_available = !Self::user_exists_in_file(&username).await;
+                // Check Firebase for user existence
+                let firebase = FireBaseClient::new();
+                let is_available = match firebase.check_username_available(&username).await {
+                    Ok(available) => available,
+                    Err(e) => {
+                        warn!("[Node {}] Firebase error checking username: {}", self.id, e);
+                        // Fallback to local file if Firebase fails
+                        !Self::user_exists_in_file(&username).await
+                    }
+                };
                 Some(Message::CheckUsernameAvailableResponse {
                     username,
                     is_available,

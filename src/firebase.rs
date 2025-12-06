@@ -329,4 +329,13 @@ impl FireBaseClient {
         addresses.sort();
         Ok(addresses)
     }
+
+    /// Check if a username is available (not registered by anyone)
+    /// Returns true if available (nobody has this username), false if taken
+    pub async fn check_username_available(&self, username: &str) -> Result<bool, reqwest::Error> {
+        match self.find_user_by_username(username).await? {
+            Some(_) => Ok(false),  // Username is taken
+            None => Ok(true),      // Username is available
+        }
+    }
 }
