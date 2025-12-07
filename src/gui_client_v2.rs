@@ -716,77 +716,86 @@ impl ClientAppV2 {
         let user_id = self.session.user_id.clone();
         let runtime = self.runtime.as_ref().unwrap().clone();
         let cache_dir = Self::get_user_cache_dir(&user_id);
+        let known_ids = self.known_firebase_image_ids.clone();
         
-        // Get current set of image IDs from Firebase
-        runtime.block_on(async {
-            let firebase = FireBaseClient::new();
-            
-            match firebase.get_received_images(&user_id).await {
-                Ok(images) => {
-                    let mut new_images_saved = false;
-                    
-                    for img in images {
-                        // Check if we've already processed this image
-                        if !self.known_firebase_image_ids.contains(&img.image_id) {
-                            eprintln!("[FIREBASE LISTENER] New image detected: {} from {}", 
-                                     img.image_id, img.from_user);
-                            
-                            // Mark as known
-                            self.known_firebase_image_ids.insert(img.image_id.clone());
-                            
-                            // Save to local cache
-                            let filename = format!("{}_{}.enc", img.from_user.replace('#', "_"), img.image_id);
-                            let file_path = cache_dir.join(&filename);
-                            
-                            // Only save if not already cached
-                            if !file_path.exists() {
-                                if let Ok(encrypted_data) = base64::engine::general_purpose::STANDARD.decode(&img.encrypted_data_base64) {
-                                    if std::fs::write(&file_path, &encrypted_data).is_ok() {
-                                        // Save metadata
-                                        let meta = ImageCacheMeta {
-                                            from_user: img.from_user.clone(),
-                                            remaining_views: img.remaining_views,
-                                            max_views: img.max_views,
-                                            received_at: img.received_at,
-                                            image_id: img.image_id.clone(),
-                                        };
-                                        let meta_path = file_path.with_extension("meta.json");
-                                        if std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap_or_default()).is_ok() {
-                                            eprintln!("[FIREBASE LISTENER] Successfully saved image {} to cache", img.image_id);
-                                            new_images_saved = true;
-                                            
-                                            // Add to received_images list immediately
-                                            let received_image = ReceivedImage {
-                                                filename: filename.clone(),
+        // Clone for second thread before first spawn
+        let user_id_for_update = user_id.clone();
+        let runtime_for_update = runtime.clone();
+        
+        // Spawn background thread to avoid blocking the GUI
+        std::thread::spawn(move || {
+            runtime.block_on(async move {
+                let firebase = FireBaseClient::new();
+                
+                match firebase.get_received_images(&user_id).await {
+                    Ok(images) => {
+                        for img in images {
+                            // Check if we've already processed this image
+                            if !known_ids.contains(&img.image_id) {
+                                eprintln!("[FIREBASE LISTENER] New image detected: {} from {}", 
+                                         img.image_id, img.from_user);
+                                
+                                // Save to local cache
+                                let filename = format!("{}_{}.enc", img.from_user.replace('#', "_"), img.image_id);
+                                let file_path = cache_dir.join(&filename);
+                                
+                                let mut should_delete_from_firebase = false;
+                                
+                                // Only save if not already cached
+                                if !file_path.exists() {
+                                    if let Ok(encrypted_data) = base64::engine::general_purpose::STANDARD.decode(&img.encrypted_data_base64) {
+                                        if std::fs::write(&file_path, &encrypted_data).is_ok() {
+                                            // Save metadata
+                                            let meta = ImageCacheMeta {
                                                 from_user: img.from_user.clone(),
                                                 remaining_views: img.remaining_views,
                                                 max_views: img.max_views,
                                                 received_at: img.received_at,
-                                                file_path: file_path.to_string_lossy().to_string(),
                                                 image_id: img.image_id.clone(),
                                             };
-                                            
-                                            // Prepend to inbox so newest appears first
-                                            self.received_images.insert(0, received_image);
-                                            
-                                            eprintln!("[FIREBASE LISTENER] Added image {} from {} to inbox! Total: {}", 
-                                                     img.image_id, img.from_user, self.received_images.len());
+                                            let meta_path = file_path.with_extension("meta.json");
+                                            if std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap_or_default()).is_ok() {
+                                                eprintln!("[FIREBASE LISTENER] Successfully saved image {} to cache (will appear on next inbox refresh)", img.image_id);
+                                                should_delete_from_firebase = true;
+                                            }
                                         }
+                                    }
+                                } else {
+                                    // Image already exists locally, delete from Firebase
+                                    should_delete_from_firebase = true;
+                                }
+                                
+                                // Delete from Firebase after successful save to local cache
+                                if should_delete_from_firebase {
+                                    if let Err(e) = firebase.delete_received_image(&user_id, &img.image_id).await {
+                                        eprintln!("[FIREBASE LISTENER] Failed to delete image {} from Firebase: {}", img.image_id, e);
+                                    } else {
+                                        eprintln!("[FIREBASE LISTENER] Deleted image {} from Firebase after saving to cache", img.image_id);
                                     }
                                 }
                             }
                         }
                     }
-                    
-                    if new_images_saved {
-                        // Re-sort inbox by timestamp
-                        self.received_images.sort_by(|a, b| b.received_at.cmp(&a.received_at));
+                    Err(e) => {
+                        eprintln!("[FIREBASE LISTENER] Error checking for images: {}", e);
                     }
                 }
-                Err(e) => {
-                    eprintln!("[FIREBASE LISTENER] Error checking for images: {}", e);
+            });
+        });
+        
+        // Update known IDs by fetching current state (also in background to not block)
+        std::thread::spawn(move || {
+            runtime_for_update.block_on(async move {
+                let firebase = FireBaseClient::new();
+                if let Ok(images) = firebase.get_received_images(&user_id_for_update).await {
+                    let image_ids: std::collections::HashSet<String> = 
+                        images.into_iter().map(|img| img.image_id).collect();
+                    
+                    // Note: We can't safely update known_firebase_image_ids from here
+                    // The next poll will pick up the new images from cache
+                    eprintln!("[FIREBASE LISTENER] Found {} total images in Firebase", image_ids.len());
                 }
-            }
+            });
         });
     }
 
@@ -1299,6 +1308,21 @@ impl eframe::App for ClientAppV2 {
                             
                             eprintln!("[DIRECT DELIVERY] Received image {} from {} - added to inbox! Total images: {}", 
                                      image_meta.image_id, image_meta.from_user, self.received_images.len());
+                            
+                            // Delete from Firebase after successful save (in background to not block)
+                            let user_id_clone = user_id.clone();
+                            let image_id_clone = image_meta.image_id.clone();
+                            let runtime = self.runtime.as_ref().unwrap().clone();
+                            std::thread::spawn(move || {
+                                runtime.block_on(async move {
+                                    let firebase = FireBaseClient::new();
+                                    if let Err(e) = firebase.delete_received_image(&user_id_clone, &image_id_clone).await {
+                                        eprintln!("[DIRECT DELIVERY] Failed to delete image {} from Firebase: {}", image_id_clone, e);
+                                    } else {
+                                        eprintln!("[DIRECT DELIVERY] Deleted image {} from Firebase after UDP delivery", image_id_clone);
+                                    }
+                                });
+                            });
                         } else {
                             eprintln!("[DEBUG] Failed to save encrypted file");
                         }
@@ -1944,9 +1968,11 @@ impl ClientAppV2 {
                 if ui.add(button).clicked() {
                     self.current_page = page.clone();
                     
-                    // Load notes when switching to Notes page
+                    // Load data when switching to specific pages
                     if page == Page::Notes {
                         self.load_notes();
+                    } else if page == Page::Inbox {
+                        self.load_cached_images();
                     }
                 }
                 
