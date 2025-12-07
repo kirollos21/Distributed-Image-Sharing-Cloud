@@ -1281,30 +1281,104 @@ impl ClientAppV2 {
         self.auth_error = None;
         self.auth_success = None;
 
-        // Prepare local_addr and start UDP listener so nodes can forward notes directly to this client.
+        // Prepare local_addr and start UDP listener so nodes can forward notes and images directly to this client.
         // Try default port 8009 first, otherwise pick an ephemeral port.
-        let (tx, rx) = mpsc::channel::<NoteMeta>();
+        eprintln!("[SETUP] Setting up UDP listeners during login...");
+        let (note_tx, note_rx) = mpsc::channel::<NoteMeta>();
+        let (image_tx, image_rx) = mpsc::channel::<ReceivedImageMeta>();
         let mut local_addr = get_local_ip();
+        eprintln!("[SETUP] Attempting to bind UDP on 0.0.0.0:8009...");
         if let Ok(sock) = std::net::UdpSocket::bind(("0.0.0.0", 8009)) {
+            eprintln!("[SETUP] Successfully bound to port 8009");
             if let Ok(addr) = sock.local_addr() {
                 local_addr = format!("{}:{}", local_addr, addr.port());
+                eprintln!("[SETUP] Local address: {}", local_addr);
             }
-            let tx_clone = tx.clone();
+            let note_tx_clone = note_tx.clone();
+            let image_tx_clone = image_tx.clone();
             std::thread::spawn(move || {
+                eprintln!("[UDP LISTENER PORT 8009] Started during login");
                 let mut buf = [0u8; 65536];
+                let mut reassembler = ChunkReassembler::new();
                 loop {
                     match sock.recv_from(&mut buf) {
-                        Ok((n, _src)) => {
-                            if let Ok(msg) = serde_json::from_slice::<Message>(&buf[..n]) {
-                                if let Message::SendNote { note_id, from_username, content, timestamp, .. } = msg {
-                                    let note = NoteMeta {
-                                        note_id: note_id.clone(),
-                                        from_user: from_username.clone(),
-                                        content: content.clone(),
-                                        timestamp,
-                                    };
-                                    let _ = tx_clone.send(note);
+                        Ok((n, src)) => {
+                            eprintln!("[UDP 8009 LOGIN] Received {} bytes from {}", n, src);
+                            // Try to parse as ChunkedMessage first
+                            if let Ok(chunked_msg) = serde_json::from_slice::<ChunkedMessage>(&buf[..n]) {
+                                eprintln!("[UDP 8009 LOGIN] Chunked message");
+                                // Process chunk through reassembler
+                                if let Some(complete_data) = reassembler.process_chunk(chunked_msg) {
+                                    eprintln!("[UDP 8009 LOGIN] Complete: {} bytes", complete_data.len());
+                                    // Parse complete message
+                                    if let Ok(msg) = serde_json::from_slice::<Message>(&complete_data) {
+                                        match msg {
+                                            Message::SendNote { note_id, from_username, content, timestamp, .. } => {
+                                                let note = NoteMeta {
+                                                    note_id: note_id.clone(),
+                                                    from_user: from_username.clone(),
+                                                    content: content.clone(),
+                                                    timestamp,
+                                                };
+                                                let _ = note_tx_clone.send(note);
+                                            }
+                                            Message::SendImage { from_username, encrypted_image, max_views, image_id, .. } => {
+                                                eprintln!("[UDP 8009 LOGIN] SendImage from {} (id: {}, {} bytes, views: {})", 
+                                                         from_username, image_id, encrypted_image.len(), max_views);
+                                                let timestamp = chrono::Utc::now().timestamp();
+                                                let image_meta = ReceivedImageMeta {
+                                                    image_id: image_id.clone(),
+                                                    from_user: from_username.clone(),
+                                                    remaining_views: max_views,
+                                                    max_views,
+                                                    received_at: timestamp,
+                                                    encrypted_data_base64: base64::engine::general_purpose::STANDARD.encode(&encrypted_image),
+                                                };
+                                                if image_tx_clone.send(image_meta).is_ok() {
+                                                    eprintln!("[UDP 8009 LOGIN] Sent to channel OK");
+                                                } else {
+                                                    eprintln!("[UDP 8009 LOGIN] Channel send FAILED");
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
                                 }
+                            } else if let Ok(msg) = serde_json::from_slice::<Message>(&buf[..n]) {
+                                eprintln!("[UDP 8009 LOGIN] Direct message");
+                                // Direct message (not chunked) - for small messages
+                                match msg {
+                                    Message::SendNote { note_id, from_username, content, timestamp, .. } => {
+                                        let note = NoteMeta {
+                                            note_id: note_id.clone(),
+                                            from_user: from_username.clone(),
+                                            content: content.clone(),
+                                            timestamp,
+                                        };
+                                        let _ = note_tx_clone.send(note);
+                                    }
+                                    Message::SendImage { from_username, encrypted_image, max_views, image_id, .. } => {
+                                        eprintln!("[UDP 8009 LOGIN DIRECT] SendImage from {} (id: {}, {} bytes, views: {})", 
+                                                 from_username, image_id, encrypted_image.len(), max_views);
+                                        let timestamp = chrono::Utc::now().timestamp();
+                                        let image_meta = ReceivedImageMeta {
+                                            image_id: image_id.clone(),
+                                            from_user: from_username.clone(),
+                                            remaining_views: max_views,
+                                            max_views,
+                                            received_at: timestamp,
+                                            encrypted_data_base64: base64::engine::general_purpose::STANDARD.encode(&encrypted_image),
+                                        };
+                                        if image_tx_clone.send(image_meta).is_ok() {
+                                            eprintln!("[UDP 8009 LOGIN DIRECT] Sent to channel OK");
+                                        } else {
+                                            eprintln!("[UDP 8009 LOGIN DIRECT] Channel send FAILED");
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                eprintln!("[UDP 8009 LOGIN] Parse failed");
                             }
                         }
                         Err(e) => {
@@ -1314,26 +1388,79 @@ impl ClientAppV2 {
                     }
                 }
             });
-            self.incoming_note_rx = Some(rx);
+            self.incoming_note_rx = Some(note_rx);
+            self.incoming_image_rx = Some(image_rx);
+            eprintln!("[SETUP] UDP listener thread spawned on port 8009 during login");
         } else if let Ok(sock) = std::net::UdpSocket::bind(("0.0.0.0", 0)) {
+            eprintln!("[SETUP] Port 8009 failed, using ephemeral port during login");
             if let Ok(addr) = sock.local_addr() {
                 local_addr = format!("{}:{}", local_addr, addr.port());
             }
-            let tx_clone = tx.clone();
+            let note_tx_clone = note_tx.clone();
+            let image_tx_clone = image_tx.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 65536];
+                let mut reassembler = ChunkReassembler::new();
+                eprintln!("[UDP EPHEMERAL] Started");
                 loop {
                     match sock.recv_from(&mut buf) {
-                        Ok((n, _src)) => {
-                            if let Ok(msg) = serde_json::from_slice::<Message>(&buf[..n]) {
-                                if let Message::SendNote { note_id, from_username, content, timestamp, .. } = msg {
-                                    let note = NoteMeta {
-                                        note_id: note_id.clone(),
-                                        from_user: from_username.clone(),
-                                        content: content.clone(),
-                                        timestamp,
-                                    };
-                                    let _ = tx_clone.send(note);
+                        Ok((n, src)) => {
+                            eprintln!("[UDP EPHEMERAL] Received {} bytes from {}", n, src);
+                            if let Ok(chunked_msg) = serde_json::from_slice::<ChunkedMessage>(&buf[..n]) {
+                                if let Some(complete_data) = reassembler.process_chunk(chunked_msg) {
+                                    if let Ok(msg) = serde_json::from_slice::<Message>(&complete_data) {
+                                        match msg {
+                                            Message::SendNote { note_id, from_username, content, timestamp, .. } => {
+                                                let note = NoteMeta {
+                                                    note_id: note_id.clone(),
+                                                    from_user: from_username.clone(),
+                                                    content: content.clone(),
+                                                    timestamp,
+                                                };
+                                                let _ = note_tx_clone.send(note);
+                                            }
+                                            Message::SendImage { from_username, encrypted_image, max_views, image_id, .. } => {
+                                                eprintln!("[UDP EPHEMERAL] SendImage");
+                                                let timestamp = chrono::Utc::now().timestamp();
+                                                let image_meta = ReceivedImageMeta {
+                                                    image_id: image_id.clone(),
+                                                    from_user: from_username.clone(),
+                                                    remaining_views: max_views,
+                                                    max_views,
+                                                    received_at: timestamp,
+                                                    encrypted_data_base64: base64::engine::general_purpose::STANDARD.encode(&encrypted_image),
+                                                };
+                                                let _ = image_tx_clone.send(image_meta);
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            } else if let Ok(msg) = serde_json::from_slice::<Message>(&buf[..n]) {
+                                match msg {
+                                    Message::SendNote { note_id, from_username, content, timestamp, .. } => {
+                                        let note = NoteMeta {
+                                            note_id: note_id.clone(),
+                                            from_user: from_username.clone(),
+                                            content: content.clone(),
+                                            timestamp,
+                                        };
+                                        let _ = note_tx_clone.send(note);
+                                    }
+                                    Message::SendImage { from_username, encrypted_image, max_views, image_id, .. } => {
+                                        eprintln!("[UDP EPHEMERAL DIRECT] SendImage");
+                                        let timestamp = chrono::Utc::now().timestamp();
+                                        let image_meta = ReceivedImageMeta {
+                                            image_id: image_id.clone(),
+                                            from_user: from_username.clone(),
+                                            remaining_views: max_views,
+                                            max_views,
+                                            received_at: timestamp,
+                                            encrypted_data_base64: base64::engine::general_purpose::STANDARD.encode(&encrypted_image),
+                                        };
+                                        let _ = image_tx_clone.send(image_meta);
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -1344,7 +1471,8 @@ impl ClientAppV2 {
                     }
                 }
             });
-            self.incoming_note_rx = Some(rx);
+            self.incoming_note_rx = Some(note_rx);
+            self.incoming_image_rx = Some(image_rx);
         } else {
             eprintln!("Failed to bind UDP listener on default and ephemeral ports");
         }
