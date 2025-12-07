@@ -602,6 +602,63 @@ impl Client {
         }
     }
 
+    /// Send an image request to a user via nodes (replicated to all nodes)
+    pub async fn send_image_request(
+        &self,
+        request_id: String,
+        from_id: u8,
+        to_id: u8,
+        from_username: String,
+        to_username: String,
+        image_index: usize,
+        timestamp: i64,
+    ) -> Result<String, String> {
+        let message = Message::RequestImage {
+            request_id: request_id.clone(),
+            from_user_id: from_id.to_string(),
+            from_username: from_username.clone(),
+            to_user_id: to_id.to_string(),
+            to_username: to_username.clone(),
+            image_index,
+            timestamp,
+        };
+
+        info!("[Client {}] Sending image request {} from {} to {} for image #{} (replicating to {} nodes)",
+              self.id, request_id, from_username, to_username, image_index, self.cloud_addresses.len());
+
+        let mut success_count = 0;
+        let mut last_error = String::new();
+
+        for address in &self.cloud_addresses {
+            match Self::send_to_node(self.id, address, message.clone()).await {
+                Ok(Message::RequestImageResponse { success, request_id: _, error }) => {
+                    if success {
+                        success_count += 1;
+                        debug!("[Client {}] Image request replicated to {}", self.id, address);
+                    } else {
+                        last_error = error.unwrap_or_else(|| "Request failed".to_string());
+                        warn!("[Client {}] Node {} rejected image request: {}", self.id, address, last_error);
+                    }
+                }
+                Ok(_) => {
+                    last_error = "Unexpected response from server".to_string();
+                    warn!("[Client {}] Unexpected response from {}", self.id, address);
+                }
+                Err(e) => {
+                    last_error = e.clone();
+                    warn!("[Client {}] Failed to send to {}: {}", self.id, address, e);
+                }
+            }
+        }
+
+        if success_count > 0 {
+            info!("[Client {}] Successfully sent image request {} to {}/{} nodes", self.id, request_id, success_count, self.cloud_addresses.len());
+            Ok(request_id)
+        } else {
+            Err(format!("Failed to send to any node. Last error: {}", last_error))
+        }
+    }
+
     /// Send a text note to a user via nodes (replicated to all nodes)
     pub async fn send_note(
         &self,

@@ -2960,31 +2960,61 @@ impl ClientAppV2 {
                 let request_id = format!("req_{}_{}", chrono::Utc::now().timestamp_millis(), rand::random::<u16>());
                 let timestamp = chrono::Utc::now().timestamp();
                 
-                let client = match crate::client::Client::from_firebase(0).await {
-                    Ok(c) => c,
-                    Err(e) => return Err(format!("Failed to connect to node: {}", e)),
-                };
+                // Parse numeric IDs for node message routing
+                let from_id_num = from_user_id.parse::<u8>().ok();
+                let to_id_num = to_user_id.parse::<u8>().ok();
                 
-                let message = crate::messages::Message::RequestImage {
-                    request_id: request_id.clone(),
-                    from_user_id: from_user_id.clone(),
-                    from_username: from_username.clone(),
-                    to_user_id: to_user_id.clone(),
-                    to_username: to_username.clone(),
-                    image_index,
-                    timestamp,
-                };
-                
-                match client.send_with_retry(message).await {
-                    Ok(crate::messages::Message::RequestImageResponse { success, error, .. }) => {
-                        if success {
-                            Ok(request_id)
-                        } else {
-                            Err(error.unwrap_or_else(|| "Request failed".to_string()))
+                // If we have valid numeric IDs, send via nodes
+                if let (Some(from_id), Some(to_id)) = (from_id_num, to_id_num) {
+                    let client = match crate::client::Client::from_firebase(0).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            // Fallback to Firebase direct write
+                            let firebase = FireBaseClient::new();
+                            let request_meta = crate::firebase::ImageRequestMeta {
+                                request_id: request_id.clone(),
+                                from_user_id: from_user_id.clone(),
+                                from_username: from_username.clone(),
+                                to_user_id: to_user_id.clone(),
+                                to_username: to_username.clone(),
+                                image_index,
+                                timestamp,
+                                status: "pending".to_string(),
+                            };
+                            return firebase.add_image_request(&request_meta).await
+                                .map(|_| request_id.clone())
+                                .map_err(|e| format!("Failed to send request (fallback): {}", e));
                         }
+                    };
+                    
+                    match client.send_image_request(
+                        request_id.clone(),
+                        from_id,
+                        to_id,
+                        format!("{}#{}", from_username, from_user_id),
+                        to_username.clone(),
+                        image_index,
+                        timestamp
+                    ).await {
+                        Ok(req_id) => Ok(req_id),
+                        Err(e) => Err(format!("Failed to send request via nodes: {}", e)),
                     }
-                    Ok(_) => Err("Unexpected response from server".to_string()),
-                    Err(e) => Err(format!("Request failed: {}", e)),
+                } else {
+                    // IDs are not numeric -- fallback to direct Firebase write
+                    let firebase = FireBaseClient::new();
+                    let request_meta = crate::firebase::ImageRequestMeta {
+                        request_id: request_id.clone(),
+                        from_user_id: from_user_id.clone(),
+                        from_username: from_username.clone(),
+                        to_user_id: to_user_id.clone(),
+                        to_username: to_username.clone(),
+                        image_index,
+                        timestamp,
+                        status: "pending".to_string(),
+                    };
+                    firebase.add_image_request(&request_meta).await
+                        .map(|_| request_id)
+                        .map_err(|e| format!("Failed to send request: {}", e))
                 }
             })
         });
