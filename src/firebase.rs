@@ -275,6 +275,21 @@ impl FireBaseClient {
         self.client.put(&url).json(gallery).send().await?;
         Ok(())
     }
+    
+    /// Update full resolution gallery (stores original images for sending when requested)
+    pub async fn update_full_gallery(&self, id: &str, full_gallery: &Vec<String>) -> Result<(), reqwest::Error> {
+        let url = format!("{}/users/{}/full_gallery.json", self.base_url, id);
+        self.client.put(&url).json(full_gallery).send().await?;
+        Ok(())
+    }
+    
+    /// Get full resolution gallery
+    pub async fn get_full_gallery(&self, id: &str) -> Result<Vec<String>, reqwest::Error> {
+        let url = format!("{}/users/{}/full_gallery.json", self.base_url, id);
+        let resp = self.client.get(&url).send().await?;
+        let gallery = resp.json::<Option<Vec<String>>>().await?;
+        Ok(gallery.unwrap_or_default())
+    }
 
     pub async fn add_to_gallery(&self, id: &str, image_id: &str) -> Result<(), reqwest::Error> {
         let url = format!("{}/users/{}/gallery.json", self.base_url, id);
@@ -490,6 +505,26 @@ impl FireBaseClient {
         
         Ok(())
     }
+    
+    /// Delete an image request from both users' lists
+    pub async fn delete_image_request(&self, from_user_id: &str, to_user_id: &str, request_id: &str) -> Result<(), reqwest::Error> {
+        // Delete from both users' lists in parallel
+        let url_from = format!("{}/image_requests/{}/outgoing/{}.json", 
+            self.base_url, from_user_id, request_id);
+        let url_to = format!("{}/image_requests/{}/incoming/{}.json", 
+            self.base_url, to_user_id, request_id);
+        
+        // Execute both deletes in parallel
+        let (result_from, result_to) = tokio::join!(
+            self.client.delete(&url_from).send(),
+            self.client.delete(&url_to).send()
+        );
+        
+        result_from?;
+        result_to?;
+        
+        Ok(())
+    }
 }
 
 /// Metadata for received images stored in Firebase
@@ -523,4 +558,5 @@ pub struct ImageRequestMeta {
     pub image_index: usize,
     pub timestamp: i64,
     pub status: String,  // "pending", "accepted", "rejected"
+    pub quota: u8,  // View quota (1-99)
 }

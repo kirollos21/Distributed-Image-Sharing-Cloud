@@ -235,6 +235,7 @@ pub enum Message {
         to_username: String,
         image_index: usize,  // Index in gallery (0-4)
         timestamp: i64,
+        quota: u8,  // View quota (1-99)
     },
     RequestImageResponse {
         success: bool,
@@ -257,6 +258,14 @@ pub enum Message {
         success: bool,
         error: Option<String>,
     },
+    DeleteImageRequest {
+        request_id: String,
+        user_id: String,  // User deleting
+    },
+    DeleteImageRequestResponse {
+        success: bool,
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,6 +278,7 @@ pub struct ImageRequestInfo {
     pub image_index: usize,
     pub timestamp: i64,
     pub status: RequestStatus,  // pending, accepted, rejected
+    pub quota: u8,  // View quota (1-99)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -392,8 +402,8 @@ impl fmt::Display for Message {
             Message::GetUserGalleryResponse { success, images, .. } => {
                 write!(f, "GET_USER_GALLERY_RESPONSE (success: {}, {} images)", success, images.len())
             }
-            Message::RequestImage { request_id, from_username, to_username, image_index, .. } => {
-                write!(f, "REQUEST_IMAGE {} from {} to {} (image #{})", request_id, from_username, to_username, image_index)
+            Message::RequestImage { request_id, from_username, to_username, image_index, quota, .. } => {
+                write!(f, "REQUEST_IMAGE {} from {} to {} (image #{}, quota: {})", request_id, from_username, to_username, image_index, quota)
             }
             Message::RequestImageResponse { success, request_id, .. } => {
                 write!(f, "REQUEST_IMAGE_RESPONSE {} (success: {})", request_id, success)
@@ -409,6 +419,12 @@ impl fmt::Display for Message {
             }
             Message::RespondToImageRequestResponse { success, .. } => {
                 write!(f, "RESPOND_TO_IMAGE_REQUEST_RESPONSE (success: {})", success)
+            }
+            Message::DeleteImageRequest { request_id, .. } => {
+                write!(f, "DELETE_IMAGE_REQUEST {}", request_id)
+            }
+            Message::DeleteImageRequestResponse { success, .. } => {
+                write!(f, "DELETE_IMAGE_REQUEST_RESPONSE (success: {})", success)
             }
         }
     }

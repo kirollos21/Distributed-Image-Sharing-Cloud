@@ -902,6 +902,7 @@ impl CloudNode {
                 to_username,
                 image_index,
                 timestamp,
+                quota,
             } => {
                 let firebase = FireBaseClient::new();
                 
@@ -914,6 +915,7 @@ impl CloudNode {
                     image_index,
                     timestamp,
                     status: "pending".to_string(),
+                    quota,
                 };
                 
                 match firebase.add_image_request(&request_meta).await {
@@ -936,6 +938,7 @@ impl CloudNode {
                                                     to_username: to_username.clone(),
                                                     image_index,
                                                     timestamp,
+                                                    quota,
                                                 };
                                                 
                                                 match self.send_response_to_client(addr, push_msg).await {
@@ -999,6 +1002,7 @@ impl CloudNode {
                             "rejected" => crate::messages::RequestStatus::Rejected,
                             _ => crate::messages::RequestStatus::Pending,
                         },
+                        quota: r.quota,
                     }).collect(),
                     Err(e) => {
                         warn!("[Node {}] Failed to fetch incoming requests for {}: {}", 
@@ -1021,6 +1025,7 @@ impl CloudNode {
                             "rejected" => crate::messages::RequestStatus::Rejected,
                             _ => crate::messages::RequestStatus::Pending,
                         },
+                        quota: r.quota,
                     }).collect(),
                     Err(e) => {
                         warn!("[Node {}] Failed to fetch outgoing requests for {}: {}", 
@@ -1079,6 +1084,59 @@ impl CloudNode {
                         Some(Message::RespondToImageRequestResponse {
                             success: false,
                             error: Some(format!("Failed to update request: {}", e)),
+                        })
+                    }
+                }
+            }
+
+            Message::DeleteImageRequest {
+                request_id,
+                user_id,
+            } => {
+                let firebase = FireBaseClient::new();
+                
+                // Find the request to get both user IDs
+                let mut from_id = String::new();
+                let mut to_id = String::new();
+                
+                // Check incoming requests
+                if let Ok(incoming) = firebase.get_incoming_image_requests(&user_id).await {
+                    if let Some(req) = incoming.iter().find(|r| r.request_id == request_id) {
+                        from_id = req.from_user_id.clone();
+                        to_id = req.to_user_id.clone();
+                    }
+                }
+                
+                // Check outgoing requests if not found in incoming
+                if from_id.is_empty() {
+                    if let Ok(outgoing) = firebase.get_outgoing_image_requests(&user_id).await {
+                        if let Some(req) = outgoing.iter().find(|r| r.request_id == request_id) {
+                            from_id = req.from_user_id.clone();
+                            to_id = req.to_user_id.clone();
+                        }
+                    }
+                }
+                
+                if from_id.is_empty() {
+                    return Some(Message::DeleteImageRequestResponse {
+                        success: false,
+                        error: Some("Request not found".to_string()),
+                    });
+                }
+                
+                match firebase.delete_image_request(&from_id, &to_id, &request_id).await {
+                    Ok(_) => {
+                        info!("[Node {}] Deleted request {}", self.id, request_id);
+                        Some(Message::DeleteImageRequestResponse {
+                            success: true,
+                            error: None,
+                        })
+                    }
+                    Err(e) => {
+                        error!("[Node {}] Failed to delete request {}: {}", self.id, request_id, e);
+                        Some(Message::DeleteImageRequestResponse {
+                            success: false,
+                            error: Some(format!("Failed to delete request: {}", e)),
                         })
                     }
                 }

@@ -81,9 +81,12 @@ pub struct ClientAppV2 {
     
     // My Gallery state (public pixelated images - max 5)
     my_gallery: Vec<String>,           // Base64 data URLs of pixelated images
+    my_full_gallery: Vec<String>,      // Base64 data URLs of full resolution images
     my_gallery_loaded: bool,
     my_gallery_loading: Option<Promise<Result<Vec<String>, String>>>,
+    my_full_gallery_loading: Option<Promise<Result<Vec<String>, String>>>,
     my_gallery_textures: Vec<Option<egui::TextureHandle>>,
+    my_full_gallery_textures: Vec<Option<egui::TextureHandle>>,
     gallery_upload_path: Option<String>,
     gallery_upload_in_progress: Option<Promise<Result<(), String>>>,
     gallery_error: Option<String>,
@@ -96,11 +99,14 @@ pub struct ClientAppV2 {
     note_input: std::collections::HashMap<String, String>,  // user_id -> note text input
     send_note_in_progress: Option<Promise<Result<String, String>>>,  // Returns recipient user_id on success
     request_image_in_progress: Option<Promise<Result<String, String>>>,  // Returns request_id on success
+    request_popup_data: Option<(String, String, usize)>,  // (user_id, username, image_index) for the popup
+    request_popup_quota: u8,  // View quota for the request popup
     
     // Requests state
     image_requests: Vec<ImageRequest>,  // All requests (incoming and outgoing)
     requests_loading: Option<Promise<Result<Vec<ImageRequest>, String>>>,
     respond_request_in_progress: Option<Promise<Result<(String, bool), String>>>,  // Returns (request_id, accepted) on success
+    delete_request_in_progress: Option<Promise<Result<String, String>>>,  // Returns request_id on success
     incoming_request_rx: Option<mpsc::Receiver<ImageRequest>>,  // Incoming requests from UDP listener
     
     // Notes state
@@ -167,6 +173,7 @@ pub struct ImageRequest {
     pub timestamp: i64,
     pub status: String,  // "pending", "accepted", "rejected"
     pub is_incoming: bool,  // true if this is a request TO me, false if FROM me
+    pub quota: u8,  // View quota (1-99)
 }
 
 // ============================================================================
@@ -183,6 +190,7 @@ impl AppColors {
     const WARNING: Color32 = Color32::from_rgb(234, 179, 8);      // Yellow
     const BG_DARK: Color32 = Color32::from_rgb(17, 24, 39);       // Dark background
     const BG_CARD: Color32 = Color32::from_rgb(31, 41, 55);       // Card background
+    const BG_SECONDARY: Color32 = Color32::from_rgb(45, 55, 72);  // Secondary background
     const BG_INPUT: Color32 = Color32::from_rgb(55, 65, 81);      // Input background
     const TEXT_PRIMARY: Color32 = Color32::from_rgb(243, 244, 246);
     const TEXT_SECONDARY: Color32 = Color32::from_rgb(156, 163, 175);
@@ -264,9 +272,12 @@ impl ClientAppV2 {
             viewing_in_progress: None,
             view_error: None,
             my_gallery: Vec::new(),
+            my_full_gallery: Vec::new(),
             my_gallery_loaded: false,
             my_gallery_loading: None,
+            my_full_gallery_loading: None,
             my_gallery_textures: Vec::new(),
+            my_full_gallery_textures: Vec::new(),
             gallery_upload_path: None,
             gallery_upload_in_progress: None,
             gallery_error: None,
@@ -277,9 +288,12 @@ impl ClientAppV2 {
             note_input: std::collections::HashMap::new(),
             send_note_in_progress: None,
             request_image_in_progress: None,
+            request_popup_data: None,
+            request_popup_quota: 1,
             image_requests: Vec::new(),
             requests_loading: None,
             respond_request_in_progress: None,
+            delete_request_in_progress: None,
             incoming_request_rx: None,
             notes: Vec::new(),
             notes_loading: None,
@@ -394,7 +408,7 @@ impl ClientAppV2 {
                                                     eprintln!("[UDP 8009] Channel send FAILED");
                                                 }
                                             }
-                                            Message::RequestImage { request_id, from_user_id, from_username, to_user_id, to_username, image_index, timestamp } => {
+                                            Message::RequestImage { request_id, from_user_id, from_username, to_user_id, to_username, image_index, timestamp, quota } => {
                                                 eprintln!("[UDP 8009] RequestImage from {} for image #{}", from_username, image_index);
                                                 let request = ImageRequest {
                                                     request_id,
@@ -406,6 +420,7 @@ impl ClientAppV2 {
                                                     timestamp,
                                                     status: "pending".to_string(),
                                                     is_incoming: true,
+                                                    quota,
                                                 };
                                                 let _ = request_tx_clone.send(request);
                                             }
@@ -444,7 +459,7 @@ impl ClientAppV2 {
                                                     eprintln!("[UDP 8009 DIRECT] Channel send FAILED");
                                                 }
                                     }
-                                    Message::RequestImage { request_id, from_user_id, from_username, to_user_id, to_username, image_index, timestamp } => {
+                                    Message::RequestImage { request_id, from_user_id, from_username, to_user_id, to_username, image_index, timestamp, quota } => {
                                         eprintln!("[UDP 8009 DIRECT] RequestImage from {} for image #{}", from_username, image_index);
                                         let request = ImageRequest {
                                             request_id,
@@ -456,6 +471,7 @@ impl ClientAppV2 {
                                             timestamp,
                                             status: "pending".to_string(),
                                             is_incoming: true,
+                                            quota,
                                         };
                                         let _ = request_tx_clone.send(request);
                                     }
@@ -518,7 +534,7 @@ impl ClientAppV2 {
                                                 };
                                                 let _ = image_tx_clone.send(image_meta);
                                             }
-                                            Message::RequestImage { request_id, from_user_id, from_username, to_user_id, to_username, image_index, timestamp } => {
+                                            Message::RequestImage { request_id, from_user_id, from_username, to_user_id, to_username, image_index, timestamp, quota } => {
                                                 let request = ImageRequest {
                                                     request_id,
                                                     from_user_id,
@@ -529,6 +545,7 @@ impl ClientAppV2 {
                                                     timestamp,
                                                     status: "pending".to_string(),
                                                     is_incoming: true,
+                                                    quota,
                                                 };
                                                 let _ = request_tx_clone.send(request);
                                             }
@@ -1200,6 +1217,11 @@ impl eframe::App for ClientAppV2 {
                     self.render_main_app(ui, ctx);
                 }
             });
+
+        // Image request popup window
+        if self.request_popup_data.is_some() {
+            self.render_request_popup(ctx);
+        }
 
         // Image viewer popup window
         if self.viewing_image.is_some() || self.viewing_in_progress.is_some() {
@@ -2324,7 +2346,7 @@ impl ClientAppV2 {
                     .color(AppColors::TEXT_PRIMARY)
                     .strong());
                 
-                ui.label(RichText::new("Share up to 5 pixelated preview images publicly")
+                ui.label(RichText::new("Share up to 5 images publicly (full resolution + preview)")
                     .size(14.0)
                     .color(AppColors::TEXT_SECONDARY));
                 
@@ -2362,8 +2384,8 @@ impl ClientAppV2 {
                     .color(AppColors::TEXT_SECONDARY));
                 ui.add_space(15.0);
                 
-                // Gallery grid
-                if self.my_gallery.is_empty() {
+                // Gallery grid - Two rows: Full Resolution and Pixelated Preview
+                if self.my_gallery.is_empty() && self.my_full_gallery.is_empty() {
                     egui::Frame::default()
                         .fill(AppColors::BG_CARD)
                         .rounding(Rounding::same(10.0))
@@ -2375,27 +2397,35 @@ impl ClientAppV2 {
                                 ui.label(RichText::new("Your gallery is empty")
                                     .size(18.0)
                                     .color(AppColors::TEXT_SECONDARY));
-                                ui.label(RichText::new("Add up to 5 images for others to preview")
+                                ui.label(RichText::new("Add up to 5 images to share")
                                     .color(AppColors::TEXT_SECONDARY));
                             });
                         });
                 } else {
-                    // Clone gallery data to avoid borrow issues
-                    let gallery_data: Vec<String> = self.my_gallery.clone();
-                    let num_images = gallery_data.len();
+                    let num_images = self.my_gallery.len().max(self.my_full_gallery.len());
                     
-                    // Ensure textures vec is correct size
+                    // Ensure textures vecs are correct size
                     if self.my_gallery_textures.len() != num_images {
                         self.my_gallery_textures = vec![None; num_images];
                     }
+                    if self.my_full_gallery_textures.len() != num_images {
+                        self.my_full_gallery_textures = vec![None; num_images];
+                    }
                     
-                    egui::Grid::new("my_gallery_grid")
+                    let mut remove_index: Option<usize> = None;
+                    
+                    // Row 1: Full Resolution Images
+                    ui.label(RichText::new("🔷 Full Resolution")
+                        .size(14.0)
+                        .color(AppColors::SECONDARY)
+                        .strong());
+                    ui.add_space(8.0);
+                    
+                    egui::Grid::new("full_gallery_grid")
                         .num_columns(5)
                         .spacing([10.0, 10.0])
                         .show(ui, |ui| {
-                            let mut remove_index: Option<usize> = None;
-                            
-                            for (i, data_url) in gallery_data.iter().enumerate() {
+                            for i in 0..num_images {
                                 egui::Frame::default()
                                     .fill(AppColors::BG_CARD)
                                     .rounding(Rounding::same(8.0))
@@ -2403,10 +2433,58 @@ impl ClientAppV2 {
                                     .show(ui, |ui| {
                                         ui.set_width(100.0);
                                         
-                                        // Load and display texture if not loaded
-                                        if i < self.my_gallery_textures.len() {
+                                        if i < self.my_full_gallery.len() {
+                                            let data_url = &self.my_full_gallery[i];
+                                            
+                                            if self.my_full_gallery_textures[i].is_none() {
+                                                if let Some(texture) = load_texture_from_data_url(ctx, data_url, i + 1000) {
+                                                    self.my_full_gallery_textures[i] = Some(texture);
+                                                }
+                                            }
+                                            
+                                            if let Some(texture) = &self.my_full_gallery_textures[i] {
+                                                ui.add(egui::Image::new(texture).max_size(Vec2::new(80.0, 80.0)));
+                                            } else {
+                                                ui.add_sized([80.0, 80.0], egui::Label::new(
+                                                    RichText::new("🖼️").size(30.0)
+                                                ));
+                                            }
+                                            
+                                            if ui.add(egui::Button::new("🗑️").small()).clicked() {
+                                                remove_index = Some(i);
+                                            }
+                                        } else {
+                                            ui.add_sized([80.0, 80.0], egui::Label::new(""));
+                                        }
+                                    });
+                            }
+                        });
+                    
+                    ui.add_space(15.0);
+                    
+                    // Row 2: Pixelated Preview Images
+                    ui.label(RichText::new("🔶 Pixelated Preview (64x64)")
+                        .size(14.0)
+                        .color(AppColors::WARNING)
+                        .strong());
+                    ui.add_space(8.0);
+                    
+                    egui::Grid::new("pixelated_gallery_grid")
+                        .num_columns(5)
+                        .spacing([10.0, 10.0])
+                        .show(ui, |ui| {
+                            for i in 0..num_images {
+                                egui::Frame::default()
+                                    .fill(AppColors::BG_CARD)
+                                    .rounding(Rounding::same(8.0))
+                                    .inner_margin(egui::Margin::same(8.0))
+                                    .show(ui, |ui| {
+                                        ui.set_width(100.0);
+                                        
+                                        if i < self.my_gallery.len() {
+                                            let data_url = &self.my_gallery[i];
+                                            
                                             if self.my_gallery_textures[i].is_none() {
-                                                // Try to load from data URL
                                                 if let Some(texture) = load_texture_from_data_url(ctx, data_url, i) {
                                                     self.my_gallery_textures[i] = Some(texture);
                                                 }
@@ -2419,19 +2497,17 @@ impl ClientAppV2 {
                                                     RichText::new("🖼️").size(30.0)
                                                 ));
                                             }
-                                        }
-                                        
-                                        if ui.add(egui::Button::new("🗑️").small()).clicked() {
-                                            remove_index = Some(i);
+                                        } else {
+                                            ui.add_sized([80.0, 80.0], egui::Label::new(""));
                                         }
                                     });
                             }
-                            
-                            // Handle removal
-                            if let Some(idx) = remove_index {
-                                self.remove_from_gallery(idx);
-                            }
                         });
+                    
+                    // Handle removal after rendering both rows
+                    if let Some(idx) = remove_index {
+                        self.remove_from_gallery(idx);
+                    }
                 }
                 
                 ui.add_space(20.0);
@@ -2464,6 +2540,7 @@ impl ClientAppV2 {
         let cloud_addresses = self.cloud_addresses.clone();
         let runtime = self.runtime.as_ref().unwrap().clone();
 
+        // Load pixelated gallery
         let promise = Promise::spawn_thread("load_my_gallery", move || {
             runtime.block_on(async move {
                 let client = Client::new(0, cloud_addresses);
@@ -2472,9 +2549,24 @@ impl ClientAppV2 {
         });
 
         self.my_gallery_loading = Some(promise);
+        
+        // Load full resolution gallery
+        let user_id_full = self.session.user_id.clone();
+        let runtime_full = self.runtime.as_ref().unwrap().clone();
+        
+        let promise_full = Promise::spawn_thread("load_full_gallery", move || {
+            runtime_full.block_on(async move {
+                let firebase = FireBaseClient::new();
+                firebase.get_full_gallery(&user_id_full).await
+                    .map_err(|e| e.to_string())
+            })
+        });
+        
+        self.my_full_gallery_loading = Some(promise_full);
     }
 
     fn process_my_gallery_load(&mut self) {
+        // Process pixelated gallery
         let result = if let Some(promise) = &self.my_gallery_loading {
             promise.ready().cloned()
         } else {
@@ -2492,8 +2584,33 @@ impl ClientAppV2 {
                     self.gallery_error = Some(e);
                 }
             }
-            self.my_gallery_loaded = true;
             self.my_gallery_loading = None;
+        }
+        
+        // Process full resolution gallery
+        let result_full = if let Some(promise) = &self.my_full_gallery_loading {
+            promise.ready().cloned()
+        } else {
+            None
+        };
+        
+        if let Some(res) = result_full {
+            match res {
+                Ok(full_gallery) => {
+                    self.my_full_gallery_textures = vec![None; full_gallery.len()];
+                    self.my_full_gallery = full_gallery;
+                }
+                Err(_) => {
+                    // If full gallery fails, just set empty (not critical)
+                    self.my_full_gallery = Vec::new();
+                }
+            }
+            self.my_full_gallery_loading = None;
+        }
+        
+        // Mark as loaded when both are done
+        if self.my_gallery_loading.is_none() && self.my_full_gallery_loading.is_none() {
+            self.my_gallery_loaded = true;
         }
     }
     
@@ -2526,28 +2643,44 @@ impl ClientAppV2 {
         let mut current_gallery = self.my_gallery.clone();
 
         let promise = Promise::spawn_thread("upload_gallery", move || {
-            // Read and pixelate the image
+            // Read the image
             let img = image::open(&path)
                 .map_err(|e| format!("Failed to open image: {}", e))?;
 
-            // Pixelate by reducing resolution to 64x64
+            // Create pixelated version for gallery preview (64x64)
             let pixelated = img.resize_exact(64, 64, image::imageops::FilterType::Nearest);
-            
-            // Convert to base64 for storage
-            let mut buf = Vec::new();
-            pixelated.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
-                .map_err(|e| format!("Failed to encode image: {}", e))?;
-            
-            let base64_img = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &buf);
-            let data_url = format!("data:image/png;base64,{}", base64_img);
+            let mut pixelated_buf = Vec::new();
+            pixelated.write_to(&mut std::io::Cursor::new(&mut pixelated_buf), image::ImageFormat::Png)
+                .map_err(|e| format!("Failed to encode pixelated image: {}", e))?;
+            let pixelated_base64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &pixelated_buf);
+            let pixelated_data_url = format!("data:image/png;base64,{}", pixelated_base64);
 
-            // Add to gallery
-            current_gallery.push(data_url);
+            // Create full resolution version for sending when requested
+            let mut full_buf = Vec::new();
+            img.write_to(&mut std::io::Cursor::new(&mut full_buf), image::ImageFormat::Png)
+                .map_err(|e| format!("Failed to encode full image: {}", e))?;
+            let full_base64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &full_buf);
+            let full_data_url = format!("data:image/png;base64,{}", full_base64);
+
+            // Add to both galleries
+            current_gallery.push(pixelated_data_url);
 
             let firebase = FireBaseClient::new();
             runtime.block_on(async move {
-                firebase.update_gallery(&user_id, &current_gallery).await
-                    .map_err(|e| format!("Failed to update gallery: {}", e))
+                // Get current full gallery
+                let mut full_gallery = firebase.get_full_gallery(&user_id).await.unwrap_or_default();
+                full_gallery.push(full_data_url);
+                
+                // Update both galleries in parallel
+                let (result_gallery, result_full) = tokio::join!(
+                    firebase.update_gallery(&user_id, &current_gallery),
+                    firebase.update_full_gallery(&user_id, &full_gallery)
+                );
+                
+                result_gallery.map_err(|e| format!("Failed to update gallery: {}", e))?;
+                result_full.map_err(|e| format!("Failed to update full gallery: {}", e))?;
+                
+                Ok(())
             })
         });
 
@@ -2566,8 +2699,22 @@ impl ClientAppV2 {
         let promise = Promise::spawn_thread("remove_from_gallery", move || {
             let firebase = FireBaseClient::new();
             runtime.block_on(async move {
-                firebase.update_gallery(&user_id, &current_gallery).await
-                    .map_err(|e| format!("Failed to update gallery: {}", e))
+                // Get and update full gallery too
+                let mut full_gallery = firebase.get_full_gallery(&user_id).await.unwrap_or_default();
+                if index < full_gallery.len() {
+                    full_gallery.remove(index);
+                }
+                
+                // Update both in parallel
+                let (result_gallery, result_full) = tokio::join!(
+                    firebase.update_gallery(&user_id, &current_gallery),
+                    firebase.update_full_gallery(&user_id, &full_gallery)
+                );
+                
+                result_gallery.map_err(|e| format!("Failed to update gallery: {}", e))?;
+                result_full.map_err(|e| format!("Failed to update full gallery: {}", e))?;
+                
+                Ok(())
             })
         });
 
@@ -2721,9 +2868,10 @@ impl ClientAppV2 {
                                                 }
                                             }
                                             
-                                            // Execute deferred request
+                                            // Execute deferred request - show popup instead of sending immediately
                                             if let Some((uid, uname, idx)) = request_action {
-                                                self.request_image_from_user(&uid, &uname, idx);
+                                                self.request_popup_data = Some((uid, uname, idx));
+                                                self.request_popup_quota = 1;  // Default quota
                                             }
                                         });
                                     }
@@ -2944,7 +3092,7 @@ impl ClientAppV2 {
         }
     }
     
-    fn request_image_from_user(&mut self, user_id: &str, username: &str, image_index: usize) {
+    fn request_image_from_user(&mut self, user_id: &str, username: &str, image_index: usize, quota: u8) {
         if self.request_image_in_progress.is_some() {
             return;
         }
@@ -2980,6 +3128,7 @@ impl ClientAppV2 {
                                 image_index,
                                 timestamp,
                                 status: "pending".to_string(),
+                                quota,
                             };
                             return firebase.add_image_request(&request_meta).await
                                 .map(|_| request_id.clone())
@@ -2994,7 +3143,8 @@ impl ClientAppV2 {
                         format!("{}#{}", from_username, from_user_id),
                         to_username.clone(),
                         image_index,
-                        timestamp
+                        timestamp,
+                        quota
                     ).await {
                         Ok(req_id) => Ok(req_id),
                         Err(e) => Err(format!("Failed to send request via nodes: {}", e)),
@@ -3011,6 +3161,7 @@ impl ClientAppV2 {
                         image_index,
                         timestamp,
                         status: "pending".to_string(),
+                        quota,
                     };
                     firebase.add_image_request(&request_meta).await
                         .map(|_| request_id)
@@ -3043,6 +3194,7 @@ impl ClientAppV2 {
                         timestamp: chrono::Utc::now().timestamp(),
                         status: "pending".to_string(),
                         is_incoming: false,
+                        quota: 1, // Default quota for optimistic update
                     };
                     self.image_requests.insert(0, new_request);
                 }
@@ -3089,6 +3241,7 @@ impl ClientAppV2 {
                                 timestamp: req.timestamp,
                                 status: format!("{:?}", req.status).to_lowercase(),
                                 is_incoming: true,
+                                quota: req.quota,
                             });
                         }
                         
@@ -3104,6 +3257,7 @@ impl ClientAppV2 {
                                 timestamp: req.timestamp,
                                 status: format!("{:?}", req.status).to_lowercase(),
                                 is_incoming: false,
+                                quota: req.quota,
                             });
                         }
                         
@@ -3126,8 +3280,14 @@ impl ClientAppV2 {
         };
         
         if let Some(res) = result {
-            if let Ok(requests) = res {
-                self.image_requests = requests;
+            match res {
+                Ok(requests) => {
+                    self.image_requests = requests;
+                }
+                Err(_) => {
+                    // On error, set empty list so it shows "No requests" instead of loading forever
+                    self.image_requests = Vec::new();
+                }
             }
             self.requests_loading = None;
         }
@@ -3191,6 +3351,56 @@ impl ClientAppV2 {
             self.respond_request_in_progress = None;
         }
     }
+    
+    fn delete_request(&mut self, request_id: &str) {
+        let req_id = request_id.to_string();
+        let user_id = self.session.user_id.clone();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        
+        let promise = Promise::spawn_thread("delete_request", move || {
+            runtime.block_on(async move {
+                let client = match crate::client::Client::from_firebase(0).await {
+                    Ok(c) => c,
+                    Err(e) => return Err(format!("Failed to connect to node: {}", e)),
+                };
+                
+                let message = crate::messages::Message::DeleteImageRequest {
+                    request_id: req_id.clone(),
+                    user_id,
+                };
+                
+                match client.send_with_retry(message).await {
+                    Ok(crate::messages::Message::DeleteImageRequestResponse { success, error }) => {
+                        if success {
+                            Ok(req_id)
+                        } else {
+                            Err(error.unwrap_or_else(|| "Delete failed".to_string()))
+                        }
+                    }
+                    Ok(_) => Err("Unexpected response from server".to_string()),
+                    Err(e) => Err(format!("Failed to delete: {}", e)),
+                }
+            })
+        });
+        
+        self.delete_request_in_progress = Some(promise);
+    }
+    
+    fn process_delete_request(&mut self) {
+        let result = if let Some(promise) = &self.delete_request_in_progress {
+            promise.ready().cloned()
+        } else {
+            None
+        };
+        
+        if let Some(res) = result {
+            if let Ok(request_id) = res {
+                // Remove from local list
+                self.image_requests.retain(|r| r.request_id != request_id);
+            }
+            self.delete_request_in_progress = None;
+        }
+    }
 
     // ========================================================================
     // Requests Page
@@ -3201,6 +3411,7 @@ impl ClientAppV2 {
         self.process_requests_loading();
         self.process_respond_request();
         self.process_request_image_result();
+        self.process_delete_request();
         
         ui.horizontal(|ui| {
             ui.add_space(20.0);
@@ -3268,7 +3479,10 @@ impl ClientAppV2 {
                                         .color(AppColors::TEXT_PRIMARY)
                                         .strong());
                                     
-                                    ui.label(RichText::new(format!("requests image #{}", req.image_index + 1))
+                                    ui.label(RichText::new(format!("requests image #{} ({} view{})", 
+                                        req.image_index + 1, 
+                                        req.quota,
+                                        if req.quota == 1 { "" } else { "s" }))
                                         .size(13.0)
                                         .color(AppColors::TEXT_SECONDARY));
                                     
@@ -3308,6 +3522,13 @@ impl ClientAppV2 {
                                                     .rounding(Rounding::same(4.0))).clicked() {
                                                     self.respond_to_request(&req.request_id, true);
                                                 }
+                                            }
+                                        } else if req.status == "rejected" {
+                                            // Delete button for rejected requests
+                                            if ui.add(egui::Button::new("🗑️ Delete")
+                                                .fill(AppColors::BG_SECONDARY)
+                                                .rounding(Rounding::same(4.0))).clicked() {
+                                                self.delete_request(&req.request_id);
                                             }
                                         }
                                     });
@@ -3350,7 +3571,10 @@ impl ClientAppV2 {
                                         .color(AppColors::TEXT_PRIMARY)
                                         .strong());
                                     
-                                    ui.label(RichText::new(format!("image #{}", req.image_index + 1))
+                                    ui.label(RichText::new(format!("image #{} ({} view{})", 
+                                        req.image_index + 1,
+                                        req.quota,
+                                        if req.quota == 1 { "" } else { "s" }))
                                         .size(13.0)
                                         .color(AppColors::TEXT_SECONDARY));
                                     
@@ -3364,6 +3588,17 @@ impl ClientAppV2 {
                                     ui.label(RichText::new(format!("[{}]", req.status.to_uppercase()))
                                         .size(11.0)
                                         .color(status_color));
+                                    
+                                    // Delete button for pending or rejected outgoing requests
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if req.status == "pending" || req.status == "rejected" {
+                                            if ui.add(egui::Button::new("🗑️ Delete")
+                                                .fill(AppColors::BG_SECONDARY)
+                                                .rounding(Rounding::same(4.0))).clicked() {
+                                                self.delete_request(&req.request_id);
+                                            }
+                                        }
+                                    });
                                 });
                                 
                                 // Timestamp
@@ -3725,6 +3960,98 @@ impl ClientAppV2 {
         }
     }
 
+    // ========================================================================
+    // Image Request Popup
+    // ========================================================================
+    
+    fn render_request_popup(&mut self, ctx: &egui::Context) {
+        if self.request_popup_data.is_none() {
+            return;
+        }
+        
+        let mut should_close = false;
+        let mut should_send = false;
+        
+        egui::Window::new("Request Image")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(350.0)
+            .show(ctx, |ui| {
+                if let Some((_, username, image_index)) = &self.request_popup_data {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(10.0);
+                        
+                        ui.label(RichText::new(format!("Request Image #{} from {}", image_index + 1, username))
+                            .size(16.0)
+                            .color(AppColors::TEXT_PRIMARY)
+                            .strong());
+                        
+                        ui.add_space(20.0);
+                        
+                        ui.label(RichText::new("Select view quota:")
+                            .size(14.0)
+                            .color(AppColors::TEXT_SECONDARY));
+                        
+                        ui.add_space(10.0);
+                        
+                        // Quota selector
+                        ui.horizontal(|ui| {
+                            if ui.button("➖").clicked() && self.request_popup_quota > 1 {
+                                self.request_popup_quota -= 1;
+                            }
+                            
+                            ui.label(RichText::new(format!(" {} view{} ", 
+                                self.request_popup_quota,
+                                if self.request_popup_quota == 1 { "" } else { "s" }
+                            ))
+                                .size(18.0)
+                                .color(AppColors::PRIMARY)
+                                .strong());
+                            
+                            if ui.button("➕").clicked() && self.request_popup_quota < 99 {
+                                self.request_popup_quota += 1;
+                            }
+                        });
+                        
+                        ui.add_space(20.0);
+                        
+                        // Buttons
+                        ui.horizontal(|ui| {
+                            if ui.add(egui::Button::new("Cancel")
+                                .fill(AppColors::BG_SECONDARY)
+                                .rounding(Rounding::same(6.0))
+                                .min_size(Vec2::new(100.0, 35.0))).clicked() {
+                                should_close = true;
+                            }
+                            
+                            ui.add_space(10.0);
+                            
+                            if ui.add(egui::Button::new("Send Request")
+                                .fill(AppColors::PRIMARY)
+                                .rounding(Rounding::same(6.0))
+                                .min_size(Vec2::new(100.0, 35.0))).clicked() {
+                                should_send = true;
+                            }
+                        });
+                        
+                        ui.add_space(10.0);
+                    });
+                }
+            });
+        
+        if should_close {
+            self.request_popup_data = None;
+        }
+        
+        if should_send {
+            if let Some((user_id, username, image_index)) = self.request_popup_data.take() {
+                let quota = self.request_popup_quota;
+                self.request_image_from_user(&user_id, &username, image_index, quota);
+            }
+        }
+    }
+    
     // ========================================================================
     // Image Viewer Popup
     // ========================================================================

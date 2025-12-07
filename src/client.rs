@@ -612,6 +612,7 @@ impl Client {
         to_username: String,
         image_index: usize,
         timestamp: i64,
+        quota: u8,
     ) -> Result<String, String> {
         let message = Message::RequestImage {
             request_id: request_id.clone(),
@@ -621,10 +622,11 @@ impl Client {
             to_username: to_username.clone(),
             image_index,
             timestamp,
+            quota,
         };
 
-        info!("[Client {}] Sending image request {} from {} to {} for image #{} (replicating to {} nodes)",
-              self.id, request_id, from_username, to_username, image_index, self.cloud_addresses.len());
+        info!("[Client {}] Sending image request {} from {} to {} for image #{} with quota {} (replicating to {} nodes)",
+              self.id, request_id, from_username, to_username, image_index, quota, self.cloud_addresses.len());
 
         let mut success_count = 0;
         let mut last_error = String::new();
