@@ -225,6 +225,57 @@ pub enum Message {
         images: Vec<String>,
         error: Option<String>,
     },
+    
+    // Image request messages
+    RequestImage {
+        request_id: String,
+        from_user_id: String,
+        from_username: String,
+        to_user_id: String,
+        to_username: String,
+        image_index: usize,  // Index in gallery (0-4)
+        timestamp: i64,
+    },
+    RequestImageResponse {
+        success: bool,
+        request_id: String,
+        error: Option<String>,
+    },
+    GetImageRequests {
+        user_id: String,
+    },
+    GetImageRequestsResponse {
+        incoming: Vec<ImageRequestInfo>,  // Requests TO you
+        outgoing: Vec<ImageRequestInfo>,  // Requests FROM you
+    },
+    RespondToImageRequest {
+        request_id: String,
+        user_id: String,  // User responding
+        accepted: bool,
+    },
+    RespondToImageRequestResponse {
+        success: bool,
+        error: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageRequestInfo {
+    pub request_id: String,
+    pub from_user_id: String,
+    pub from_username: String,
+    pub to_user_id: String,
+    pub to_username: String,
+    pub image_index: usize,
+    pub timestamp: i64,
+    pub status: RequestStatus,  // pending, accepted, rejected
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum RequestStatus {
+    Pending,
+    Accepted,
+    Rejected,
 }
 
 impl fmt::Display for Message {
@@ -340,6 +391,24 @@ impl fmt::Display for Message {
             }
             Message::GetUserGalleryResponse { success, images, .. } => {
                 write!(f, "GET_USER_GALLERY_RESPONSE (success: {}, {} images)", success, images.len())
+            }
+            Message::RequestImage { request_id, from_username, to_username, image_index, .. } => {
+                write!(f, "REQUEST_IMAGE {} from {} to {} (image #{})", request_id, from_username, to_username, image_index)
+            }
+            Message::RequestImageResponse { success, request_id, .. } => {
+                write!(f, "REQUEST_IMAGE_RESPONSE {} (success: {})", request_id, success)
+            }
+            Message::GetImageRequests { user_id } => {
+                write!(f, "GET_IMAGE_REQUESTS user_id: {}", user_id)
+            }
+            Message::GetImageRequestsResponse { incoming, outgoing } => {
+                write!(f, "GET_IMAGE_REQUESTS_RESPONSE ({} incoming, {} outgoing)", incoming.len(), outgoing.len())
+            }
+            Message::RespondToImageRequest { request_id, accepted, .. } => {
+                write!(f, "RESPOND_TO_IMAGE_REQUEST {} (accepted: {})", request_id, accepted)
+            }
+            Message::RespondToImageRequestResponse { success, .. } => {
+                write!(f, "RESPOND_TO_IMAGE_REQUEST_RESPONSE (success: {})", success)
             }
         }
     }

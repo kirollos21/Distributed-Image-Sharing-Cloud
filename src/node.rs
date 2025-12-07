@@ -894,6 +894,196 @@ impl CloudNode {
                 }
             }
 
+            Message::RequestImage {
+                request_id,
+                from_user_id,
+                from_username,
+                to_user_id,
+                to_username,
+                image_index,
+                timestamp,
+            } => {
+                let firebase = FireBaseClient::new();
+                
+                let request_meta = crate::firebase::ImageRequestMeta {
+                    request_id: request_id.clone(),
+                    from_user_id: from_user_id.clone(),
+                    from_username: from_username.clone(),
+                    to_user_id: to_user_id.clone(),
+                    to_username: to_username.clone(),
+                    image_index,
+                    timestamp,
+                    status: "pending".to_string(),
+                };
+                
+                match firebase.add_image_request(&request_meta).await {
+                    Ok(_) => {
+                        info!("[Node {}] Stored image request {} from {} to {}", 
+                              self.id, request_id, from_username, to_username);
+                        
+                        // If recipient is online, try to forward the request directly
+                        match firebase.get_user_ip(&to_user_id).await {
+                            Ok(Some(ip_str)) => {
+                                match firebase.get_user_status(&to_user_id).await {
+                                    Ok(status) => {
+                                        if matches!(status, crate::firebase::UserStatus::Online) {
+                                            if let Ok(addr) = ip_str.parse::<SocketAddr>() {
+                                                let push_msg = Message::RequestImage {
+                                                    request_id: request_id.clone(),
+                                                    from_user_id: from_user_id.clone(),
+                                                    from_username: from_username.clone(),
+                                                    to_user_id: to_user_id.clone(),
+                                                    to_username: to_username.clone(),
+                                                    image_index,
+                                                    timestamp,
+                                                };
+                                                
+                                                match self.send_response_to_client(addr, push_msg).await {
+                                                    Ok(()) => {
+                                                        info!("[Node {}] Forwarded image request {} to online user {} at {}", 
+                                                              self.id, request_id, to_user_id, ip_str);
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("[Node {}] Failed to forward request {} to {} at {}: {}", 
+                                                              self.id, request_id, to_user_id, ip_str, e);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("[Node {}] Failed to fetch user status for {}: {}", self.id, to_user_id, e);
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                debug!("[Node {}] No IP recorded for recipient {} in Firebase", self.id, to_user_id);
+                            }
+                            Err(e) => {
+                                warn!("[Node {}] Error fetching recipient IP for {}: {}", self.id, to_user_id, e);
+                            }
+                        }
+                        
+                        Some(Message::RequestImageResponse {
+                            success: true,
+                            request_id,
+                            error: None,
+                        })
+                    }
+                    Err(e) => {
+                        error!("[Node {}] Failed to store image request {}: {}", 
+                               self.id, request_id, e);
+                        Some(Message::RequestImageResponse {
+                            success: false,
+                            request_id,
+                            error: Some(format!("Failed to store request: {}", e)),
+                        })
+                    }
+                }
+            }
+
+            Message::GetImageRequests { user_id } => {
+                let firebase = FireBaseClient::new();
+                
+                let incoming = match firebase.get_incoming_image_requests(&user_id).await {
+                    Ok(reqs) => reqs.into_iter().map(|r| crate::messages::ImageRequestInfo {
+                        request_id: r.request_id,
+                        from_user_id: r.from_user_id,
+                        from_username: r.from_username,
+                        to_user_id: r.to_user_id,
+                        to_username: r.to_username,
+                        image_index: r.image_index,
+                        timestamp: r.timestamp,
+                        status: match r.status.as_str() {
+                            "accepted" => crate::messages::RequestStatus::Accepted,
+                            "rejected" => crate::messages::RequestStatus::Rejected,
+                            _ => crate::messages::RequestStatus::Pending,
+                        },
+                    }).collect(),
+                    Err(e) => {
+                        warn!("[Node {}] Failed to fetch incoming requests for {}: {}", 
+                              self.id, user_id, e);
+                        vec![]
+                    }
+                };
+                
+                let outgoing = match firebase.get_outgoing_image_requests(&user_id).await {
+                    Ok(reqs) => reqs.into_iter().map(|r| crate::messages::ImageRequestInfo {
+                        request_id: r.request_id,
+                        from_user_id: r.from_user_id,
+                        from_username: r.from_username,
+                        to_user_id: r.to_user_id,
+                        to_username: r.to_username,
+                        image_index: r.image_index,
+                        timestamp: r.timestamp,
+                        status: match r.status.as_str() {
+                            "accepted" => crate::messages::RequestStatus::Accepted,
+                            "rejected" => crate::messages::RequestStatus::Rejected,
+                            _ => crate::messages::RequestStatus::Pending,
+                        },
+                    }).collect(),
+                    Err(e) => {
+                        warn!("[Node {}] Failed to fetch outgoing requests for {}: {}", 
+                              self.id, user_id, e);
+                        vec![]
+                    }
+                };
+                
+                Some(Message::GetImageRequestsResponse {
+                    incoming,
+                    outgoing,
+                })
+            }
+
+            Message::RespondToImageRequest {
+                request_id,
+                user_id,
+                accepted,
+            } => {
+                let firebase = FireBaseClient::new();
+                let status = if accepted { "accepted" } else { "rejected" };
+                
+                // First, get the request to find the from_user_id and to_user_id
+                // We need to determine which user is responding
+                let mut from_id = String::new();
+                let mut to_id = String::new();
+                
+                // Check incoming requests (user_id is the recipient)
+                if let Ok(incoming) = firebase.get_incoming_image_requests(&user_id).await {
+                    if let Some(req) = incoming.iter().find(|r| r.request_id == request_id) {
+                        from_id = req.from_user_id.clone();
+                        to_id = user_id.clone();
+                    }
+                }
+                
+                if from_id.is_empty() {
+                    // Not found, return error
+                    return Some(Message::RespondToImageRequestResponse {
+                        success: false,
+                        error: Some("Request not found".to_string()),
+                    });
+                }
+                
+                match firebase.update_image_request_status(&from_id, &to_id, &request_id, status).await {
+                    Ok(_) => {
+                        info!("[Node {}] Updated request {} status to {}", 
+                              self.id, request_id, status);
+                        Some(Message::RespondToImageRequestResponse {
+                            success: true,
+                            error: None,
+                        })
+                    }
+                    Err(e) => {
+                        error!("[Node {}] Failed to update request {} status: {}", 
+                               self.id, request_id, e);
+                        Some(Message::RespondToImageRequestResponse {
+                            success: false,
+                            error: Some(format!("Failed to update request: {}", e)),
+                        })
+                    }
+                }
+            }
+
             Message::CheckUsernameAvailable { username } => {
                 // username is in format "name#id" (e.g., "potato#2")
                 // We need to check if the user ID exists AND the username matches

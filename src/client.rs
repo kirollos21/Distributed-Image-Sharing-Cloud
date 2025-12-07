@@ -82,18 +82,22 @@ impl Client {
                 sleep(Duration::from_millis(500)).await; // Brief pause before retry
             }
             
-            // Try each node sequentially
+            // Try each node sequentially, with 2 attempts per node
             for (i, address) in self.cloud_addresses.iter().enumerate() {
-                debug!("[Client {}] Trying node {} at {}", self.id, i + 1, address);
-                
-                match Self::send_to_node(self.id, address, message.clone()).await {
-                    Ok(response) => {
-                        debug!("[Client {}] Got response from node {}", self.id, i + 1);
-                        return Ok(response);
-                    }
-                    Err(e) => {
-                        warn!("[Client {}] Node {} ({}) failed: {}", self.id, i + 1, address, e);
-                        continue; // Try next node
+                for attempt in 1..=2 {
+                    debug!("[Client {}] Trying node {} at {} (attempt {})", self.id, i + 1, address, attempt);
+                    
+                    match Self::send_to_node(self.id, address, message.clone()).await {
+                        Ok(response) => {
+                            debug!("[Client {}] Got response from node {} on attempt {}", self.id, i + 1, attempt);
+                            return Ok(response);
+                        }
+                        Err(e) => {
+                            warn!("[Client {}] Node {} ({}) failed on attempt {}: {}", self.id, i + 1, address, attempt, e);
+                            if attempt == 1 {
+                                sleep(Duration::from_millis(100)).await; // Brief pause before retry
+                            }
+                        }
                     }
                 }
             }
@@ -119,25 +123,26 @@ impl Client {
         info!("[Client {}] Registering username: {}", self.id, username);
         info!("[Client {}] Trying {} cloud nodes...", self.id, self.cloud_addresses.len());
 
-        // Try to register with any available node
+        // Try to register with any available node, 2 attempts per node
         let mut last_error = String::new();
         for (i, address) in self.cloud_addresses.iter().enumerate() {
-            info!("[Client {}] Attempting connection to node {}/{}: {}", self.id, i + 1, self.cloud_addresses.len(), address);
+            for attempt in 1..=2 {
+                info!("[Client {}] Attempting connection to node {}/{}: {} (attempt {})", self.id, i + 1, self.cloud_addresses.len(), address, attempt);
 
-            match Self::send_to_node(self.id, address, message.clone()).await {
-                Ok(Message::SessionRegisterResponse { success, error }) => {
-                    if success {
-                        info!("[Client {}] Successfully registered username: {}", self.id, username);
-                        return Ok(());
-                    } else {
-                        let err_msg = error.unwrap_or_else(|| "Registration failed".to_string());
-                        error!("[Client {}] Node {} rejected registration: {}", self.id, address, err_msg);
-                        return Err(err_msg);
+                match Self::send_to_node(self.id, address, message.clone()).await {
+                    Ok(Message::SessionRegisterResponse { success, error }) => {
+                        if success {
+                            info!("[Client {}] Successfully registered username: {}", self.id, username);
+                            return Ok(());
+                        } else {
+                            let err_msg = error.unwrap_or_else(|| "Registration failed".to_string());
+                            error!("[Client {}] Node {} rejected registration: {}", self.id, address, err_msg);
+                            return Err(err_msg);
+                        }
                     }
-                }
-                Ok(_) => {
-                    let err_msg = "Unexpected response from server".to_string();
-                    error!("[Client {}] Node {} sent unexpected response", self.id, address);
+                    Ok(_) => {
+                        let err_msg = "Unexpected response from server".to_string();
+                        error!("[Client {}] Node {} sent unexpected response", self.id, address);
                     return Err(err_msg);
                 }
                 Err(e) => {
@@ -436,14 +441,18 @@ impl Client {
         let message = Message::GetUserList;
 
         for address in &self.cloud_addresses {
-            match Self::send_to_node(self.id, address, message.clone()).await {
-                Ok(Message::GetUserListResponse { users }) => {
-                    return Ok(users);
-                }
-                Ok(_) => continue,
-                Err(e) => {
-                    warn!("[Client {}] Failed to get user list via {}: {}", self.id, address, e);
-                    continue;
+            for attempt in 1..=2 {
+                match Self::send_to_node(self.id, address, message.clone()).await {
+                    Ok(Message::GetUserListResponse { users }) => {
+                        return Ok(users);
+                    }
+                    Ok(_) => continue,
+                    Err(e) => {
+                        warn!("[Client {}] Failed to get user list via {} (attempt {}): {}", self.id, address, attempt, e);
+                        if attempt == 1 {
+                            sleep(Duration::from_millis(100)).await;
+                        }
+                    }
                 }
             }
         }
@@ -456,18 +465,24 @@ impl Client {
         let message = Message::GetUserInfo { user_id };
 
         for address in &self.cloud_addresses {
-            match Self::send_to_node(self.id, address, message.clone()).await {
-                Ok(Message::GetUserInfoResponse { success, user_info, .. }) => {
-                    if success {
-                        return Ok(user_info);
-                    } else {
-                        return Ok(None);
+            for attempt in 1..=2 {
+                match Self::send_to_node(self.id, address, message.clone()).await {
+                    Ok(Message::GetUserInfoResponse { success, user_info, .. }) => {
+                        if success {
+                            return Ok(user_info);
+                        } else {
+                            return Ok(None);
+                        }
+                    }
+                    Ok(_) => continue,
+                    Err(e) => {
+                        warn!("[Client {}] Failed to get user info via {} (attempt {}): {}", self.id, address, attempt, e);
+                        if attempt == 1 {
+                            sleep(Duration::from_millis(100)).await;
+                        }
                     }
                 }
-                Ok(_) => continue,
-                Err(e) => {
-                    warn!("[Client {}] Failed to get user info via {}: {}", self.id, address, e);
-                    continue;
+            }
                 }
             }
         }
@@ -480,19 +495,24 @@ impl Client {
         let message = Message::GetUserGallery { user_id };
 
         for address in &self.cloud_addresses {
-            match Self::send_to_node(self.id, address, message.clone()).await {
-                Ok(Message::GetUserGalleryResponse { success, images, error }) => {
-                    if success {
-                        return Ok(images);
-                    } else {
-                        return Err(error.unwrap_or_else(|| "Failed to get gallery".to_string()));
+            for attempt in 1..=2 {
+                match Self::send_to_node(self.id, address, message.clone()).await {
+                    Ok(Message::GetUserGalleryResponse { success, images, error }) => {
+                        if success {
+                            return Ok(images);
+                        } else {
+                            return Err(error.unwrap_or_else(|| "Failed to get gallery".to_string()));
+                        }
+                    }
+                    Ok(_) => continue,
+                    Err(e) => {
+                        warn!("[Client {}] Failed to get gallery via {} (attempt {}): {}", self.id, address, attempt, e);
+                        if attempt == 1 {
+                            sleep(Duration::from_millis(100)).await;
+                        }
                     }
                 }
-                Ok(_) => continue,
-                Err(e) => {
-                    warn!("[Client {}] Failed to get gallery via {}: {}", self.id, address, e);
-                    continue;
-                }
+            }
             }
         }
 
@@ -505,19 +525,24 @@ impl Client {
             username: username.clone(),
         };
 
-        // Try to check with any available node
+        // Try to check with any available node, 2 attempts per node
         for address in &self.cloud_addresses {
-            match Self::send_to_node(self.id, address, message.clone()).await {
-                Ok(Message::CheckUsernameAvailableResponse { is_available, .. }) => {
-                    return Ok(is_available);
+            for attempt in 1..=2 {
+                match Self::send_to_node(self.id, address, message.clone()).await {
+                    Ok(Message::CheckUsernameAvailableResponse { is_available, .. }) => {
+                        return Ok(is_available);
+                    }
+                    Ok(_) => {
+                        return Err("Unexpected response from server".to_string());
+                    }
+                    Err(e) => {
+                        warn!("[Client {}] Failed to check with {} (attempt {}): {}", self.id, address, attempt, e);
+                        if attempt == 1 {
+                            sleep(Duration::from_millis(100)).await;
+                        }
+                    }
                 }
-                Ok(_) => {
-                    return Err("Unexpected response from server".to_string());
-                }
-                Err(e) => {
-                    warn!("[Client {}] Failed to check with {}: {}", self.id, address, e);
-                    continue;
-                }
+            }
             }
         }
 

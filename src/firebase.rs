@@ -424,6 +424,60 @@ impl FireBaseClient {
         self.client.delete(&url).send().await?;
         Ok(())
     }
+    
+    // ==================== IMAGE REQUESTS OPERATIONS ====================
+    
+    /// Store an image request in Firebase
+    pub async fn add_image_request(&self, request: &ImageRequestMeta) -> Result<(), reqwest::Error> {
+        // Store in both users' request lists
+        let url_from = format!("{}/image_requests/{}/outgoing/{}.json", 
+            self.base_url, request.from_user_id, request.request_id);
+        self.client.put(&url_from).json(request).send().await?;
+        
+        let url_to = format!("{}/image_requests/{}/incoming/{}.json", 
+            self.base_url, request.to_user_id, request.request_id);
+        self.client.put(&url_to).json(request).send().await?;
+        
+        Ok(())
+    }
+    
+    /// Get all incoming image requests for a user
+    pub async fn get_incoming_image_requests(&self, user_id: &str) -> Result<Vec<ImageRequestMeta>, reqwest::Error> {
+        let url = format!("{}/image_requests/{}/incoming.json", self.base_url, user_id);
+        let resp = self.client.get(&url).send().await?;
+        let requests_map = resp.json::<Option<HashMap<String, ImageRequestMeta>>>().await?;
+        
+        match requests_map {
+            Some(map) => Ok(map.into_values().collect()),
+            None => Ok(vec![]),
+        }
+    }
+    
+    /// Get all outgoing image requests for a user
+    pub async fn get_outgoing_image_requests(&self, user_id: &str) -> Result<Vec<ImageRequestMeta>, reqwest::Error> {
+        let url = format!("{}/image_requests/{}/outgoing.json", self.base_url, user_id);
+        let resp = self.client.get(&url).send().await?;
+        let requests_map = resp.json::<Option<HashMap<String, ImageRequestMeta>>>().await?;
+        
+        match requests_map {
+            Some(map) => Ok(map.into_values().collect()),
+            None => Ok(vec![]),
+        }
+    }
+    
+    /// Update an image request status
+    pub async fn update_image_request_status(&self, from_user_id: &str, to_user_id: &str, request_id: &str, status: &str) -> Result<(), reqwest::Error> {
+        // Update in both users' lists
+        let url_from = format!("{}/image_requests/{}/outgoing/{}/status.json", 
+            self.base_url, from_user_id, request_id);
+        self.client.put(&url_from).json(&status).send().await?;
+        
+        let url_to = format!("{}/image_requests/{}/incoming/{}/status.json", 
+            self.base_url, to_user_id, request_id);
+        self.client.put(&url_to).json(&status).send().await?;
+        
+        Ok(())
+    }
 }
 
 /// Metadata for received images stored in Firebase
@@ -444,4 +498,17 @@ pub struct NoteMeta {
     pub from_user: String,
     pub content: String,
     pub timestamp: i64,
+}
+
+/// Metadata for image requests stored in Firebase
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageRequestMeta {
+    pub request_id: String,
+    pub from_user_id: String,
+    pub from_username: String,
+    pub to_user_id: String,
+    pub to_username: String,
+    pub image_index: usize,
+    pub timestamp: i64,
+    pub status: String,  // "pending", "accepted", "rejected"
 }

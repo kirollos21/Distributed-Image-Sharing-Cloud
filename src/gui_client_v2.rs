@@ -25,6 +25,7 @@ pub enum Page {
     Notes,       // Text notes from other users (synced)
     MyGallery,   // Your public gallery (up to 5 pixelated images)
     BrowseUsers, // Search users and see their galleries
+    Requests,    // Image requests (incoming and outgoing)
     Settings,
 }
 
@@ -94,6 +95,13 @@ pub struct ClientAppV2 {
     search_gallery_textures: std::collections::HashMap<String, Vec<egui::TextureHandle>>,  // user_id -> textures
     note_input: std::collections::HashMap<String, String>,  // user_id -> note text input
     send_note_in_progress: Option<Promise<Result<String, String>>>,  // Returns recipient user_id on success
+    request_image_in_progress: Option<Promise<Result<String, String>>>,  // Returns request_id on success
+    
+    // Requests state
+    image_requests: Vec<ImageRequest>,  // All requests (incoming and outgoing)
+    requests_loading: Option<Promise<Result<Vec<ImageRequest>, String>>>,
+    respond_request_in_progress: Option<Promise<Result<String, String>>>,  // Returns request_id on success
+    incoming_request_rx: Option<mpsc::Receiver<ImageRequest>>,  // Incoming requests from UDP listener
     
     // Notes state
     notes: Vec<NoteMeta>,
@@ -146,6 +154,19 @@ pub struct UserSearchResult {
     pub status: String,
     pub last_seen: i64,
     pub gallery: Vec<String>,  // Base64 data URLs of pixelated gallery images
+}
+
+#[derive(Clone)]
+pub struct ImageRequest {
+    pub request_id: String,
+    pub from_user_id: String,
+    pub from_username: String,
+    pub to_user_id: String,
+    pub to_username: String,
+    pub image_index: usize,
+    pub timestamp: i64,
+    pub status: String,  // "pending", "accepted", "rejected"
+    pub is_incoming: bool,  // true if this is a request TO me, false if FROM me
 }
 
 // ============================================================================
@@ -255,6 +276,11 @@ impl ClientAppV2 {
             search_gallery_textures: std::collections::HashMap::new(),
             note_input: std::collections::HashMap::new(),
             send_note_in_progress: None,
+            request_image_in_progress: None,
+            image_requests: Vec::new(),
+            requests_loading: None,
+            respond_request_in_progress: None,
+            incoming_request_rx: None,
             notes: Vec::new(),
             notes_loading: None,
             note_delete_in_progress: None,
@@ -311,6 +337,7 @@ impl ClientAppV2 {
         eprintln!("[SETUP] Setting up UDP listeners...");
         let (note_tx, note_rx) = mpsc::channel::<NoteMeta>();
         let (image_tx, image_rx) = mpsc::channel::<ReceivedImageMeta>();
+        let (request_tx, request_rx) = mpsc::channel::<ImageRequest>();
         let mut local_addr = get_local_ip();
         eprintln!("[SETUP] Attempting to bind UDP on 0.0.0.0:8009...");
         if let Ok(sock) = std::net::UdpSocket::bind(("0.0.0.0", 8009)) {
@@ -321,6 +348,7 @@ impl ClientAppV2 {
             }
             let note_tx_clone = note_tx.clone();
             let image_tx_clone = image_tx.clone();
+            let request_tx_clone = request_tx.clone();
             std::thread::spawn(move || {
                 eprintln!("[UDP LISTENER PORT 8009] Started");
                 let mut buf = [0u8; 65536];
@@ -366,6 +394,21 @@ impl ClientAppV2 {
                                                     eprintln!("[UDP 8009] Channel send FAILED");
                                                 }
                                             }
+                                            Message::RequestImage { request_id, from_user_id, from_username, to_user_id, to_username, image_index, timestamp } => {
+                                                eprintln!("[UDP 8009] RequestImage from {} for image #{}", from_username, image_index);
+                                                let request = ImageRequest {
+                                                    request_id,
+                                                    from_user_id,
+                                                    from_username,
+                                                    to_user_id,
+                                                    to_username,
+                                                    image_index,
+                                                    timestamp,
+                                                    status: "pending".to_string(),
+                                                    is_incoming: true,
+                                                };
+                                                let _ = request_tx_clone.send(request);
+                                            }
                                             _ => {}
                                         }
                                     }
@@ -401,6 +444,21 @@ impl ClientAppV2 {
                                                     eprintln!("[UDP 8009 DIRECT] Channel send FAILED");
                                                 }
                                     }
+                                    Message::RequestImage { request_id, from_user_id, from_username, to_user_id, to_username, image_index, timestamp } => {
+                                        eprintln!("[UDP 8009 DIRECT] RequestImage from {} for image #{}", from_username, image_index);
+                                        let request = ImageRequest {
+                                            request_id,
+                                            from_user_id,
+                                            from_username,
+                                            to_user_id,
+                                            to_username,
+                                            image_index,
+                                            timestamp,
+                                            status: "pending".to_string(),
+                                            is_incoming: true,
+                                        };
+                                        let _ = request_tx_clone.send(request);
+                                    }
                                     _ => {}
                                 }
                             } else {
@@ -416,6 +474,7 @@ impl ClientAppV2 {
             });
             self.incoming_note_rx = Some(note_rx);
             self.incoming_image_rx = Some(image_rx);
+            self.incoming_request_rx = Some(request_rx);
             eprintln!("[SETUP] UDP listener thread spawned on port 8009");
         } else if let Ok(sock) = std::net::UdpSocket::bind(("0.0.0.0", 0)) {
             eprintln!("[SETUP] Port 8009 failed, using ephemeral port");
@@ -424,6 +483,7 @@ impl ClientAppV2 {
             }
             let note_tx_clone = note_tx.clone();
             let image_tx_clone = image_tx.clone();
+            let request_tx_clone = request_tx.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 65536];
                 let mut reassembler = ChunkReassembler::new();
@@ -457,6 +517,20 @@ impl ClientAppV2 {
                                                     encrypted_data_base64: base64::engine::general_purpose::STANDARD.encode(&encrypted_image),
                                                 };
                                                 let _ = image_tx_clone.send(image_meta);
+                                            }
+                                            Message::RequestImage { request_id, from_user_id, from_username, to_user_id, to_username, image_index, timestamp } => {
+                                                let request = ImageRequest {
+                                                    request_id,
+                                                    from_user_id,
+                                                    from_username,
+                                                    to_user_id,
+                                                    to_username,
+                                                    image_index,
+                                                    timestamp,
+                                                    status: "pending".to_string(),
+                                                    is_incoming: true,
+                                                };
+                                                let _ = request_tx_clone.send(request);
                                             }
                                             _ => {}
                                         }
@@ -499,6 +573,7 @@ impl ClientAppV2 {
             });
             self.incoming_note_rx = Some(note_rx);
             self.incoming_image_rx = Some(image_rx);
+            self.incoming_request_rx = Some(request_rx);
             eprintln!("[SETUP] UDP listener thread spawned on ephemeral port");
         } else {
             eprintln!("Failed to bind UDP listener on default and ephemeral ports");
@@ -1043,6 +1118,15 @@ impl eframe::App for ClientAppV2 {
                 while let Ok(note) = rx.try_recv() {
                     // Prepend to notes list so newest appear first
                     self.notes.insert(0, note);
+                }
+            }
+            
+            // Process incoming image requests from UDP listener (direct delivery)
+            if let Some(rx) = &self.incoming_request_rx {
+                while let Ok(request) = rx.try_recv() {
+                    eprintln!("[DEBUG] Received image request via UDP: {} from {}", request.request_id, request.from_username);
+                    // Prepend to requests list so newest appear first
+                    self.image_requests.insert(0, request);
                 }
             }
 
@@ -1642,6 +1726,7 @@ impl ClientAppV2 {
                 Page::Notes => self.render_notes_page(ui, ctx),
                 Page::MyGallery => self.render_my_gallery_page(ui, ctx),
                 Page::BrowseUsers => self.render_browse_users_page(ui, ctx),
+                Page::Requests => self.render_requests_page(ui, ctx),
                 Page::Settings => self.render_settings_page(ui, ctx),
             }
         });
@@ -1691,6 +1776,7 @@ impl ClientAppV2 {
                 (Page::Notes, "📝", "Notes"),
                 (Page::MyGallery, "🖼️", "Gallery"),
                 (Page::BrowseUsers, "👥", "Browse"),
+                (Page::Requests, "🔔", "Requests"),
                 (Page::Settings, "⚙️", "Settings"),
             ];
             
@@ -2170,7 +2256,7 @@ impl ClientAppV2 {
                                             AppColors::ERROR 
                                         };
                                         ui.add_space(2.0);
-                                        ui.label(RichText::new(format!("Views: {}/{}", remaining_views, max_views))
+                                        ui.label(RichText::new(format!("Views: {}/{}", remaining_views - 1, max_views - 1))
                                             .size(11.0)
                                             .color(views_color));
                                         
@@ -2251,6 +2337,9 @@ impl ClientAppV2 {
                 
                 // Process loading result
                 self.process_my_gallery_load();
+                
+                // Process upload result
+                self.process_gallery_upload();
                 
                 // Show loading spinner
                 if self.my_gallery_loading.is_some() {
@@ -2405,6 +2494,29 @@ impl ClientAppV2 {
             }
             self.my_gallery_loaded = true;
             self.my_gallery_loading = None;
+        }
+    }
+    
+    fn process_gallery_upload(&mut self) {
+        let result = if let Some(promise) = &self.gallery_upload_in_progress {
+            promise.ready().cloned()
+        } else {
+            None
+        };
+
+        if let Some(res) = result {
+            match res {
+                Ok(_) => {
+                    // Upload successful, reload the gallery to show new image
+                    self.my_gallery_loaded = false;
+                    self.gallery_error = None;
+                    self.load_my_gallery();
+                }
+                Err(e) => {
+                    self.gallery_error = Some(format!("Upload failed: {}", e));
+                }
+            }
+            self.gallery_upload_in_progress = None;
         }
     }
 
@@ -2589,12 +2701,22 @@ impl ClientAppV2 {
                                             
                                             // Display cached textures
                                             if let Some(textures) = self.search_gallery_textures.get(&user_id) {
-                                                for texture in textures.iter().take(5) {
-                                                    let size = Vec2::new(60.0, 60.0);
-                                                    let image = egui::Image::new(texture)
-                                                        .fit_to_exact_size(size)
-                                                        .rounding(Rounding::same(4.0));
-                                                    ui.add(image);
+                                                for (idx, texture) in textures.iter().take(5).enumerate() {
+                                                    ui.vertical(|ui| {
+                                                        let size = Vec2::new(60.0, 60.0);
+                                                        let image = egui::Image::new(texture)
+                                                            .fit_to_exact_size(size)
+                                                            .rounding(Rounding::same(4.0));
+                                                        
+                                                        if ui.add(egui::ImageButton::new(image)).clicked() {
+                                                            // Request this image
+                                                            self.request_image_from_user(&user_id, &user.username, idx);
+                                                        }
+                                                        
+                                                        ui.label(RichText::new(format!("#{}", idx + 1))
+                                                            .size(9.0)
+                                                            .color(AppColors::TEXT_SECONDARY));
+                                                    });
                                                 }
                                             }
                                         });
@@ -2814,6 +2936,387 @@ impl ClientAppV2 {
                 self.search_in_progress = None;
             }
         }
+    }
+    
+    fn request_image_from_user(&mut self, user_id: &str, username: &str, image_index: usize) {
+        if self.request_image_in_progress.is_some() {
+            return;
+        }
+        
+        let from_user_id = self.session.user_id.clone();
+        let from_username = self.session.username.clone();
+        let to_user_id = user_id.to_string();
+        let to_username = username.to_string();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        
+        let promise = Promise::spawn_thread("request_image", move || {
+            runtime.block_on(async move {
+                let request_id = format!("req_{}_{}", chrono::Utc::now().timestamp_millis(), rand::random::<u16>());
+                let timestamp = chrono::Utc::now().timestamp();
+                
+                let client = match crate::client::Client::from_firebase(0).await {
+                    Ok(c) => c,
+                    Err(e) => return Err(format!("Failed to connect to node: {}", e)),
+                };
+                
+                let message = crate::messages::Message::RequestImage {
+                    request_id: request_id.clone(),
+                    from_user_id: from_user_id.clone(),
+                    from_username: from_username.clone(),
+                    to_user_id: to_user_id.clone(),
+                    to_username: to_username.clone(),
+                    image_index,
+                    timestamp,
+                };
+                
+                match client.send_request(message).await {
+                    Ok(crate::messages::Message::RequestImageResponse { success, error, .. }) => {
+                        if success {
+                            Ok(request_id)
+                        } else {
+                            Err(error.unwrap_or_else(|| "Request failed".to_string()))
+                        }
+                    }
+                    Ok(_) => Err("Unexpected response from server".to_string()),
+                    Err(e) => Err(format!("Request failed: {}", e)),
+                }
+            })
+        });
+        
+        self.request_image_in_progress = Some(promise);
+    }
+    
+    fn process_request_image_result(&mut self) {
+        let result = if let Some(promise) = &self.request_image_in_progress {
+            promise.ready().cloned()
+        } else {
+            None
+        };
+        
+        if let Some(res) = result {
+            match res {
+                Ok(_request_id) => {
+                    // Optionally show success message
+                    // Could refresh requests list here
+                }
+                Err(_e) => {
+                    // Optionally show error message
+                }
+            }
+            self.request_image_in_progress = None;
+        }
+    }
+    
+    fn load_image_requests(&mut self) {
+        if self.requests_loading.is_some() {
+            return;
+        }
+        
+        let user_id = self.session.user_id.clone();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        
+        let promise = Promise::spawn_thread("load_requests", move || {
+            runtime.block_on(async move {
+                let client = match crate::client::Client::from_firebase(0).await {
+                    Ok(c) => c,
+                    Err(e) => return Err(format!("Failed to connect to node: {}", e)),
+                };
+                
+                let message = crate::messages::Message::GetImageRequests {
+                    user_id: user_id.clone(),
+                };
+                
+                match client.send_request(message).await {
+                    Ok(crate::messages::Message::GetImageRequestsResponse { incoming, outgoing }) => {
+                        let mut requests = Vec::new();
+                        
+                        // Add incoming requests
+                        for req in incoming {
+                            requests.push(ImageRequest {
+                                request_id: req.request_id,
+                                from_user_id: req.from_user_id,
+                                from_username: req.from_username,
+                                to_user_id: req.to_user_id,
+                                to_username: req.to_username,
+                                image_index: req.image_index,
+                                timestamp: req.timestamp,
+                                status: format!(\"{:?}\", req.status).to_lowercase(),
+                                is_incoming: true,
+                            });
+                        }
+                        
+                        // Add outgoing requests
+                        for req in outgoing {
+                            requests.push(ImageRequest {
+                                request_id: req.request_id,
+                                from_user_id: req.from_user_id,
+                                from_username: req.from_username,
+                                to_user_id: req.to_user_id,
+                                to_username: req.to_username,
+                                image_index: req.image_index,
+                                timestamp: req.timestamp,
+                                status: format!(\"{:?}\", req.status).to_lowercase(),
+                                is_incoming: false,
+                            });
+                        }
+                        
+                        Ok(requests)
+                    }
+                    Ok(_) => Err("Unexpected response from server".to_string()),
+                    Err(e) => Err(format!("Failed to get requests: {}", e)),
+                }
+            })
+        });
+        
+        self.requests_loading = Some(promise);
+    }
+    
+    fn process_requests_loading(&mut self) {
+        let result = if let Some(promise) = &self.requests_loading {
+            promise.ready().cloned()
+        } else {
+            None
+        };
+        
+        if let Some(res) = result {
+            if let Ok(requests) = res {
+                self.image_requests = requests;
+            }
+            self.requests_loading = None;
+        }
+    }
+    
+    fn respond_to_request(&mut self, request_id: &str, accepted: bool) {
+        if self.respond_request_in_progress.is_some() {
+            return;
+        }
+        
+        let req_id = request_id.to_string();
+        let user_id = self.session.user_id.clone();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        
+        let promise = Promise::spawn_thread("respond_request", move || {
+            runtime.block_on(async move {
+                let client = match crate::client::Client::from_firebase(0).await {
+                    Ok(c) => c,
+                    Err(e) => return Err(format!("Failed to connect to node: {}", e)),
+                };
+                
+                let message = crate::messages::Message::RespondToImageRequest {
+                    request_id: req_id.clone(),
+                    user_id,
+                    accepted,
+                };
+                
+                match client.send_request(message).await {
+                    Ok(crate::messages::Message::RespondToImageRequestResponse { success, error }) => {
+                        if success {
+                            Ok(req_id)
+                        } else {
+                            Err(error.unwrap_or_else(|| "Response failed".to_string()))
+                        }
+                    }
+                    Ok(_) => Err("Unexpected response from server".to_string()),
+                    Err(e) => Err(format!("Failed to respond: {}", e)),
+                }
+            })
+        });
+        
+        self.respond_request_in_progress = Some(promise);
+    }
+    
+    fn process_respond_request(&mut self) {
+        let result = if let Some(promise) = &self.respond_request_in_progress {
+            promise.ready().cloned()
+        } else {
+            None
+        };
+        
+        if let Some(res) = result {
+            if res.is_ok() {
+                // Reload requests to get updated status
+                self.load_image_requests();
+            }
+            self.respond_request_in_progress = None;
+        }
+    }
+
+    // ========================================================================
+    // Requests Page
+    // ========================================================================
+    
+    fn render_requests_page(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+        // Process pending operations
+        self.process_requests_loading();
+        self.process_respond_request();
+        self.process_request_image_result();
+        
+        ui.horizontal(|ui| {
+            ui.add_space(20.0);
+            
+            ui.vertical(|ui| {
+                ui.set_width(ui.available_width() - 40.0);
+                
+                ui.label(RichText::new("Image Requests")
+                    .size(24.0)
+                    .color(AppColors::TEXT_PRIMARY)
+                    .strong());
+                ui.label(RichText::new("Manage incoming and outgoing image requests")
+                    .size(14.0)
+                    .color(AppColors::TEXT_SECONDARY));
+                
+                ui.add_space(25.0);
+                
+                // Refresh button
+                if ui.add(egui::Button::new("🔄 Refresh")
+                    .fill(AppColors::PRIMARY)
+                    .rounding(Rounding::same(6.0))).clicked() {
+                    self.load_image_requests();
+                }
+                
+                ui.add_space(20.0);
+                
+                // Load requests on first view
+                if self.image_requests.is_empty() && self.requests_loading.is_none() {
+                    self.load_image_requests();
+                }
+                
+                // Show loading
+                if self.requests_loading.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Loading requests...");
+                    });
+                    return;
+                }
+                
+                // Separate incoming and outgoing
+                let incoming: Vec<_> = self.image_requests.iter().filter(|r| r.is_incoming).cloned().collect();
+                let outgoing: Vec<_> = self.image_requests.iter().filter(|r| !r.is_incoming).cloned().collect();
+                
+                // Incoming requests section
+                ui.label(RichText::new(format!("📥 Incoming Requests ({})", incoming.len()))
+                    .size(18.0)
+                    .color(AppColors::PRIMARY)
+                    .strong());
+                ui.add_space(10.0);
+                
+                if incoming.is_empty() {
+                    ui.label(RichText::new("No incoming requests")
+                        .color(AppColors::TEXT_SECONDARY));
+                } else {
+                    for req in &incoming {
+                        egui::Frame::default()
+                            .fill(AppColors::BG_CARD)
+                            .rounding(Rounding::same(8.0))
+                            .inner_margin(egui::Margin::same(15.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(format!("👤 {}#{}", req.from_username, req.from_user_id))
+                                        .size(14.0)
+                                        .color(AppColors::TEXT_PRIMARY)
+                                        .strong());
+                                    
+                                    ui.label(RichText::new(format!("requests image #{}", req.image_index + 1))
+                                        .size(13.0)
+                                        .color(AppColors::TEXT_SECONDARY));
+                                    
+                                    // Status badge
+                                    let status_color = match req.status.as_str() {
+                                        "pending" => AppColors::WARNING,
+                                        "accepted" => AppColors::SUCCESS,
+                                        "rejected" => AppColors::ERROR,
+                                        _ => AppColors::TEXT_SECONDARY,
+                                    };
+                                    ui.label(RichText::new(format!("[{}]", req.status.to_uppercase()))
+                                        .size(11.0)
+                                        .color(status_color));
+                                    
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if req.status == "pending" {
+                                            if ui.add(egui::Button::new("❌ Reject")
+                                                .fill(AppColors::ERROR.linear_multiply(0.7))
+                                                .rounding(Rounding::same(4.0))).clicked() {
+                                                self.respond_to_request(&req.request_id, false);
+                                            }
+                                            
+                                            ui.add_space(5.0);
+                                            
+                                            if ui.add(egui::Button::new("✅ Accept")
+                                                .fill(AppColors::SUCCESS.linear_multiply(0.7))
+                                                .rounding(Rounding::same(4.0))).clicked() {
+                                                self.respond_to_request(&req.request_id, true);
+                                            }
+                                        }
+                                    });
+                                });
+                                
+                                // Timestamp
+                                let dt = chrono::DateTime::from_timestamp(req.timestamp, 0);
+                                if let Some(dt) = dt {
+                                    ui.label(RichText::new(format!("🕒 {}", dt.format("%Y-%m-%d %H:%M:%S")))
+                                        .size(11.0)
+                                        .color(AppColors::TEXT_SECONDARY));
+                                }
+                            });
+                        ui.add_space(8.0);
+                    }
+                }
+                
+                ui.add_space(30.0);
+                
+                // Outgoing requests section
+                ui.label(RichText::new(format!("📤 Outgoing Requests ({})", outgoing.len()))
+                    .size(18.0)
+                    .color(AppColors::SECONDARY)
+                    .strong());
+                ui.add_space(10.0);
+                
+                if outgoing.is_empty() {
+                    ui.label(RichText::new("No outgoing requests")
+                        .color(AppColors::TEXT_SECONDARY));
+                } else {
+                    for req in &outgoing {
+                        egui::Frame::default()
+                            .fill(AppColors::BG_CARD)
+                            .rounding(Rounding::same(8.0))
+                            .inner_margin(egui::Margin::same(15.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(format!("To: {}#{}", req.to_username, req.to_user_id))
+                                        .size(14.0)
+                                        .color(AppColors::TEXT_PRIMARY)
+                                        .strong());
+                                    
+                                    ui.label(RichText::new(format!("image #{}", req.image_index + 1))
+                                        .size(13.0)
+                                        .color(AppColors::TEXT_SECONDARY));
+                                    
+                                    // Status badge
+                                    let status_color = match req.status.as_str() {
+                                        "pending" => AppColors::WARNING,
+                                        "accepted" => AppColors::SUCCESS,
+                                        "rejected" => AppColors::ERROR,
+                                        _ => AppColors::TEXT_SECONDARY,
+                                    };
+                                    ui.label(RichText::new(format!("[{}]", req.status.to_uppercase()))
+                                        .size(11.0)
+                                        .color(status_color));
+                                });
+                                
+                                // Timestamp
+                                let dt = chrono::DateTime::from_timestamp(req.timestamp, 0);
+                                if let Some(dt) = dt {
+                                    ui.label(RichText::new(format!("🕒 {}", dt.format("%Y-%m-%d %H:%M:%S")))
+                                        .size(11.0)
+                                        .color(AppColors::TEXT_SECONDARY));
+                                }
+                            });
+                        ui.add_space(8.0);
+                    }
+                }
+            });
+        });
     }
 
     // ========================================================================
