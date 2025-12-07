@@ -1992,7 +1992,7 @@ impl ClientAppV2 {
                                 egui::Frame::default()
                                     .fill(AppColors::BG_CARD)
                                     .rounding(Rounding::same(8.0))
-                                    .inner_margin(egui::Margin::same(10.0))
+                                    .inner_margin(egui::Margin::symmetric(5.0, 10.0))
                                     .show(ui, |ui| {
                                         ui.set_width(150.0);
                                         
@@ -2022,16 +2022,14 @@ impl ClientAppV2 {
                                         ui.add_space(6.0);
                                         
                                         // View button - always enabled, but changes label based on remaining views
-                                        let button_text = if *remaining_views > 0 {
+                                        let button_text = {
                                             "👁 View"
-                                        } else {
-                                            "🔒 View Encrypted"
                                         };
                                         
                                         if ui.add_enabled(
                                             !viewing_in_progress,
                                             egui::Button::new(button_text)
-                                                .min_size(Vec2::new(140.0, 24.0))
+                                                .min_size(Vec2::new(70.0, 24.0))
                                         ).clicked() {
                                             clicked_view = Some(*i);
                                         }
@@ -2042,10 +2040,11 @@ impl ClientAppV2 {
                                         if ui.add(
                                             egui::Button::new("🗑 Delete")
                                                 .fill(AppColors::ERROR)
-                                                .min_size(Vec2::new(140.0, 24.0))
+                                                .min_size(Vec2::new(70.0, 24.0))
                                         ).clicked() {
                                             clicked_delete = Some(*i);
                                         }
+                                        ui.add_space(2.0);
                                     });
                                 
                                 if (i + 1) % columns == 0 {
