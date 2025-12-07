@@ -3335,8 +3335,15 @@ impl ClientAppV2 {
     fn respond_to_request(&mut self, request_id: &str, accepted: bool) {
         let req_id = request_id.to_string();
         let user_id = self.session.user_id.clone();
+        let username = self.session.username.clone();
         let is_accepted = accepted;
         let runtime = self.runtime.as_ref().unwrap().clone();
+        let cloud_addresses = self.cloud_addresses.clone();
+        
+        // Find the request to get details needed for sending the image
+        let request_info = self.image_requests.iter()
+            .find(|r| r.request_id == req_id)
+            .map(|r| (r.from_user_id.clone(), r.from_username.clone(), r.image_index, r.quota));
         
         let promise = Promise::spawn_thread("respond_request", move || {
             runtime.block_on(async move {
@@ -3345,6 +3352,50 @@ impl ClientAppV2 {
                     Err(e) => return Err(format!("Failed to connect to node: {}", e)),
                 };
                 
+                // If accepting, download image from Firebase and send it to requester
+                if is_accepted {
+                    if let Some((requester_id, requester_username, image_index, quota)) = request_info {
+                        // Download the full resolution image from Firebase
+                        let firebase = FireBaseClient::new();
+                        let full_gallery = firebase.get_full_gallery(&user_id).await
+                            .map_err(|e| format!("Failed to get gallery: {}", e))?;
+                        
+                        if image_index >= full_gallery.len() {
+                            return Err(format!("Image index {} out of bounds", image_index));
+                        }
+                        
+                        // Decode the base64 image data
+                        let image_data_base64 = &full_gallery[image_index];
+                        let image_data = base64::Engine::decode(
+                            &base64::engine::general_purpose::STANDARD,
+                            image_data_base64
+                        ).map_err(|e| format!("Failed to decode image: {}", e))?;
+                        
+                        // Encrypt and send to requester using normal flow
+                        let recipient = format!("{}#{}", requester_username, requester_id);
+                        let from_user = format!("{}#{}", username, user_id);
+                        
+                        let encrypted = crate::encryption::encrypt_image(
+                            image_data,
+                            vec![recipient.clone()],
+                            quota + 1,  // +1 for initial view during encryption
+                        ).await.map_err(|e| format!("Encryption failed: {}", e))?;
+                        
+                        // Send to cloud
+                        let client_sender = Client::new(0, cloud_addresses);
+                        let image_id = format!("img_{}", chrono::Utc::now().timestamp_millis());
+                        
+                        client_sender.send_image(
+                            from_user,
+                            vec![recipient],
+                            encrypted,
+                            quota + 1,
+                            image_id,
+                        ).await.map_err(|e| format!("Failed to send image: {}", e))?;
+                    }
+                }
+                
+                // Update request status in Firebase
                 let message = crate::messages::Message::RespondToImageRequest {
                     request_id: req_id.clone(),
                     user_id,

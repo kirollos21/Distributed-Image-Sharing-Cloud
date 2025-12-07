@@ -1188,42 +1188,8 @@ impl CloudNode {
                         info!("[Node {}] Updated request {} status to {}", 
                               self.id, request_id, status);
                         
-                        // If accepted, send the image from full_gallery to the requester's inbox
-                        if accepted {
-                            match firebase.get_full_gallery(&to_id).await {
-                                Ok(gallery) => {
-                                    if image_index < gallery.len() {
-                                        let image_b64 = &gallery[image_index];
-                                        
-                                        // Store encrypted image in requester's inbox
-                                        let received_meta = crate::firebase::ReceivedImageMeta {
-                                            image_id: request_id.clone(),
-                                            from_user: to_id.clone(),
-                                            remaining_views: quota,
-                                            max_views: quota,
-                                            received_at: chrono::Utc::now().timestamp(),
-                                            encrypted_data_base64: image_b64.clone(),
-                                        };
-                                        
-                                        match firebase.add_received_image(&from_id, &received_meta).await {
-                                            Ok(_) => {
-                                                info!("[Node {}] Sent image to requester {}'s inbox", self.id, from_id);
-                                            }
-                                            Err(e) => {
-                                                error!("[Node {}] Failed to store image in inbox: {}", self.id, e);
-                                            }
-                                        }
-                                    } else {
-                                        warn!("[Node {}] Image index {} out of bounds for user {}", 
-                                              self.id, image_index, to_id);
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("[Node {}] Failed to get full gallery for user {}: {}", 
-                                           self.id, to_id, e);
-                                }
-                            }
-                        }
+                        // Note: Image delivery is now handled by the client that accepts the request
+                        // The client downloads from their gallery and sends directly to requester
                         
                         Some(Message::RespondToImageRequestResponse {
                             success: true,
