@@ -308,12 +308,16 @@ impl ClientAppV2 {
 
         // Prepare local_addr and start UDP listener so nodes can forward notes and images directly to this client.
         // Try default port 8009 first, otherwise pick an ephemeral port.
+        eprintln!("[SETUP] Setting up UDP listeners...");
         let (note_tx, note_rx) = mpsc::channel::<NoteMeta>();
         let (image_tx, image_rx) = mpsc::channel::<ReceivedImageMeta>();
         let mut local_addr = get_local_ip();
+        eprintln!("[SETUP] Attempting to bind UDP on 0.0.0.0:8009...");
         if let Ok(sock) = std::net::UdpSocket::bind(("0.0.0.0", 8009)) {
+            eprintln!("[SETUP] Successfully bound to port 8009");
             if let Ok(addr) = sock.local_addr() {
                 local_addr = format!("{}:{}", local_addr, addr.port());
+                eprintln!("[SETUP] Local address: {}", local_addr);
             }
             let note_tx_clone = note_tx.clone();
             let image_tx_clone = image_tx.clone();
@@ -412,7 +416,9 @@ impl ClientAppV2 {
             });
             self.incoming_note_rx = Some(note_rx);
             self.incoming_image_rx = Some(image_rx);
+            eprintln!("[SETUP] UDP listener thread spawned on port 8009");
         } else if let Ok(sock) = std::net::UdpSocket::bind(("0.0.0.0", 0)) {
+            eprintln!("[SETUP] Port 8009 failed, using ephemeral port");
             if let Ok(addr) = sock.local_addr() {
                 local_addr = format!("{}:{}", local_addr, addr.port());
             }
@@ -493,6 +499,7 @@ impl ClientAppV2 {
             });
             self.incoming_note_rx = Some(note_rx);
             self.incoming_image_rx = Some(image_rx);
+            eprintln!("[SETUP] UDP listener thread spawned on ephemeral port");
         } else {
             eprintln!("Failed to bind UDP listener on default and ephemeral ports");
         }
