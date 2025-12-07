@@ -876,6 +876,33 @@ impl ClientAppV2 {
         self.view_error = None;
     }
     
+    /// Delete a received image from inbox
+    fn delete_received_image(&mut self, index: usize) {
+        if let Some(image) = self.received_images.get(index) {
+            let file_path = std::path::PathBuf::from(&image.file_path);
+            let meta_path = file_path.with_extension("meta.json");
+            
+            // Delete local files
+            let _ = std::fs::remove_file(&file_path);
+            let _ = std::fs::remove_file(&meta_path);
+            
+            // Delete from Firebase
+            let user_id = self.session.user_id.clone();
+            let image_id = image.image_id.clone();
+            let runtime = self.runtime.as_ref().unwrap().clone();
+            
+            std::thread::spawn(move || {
+                runtime.block_on(async move {
+                    let firebase = FireBaseClient::new();
+                    let _ = firebase.delete_received_image(&user_id, &image_id).await;
+                });
+            });
+            
+            // Remove from list
+            self.received_images.remove(index);
+        }
+    }
+    
     /// Save pending Firebase updates to disk (for persistence across app restarts)
     fn save_pending_updates(&self) {
         let cache_dir = Self::get_user_cache_dir(&self.session.user_id);
@@ -995,6 +1022,8 @@ impl eframe::App for ClientAppV2 {
             // Process incoming images from UDP listener (direct delivery)
             if let Some(rx) = &self.incoming_image_rx {
                 while let Ok(image_meta) = rx.try_recv() {
+                    eprintln!("[DEBUG] Received image via UDP: {} from {}", image_meta.image_id, image_meta.from_user);
+                    
                     // Save to local cache
                     let user_id = &self.session.user_id;
                     let cache_dir = Self::get_user_cache_dir(user_id);
@@ -1003,11 +1032,26 @@ impl eframe::App for ClientAppV2 {
                     let filename = format!("{}_{}.enc", image_meta.from_user.replace('#', "_"), image_meta.image_id);
                     let file_path = cache_dir.join(&filename);
                     
+                    eprintln!("[DEBUG] Saving to: {:?}", file_path);
+                    
                     if let Ok(encrypted_data) = base64::engine::general_purpose::STANDARD.decode(&image_meta.encrypted_data_base64) {
+                        eprintln!("[DEBUG] Decoded {} bytes of encrypted data", encrypted_data.len());
                         if let Ok(_) = std::fs::write(&file_path, &encrypted_data) {
+                            eprintln!("[DEBUG] Saved encrypted file successfully");
                             // Save metadata
-                            let meta_path = cache_dir.join(format!("{}.meta.json", filename));
-                            let _ = std::fs::write(&meta_path, serde_json::to_string(&image_meta).unwrap_or_default());
+                            let meta = ImageCacheMeta {
+                                from_user: image_meta.from_user.clone(),
+                                remaining_views: image_meta.remaining_views,
+                                max_views: image_meta.max_views,
+                                received_at: image_meta.received_at,
+                                image_id: image_meta.image_id.clone(),
+                            };
+                            let meta_path = file_path.with_extension("meta.json");
+                            if let Ok(_) = std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap_or_default()) {
+                                eprintln!("[DEBUG] Saved metadata file successfully");
+                            } else {
+                                eprintln!("[DEBUG] Failed to save metadata file");
+                            }
                             
                             // Add to received_images list
                             let received_image = ReceivedImage {
@@ -1023,9 +1067,13 @@ impl eframe::App for ClientAppV2 {
                             // Prepend to inbox so newest appears first
                             self.received_images.insert(0, received_image);
                             
-                            eprintln!("[DIRECT DELIVERY] Received image {} from {} - added to inbox!", 
-                                     image_meta.image_id, image_meta.from_user);
+                            eprintln!("[DIRECT DELIVERY] Received image {} from {} - added to inbox! Total images: {}", 
+                                     image_meta.image_id, image_meta.from_user, self.received_images.len());
+                        } else {
+                            eprintln!("[DEBUG] Failed to save encrypted file");
                         }
+                    } else {
+                        eprintln!("[DEBUG] Failed to decode base64 data");
                     }
                 }
             }
@@ -1818,11 +1866,11 @@ impl ClientAppV2 {
             };
 
             runtime.block_on(async move {
-                // Encrypt image
+                // Encrypt image with quota + 1 to account for the initial view during encryption
                 let encrypted = crate::encryption::encrypt_image(
                     image_data,
                     recipients.clone(),
-                    quota,
+                    quota + 1,
                 ).await.map_err(|e| format!("Encryption failed: {}", e))?;
 
                 // Send to cloud
@@ -1833,7 +1881,7 @@ impl ClientAppV2 {
                     from_user,
                     recipients,
                     encrypted,
-                    quota,
+                    quota + 1,
                     image_id,
                 ).await
             })
@@ -1934,6 +1982,7 @@ impl ClientAppV2 {
                     
                     let viewing_in_progress = self.viewing_in_progress.is_some();
                     let mut clicked_view: Option<usize> = None;
+                    let mut clicked_delete: Option<usize> = None;
                     
                     egui::Grid::new("inbox_grid")
                         .num_columns(columns)
@@ -1986,6 +2035,17 @@ impl ClientAppV2 {
                                         ).clicked() {
                                             clicked_view = Some(*i);
                                         }
+                                        
+                                        ui.add_space(4.0);
+                                        
+                                        // Delete button
+                                        if ui.add(
+                                            egui::Button::new("🗑 Delete")
+                                                .fill(AppColors::ERROR)
+                                                .min_size(Vec2::new(140.0, 24.0))
+                                        ).clicked() {
+                                            clicked_delete = Some(*i);
+                                        }
                                     });
                                 
                                 if (i + 1) % columns == 0 {
@@ -1997,6 +2057,11 @@ impl ClientAppV2 {
                     // Handle view click after loop
                     if let Some(idx) = clicked_view {
                         self.view_cached_image(idx);
+                    }
+                    
+                    // Handle delete click after loop
+                    if let Some(idx) = clicked_delete {
+                        self.delete_received_image(idx);
                     }
                 }
             });
