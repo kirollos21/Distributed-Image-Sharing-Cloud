@@ -2641,6 +2641,7 @@ impl ClientAppV2 {
                     // Clone results to avoid borrow issues
                     let results_clone: Vec<UserSearchResult> = self.search_results.clone();
                     let mut add_recipient: Option<String> = None;
+                    let mut request_image_action: Option<(String, String, usize)> = None;  // (user_id, username, idx)
                     
                     for user in &results_clone {
                         egui::Frame::default()
@@ -2709,8 +2710,8 @@ impl ClientAppV2 {
                                                             .rounding(Rounding::same(4.0));
                                                         
                                                         if ui.add(egui::ImageButton::new(image)).clicked() {
-                                                            // Request this image
-                                                            self.request_image_from_user(&user_id, &user.username, idx);
+                                                            // Request this image (defer action)
+                                                            request_image_action = Some((user_id.clone(), user.username.clone(), idx));
                                                         }
                                                         
                                                         ui.label(RichText::new(format!("#{}", idx + 1))
@@ -2780,6 +2781,11 @@ impl ClientAppV2 {
                     
                     if let Some((user_id, username, content)) = send_note_action {
                         self.send_note_to_user(&user_id, &username, &content);
+                    }
+                    
+                    // Apply deferred request image action
+                    if let Some((user_id, username, idx)) = request_image_action {
+                        self.request_image_from_user(&user_id, &username, idx);
                     }
                     
                     // Apply deferred add recipient action
@@ -2969,7 +2975,7 @@ impl ClientAppV2 {
                     timestamp,
                 };
                 
-                match client.send_request(message).await {
+                match client.send_with_retry(message).await {
                     Ok(crate::messages::Message::RequestImageResponse { success, error, .. }) => {
                         if success {
                             Ok(request_id)
@@ -3026,7 +3032,7 @@ impl ClientAppV2 {
                     user_id: user_id.clone(),
                 };
                 
-                match client.send_request(message).await {
+                match client.send_with_retry(message).await {
                     Ok(crate::messages::Message::GetImageRequestsResponse { incoming, outgoing }) => {
                         let mut requests = Vec::new();
                         
@@ -3040,7 +3046,7 @@ impl ClientAppV2 {
                                 to_username: req.to_username,
                                 image_index: req.image_index,
                                 timestamp: req.timestamp,
-                                status: format!(\"{:?}\", req.status).to_lowercase(),
+                                status: format!("{:?}", req.status).to_lowercase(),
                                 is_incoming: true,
                             });
                         }
@@ -3055,7 +3061,7 @@ impl ClientAppV2 {
                                 to_username: req.to_username,
                                 image_index: req.image_index,
                                 timestamp: req.timestamp,
-                                status: format!(\"{:?}\", req.status).to_lowercase(),
+                                status: format!("{:?}", req.status).to_lowercase(),
                                 is_incoming: false,
                             });
                         }
@@ -3108,7 +3114,7 @@ impl ClientAppV2 {
                     accepted,
                 };
                 
-                match client.send_request(message).await {
+                match client.send_with_retry(message).await {
                     Ok(crate::messages::Message::RespondToImageRequestResponse { success, error }) => {
                         if success {
                             Ok(req_id)

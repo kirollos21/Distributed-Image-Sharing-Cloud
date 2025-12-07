@@ -143,12 +143,13 @@ impl Client {
                     Ok(_) => {
                         let err_msg = "Unexpected response from server".to_string();
                         error!("[Client {}] Node {} sent unexpected response", self.id, address);
-                    return Err(err_msg);
-                }
-                Err(e) => {
-                    warn!("[Client {}] Failed to connect to node {} ({}): {}", self.id, i + 1, address, e);
-                    last_error = format!("{}: {}", address, e);
-                    continue;
+                        return Err(err_msg);
+                    }
+                    Err(e) => {
+                        warn!("[Client {}] Failed to connect to node {} ({}): {}", self.id, i + 1, address, e);
+                        last_error = format!("{}: {}", address, e);
+                        continue;
+                    }
                 }
             }
         }
@@ -483,8 +484,6 @@ impl Client {
                     }
                 }
             }
-                }
-            }
         }
 
         Err("Failed to connect to any cloud node".to_string())
@@ -512,7 +511,6 @@ impl Client {
                         }
                     }
                 }
-            }
             }
         }
 
@@ -544,7 +542,6 @@ impl Client {
                 }
             }
             }
-        }
 
         Err("Failed to connect to any cloud node".to_string())
     }
