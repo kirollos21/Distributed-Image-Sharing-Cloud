@@ -100,7 +100,7 @@ pub struct ClientAppV2 {
     // Requests state
     image_requests: Vec<ImageRequest>,  // All requests (incoming and outgoing)
     requests_loading: Option<Promise<Result<Vec<ImageRequest>, String>>>,
-    respond_request_in_progress: Option<Promise<Result<String, String>>>,  // Returns request_id on success
+    respond_request_in_progress: Option<Promise<Result<(String, bool), String>>>,  // Returns (request_id, accepted) on success
     incoming_request_rx: Option<mpsc::Receiver<ImageRequest>>,  // Incoming requests from UDP listener
     
     // Notes state
@@ -2641,7 +2641,6 @@ impl ClientAppV2 {
                     // Clone results to avoid borrow issues
                     let results_clone: Vec<UserSearchResult> = self.search_results.clone();
                     let mut add_recipient: Option<String> = None;
-                    let mut request_image_action: Option<(String, String, usize)> = None;  // (user_id, username, idx)
                     
                     for user in &results_clone {
                         egui::Frame::default()
@@ -2701,6 +2700,7 @@ impl ClientAppV2 {
                                             }
                                             
                                             // Display cached textures
+                                            let mut request_action = None;
                                             if let Some(textures) = self.search_gallery_textures.get(&user_id) {
                                                 for (idx, texture) in textures.iter().take(5).enumerate() {
                                                     ui.vertical(|ui| {
@@ -2710,8 +2710,8 @@ impl ClientAppV2 {
                                                             .rounding(Rounding::same(4.0));
                                                         
                                                         if ui.add(egui::ImageButton::new(image)).clicked() {
-                                                            // Request this image (defer action)
-                                                            request_image_action = Some((user_id.clone(), user.username.clone(), idx));
+                                                            // Defer the request to avoid borrow issues
+                                                            request_action = Some((user_id.clone(), user.username.clone(), idx));
                                                         }
                                                         
                                                         ui.label(RichText::new(format!("#{}", idx + 1))
@@ -2719,6 +2719,11 @@ impl ClientAppV2 {
                                                             .color(AppColors::TEXT_SECONDARY));
                                                     });
                                                 }
+                                            }
+                                            
+                                            // Execute deferred request
+                                            if let Some((uid, uname, idx)) = request_action {
+                                                self.request_image_from_user(&uid, &uname, idx);
                                             }
                                         });
                                     }
@@ -2781,11 +2786,6 @@ impl ClientAppV2 {
                     
                     if let Some((user_id, username, content)) = send_note_action {
                         self.send_note_to_user(&user_id, &username, &content);
-                    }
-                    
-                    // Apply deferred request image action
-                    if let Some((user_id, username, idx)) = request_image_action {
-                        self.request_image_from_user(&user_id, &username, idx);
                     }
                     
                     // Apply deferred add recipient action
@@ -3001,9 +3001,20 @@ impl ClientAppV2 {
         
         if let Some(res) = result {
             match res {
-                Ok(_request_id) => {
-                    // Optionally show success message
-                    // Could refresh requests list here
+                Ok(request_id) => {
+                    // Add the request to local list immediately (optimistic update)
+                    let new_request = ImageRequest {
+                        request_id,
+                        from_user_id: self.session.user_id.clone(),
+                        from_username: self.session.username.clone(),
+                        to_user_id: String::new(), // We don't have this info here, but it's outgoing so less critical
+                        to_username: String::new(),
+                        image_index: 0, // We don't track this in the result
+                        timestamp: chrono::Utc::now().timestamp(),
+                        status: "pending".to_string(),
+                        is_incoming: false,
+                    };
+                    self.image_requests.insert(0, new_request);
                 }
                 Err(_e) => {
                     // Optionally show error message
@@ -3099,6 +3110,7 @@ impl ClientAppV2 {
         
         let req_id = request_id.to_string();
         let user_id = self.session.user_id.clone();
+        let is_accepted = accepted;
         let runtime = self.runtime.as_ref().unwrap().clone();
         
         let promise = Promise::spawn_thread("respond_request", move || {
@@ -3111,13 +3123,13 @@ impl ClientAppV2 {
                 let message = crate::messages::Message::RespondToImageRequest {
                     request_id: req_id.clone(),
                     user_id,
-                    accepted,
+                    accepted: is_accepted,
                 };
                 
                 match client.send_with_retry(message).await {
                     Ok(crate::messages::Message::RespondToImageRequestResponse { success, error }) => {
                         if success {
-                            Ok(req_id)
+                            Ok((req_id, is_accepted))
                         } else {
                             Err(error.unwrap_or_else(|| "Response failed".to_string()))
                         }
@@ -3139,9 +3151,16 @@ impl ClientAppV2 {
         };
         
         if let Some(res) = result {
-            if res.is_ok() {
-                // Reload requests to get updated status
-                self.load_image_requests();
+            match res {
+                Ok((request_id, accepted)) => {
+                    // Update the local request status instead of reloading everything
+                    if let Some(request) = self.image_requests.iter_mut().find(|r| r.request_id == request_id) {
+                        request.status = if accepted { "accepted".to_string() } else { "rejected".to_string() };
+                    }
+                }
+                Err(_e) => {
+                    // Error handling can be added if needed
+                }
             }
             self.respond_request_in_progress = None;
         }

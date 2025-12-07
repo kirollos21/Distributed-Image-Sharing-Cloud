@@ -429,14 +429,20 @@ impl FireBaseClient {
     
     /// Store an image request in Firebase
     pub async fn add_image_request(&self, request: &ImageRequestMeta) -> Result<(), reqwest::Error> {
-        // Store in both users' request lists
+        // Store in both users' request lists in parallel for better performance
         let url_from = format!("{}/image_requests/{}/outgoing/{}.json", 
             self.base_url, request.from_user_id, request.request_id);
-        self.client.put(&url_from).json(request).send().await?;
-        
         let url_to = format!("{}/image_requests/{}/incoming/{}.json", 
             self.base_url, request.to_user_id, request.request_id);
-        self.client.put(&url_to).json(request).send().await?;
+        
+        // Execute both writes in parallel
+        let (result_from, result_to) = tokio::join!(
+            self.client.put(&url_from).json(request).send(),
+            self.client.put(&url_to).json(request).send()
+        );
+        
+        result_from?;
+        result_to?;
         
         Ok(())
     }
@@ -467,14 +473,20 @@ impl FireBaseClient {
     
     /// Update an image request status
     pub async fn update_image_request_status(&self, from_user_id: &str, to_user_id: &str, request_id: &str, status: &str) -> Result<(), reqwest::Error> {
-        // Update in both users' lists
+        // Update in both users' lists in parallel for better performance
         let url_from = format!("{}/image_requests/{}/outgoing/{}/status.json", 
             self.base_url, from_user_id, request_id);
-        self.client.put(&url_from).json(&status).send().await?;
-        
         let url_to = format!("{}/image_requests/{}/incoming/{}/status.json", 
             self.base_url, to_user_id, request_id);
-        self.client.put(&url_to).json(&status).send().await?;
+        
+        // Execute both updates in parallel
+        let (result_from, result_to) = tokio::join!(
+            self.client.put(&url_from).json(&status).send(),
+            self.client.put(&url_to).json(&status).send()
+        );
+        
+        result_from?;
+        result_to?;
         
         Ok(())
     }
