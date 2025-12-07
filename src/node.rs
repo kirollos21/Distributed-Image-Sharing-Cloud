@@ -1195,7 +1195,7 @@ impl CloudNode {
                                     if image_index < gallery.len() {
                                         let image_b64 = &gallery[image_index];
                                         
-                                        // Store encrypted image in requester's inbox
+                                        // Store encrypted image in requester's inbox (Firebase for offline access)
                                         let received_meta = crate::firebase::ReceivedImageMeta {
                                             image_id: request_id.clone(),
                                             from_user: to_id.clone(),
@@ -1207,10 +1207,57 @@ impl CloudNode {
                                         
                                         match firebase.add_received_image(&from_id, &received_meta).await {
                                             Ok(_) => {
-                                                info!("[Node {}] Sent image to requester {}'s inbox", self.id, from_id);
+                                                info!("[Node {}] Sent image to requester {}'s inbox in Firebase", self.id, from_id);
                                             }
                                             Err(e) => {
                                                 error!("[Node {}] Failed to store image in inbox: {}", self.id, e);
+                                            }
+                                        }
+                                        
+                                        // Also try to send via UDP if requester is online (instant delivery)
+                                        match firebase.get_user_ip(&from_id).await {
+                                            Ok(Some(ip_str)) => {
+                                                // Check if user is online
+                                                match firebase.get_user_info(&from_id).await {
+                                                    Ok(Some(user_info)) => {
+                                                        if matches!(user_info.status, crate::firebase::UserStatus::Online) {
+                                                            // User is online, send image via UDP for instant delivery
+                                                            if let Ok(encrypted_data) = base64::engine::general_purpose::STANDARD.decode(image_b64) {
+                                                                let push_msg = Message::SendImage {
+                                                                    from_username: to_id.clone(),
+                                                                    to_username: from_id.clone(),
+                                                                    encrypted_image: encrypted_data,
+                                                                    max_views: quota,
+                                                                    image_id: request_id.clone(),
+                                                                };
+                                                                
+                                                                if let Ok(recipient_addr) = ip_str.parse::<std::net::SocketAddr>() {
+                                                                    match self.send_response_to_client(recipient_addr, push_msg).await {
+                                                                        Ok(()) => {
+                                                                            info!("[Node {}] Sent accepted image {} to online user {} at {} via UDP", 
+                                                                                  self.id, request_id, from_id, ip_str);
+                                                                        }
+                                                                        Err(e) => {
+                                                                            warn!("[Node {}] Failed to send image to {} at {}: {}", 
+                                                                                  self.id, from_id, ip_str, e);
+                                                                        }
+                                                                    }
+                                                                } else {
+                                                                    warn!("[Node {}] Invalid recipient address: {}", self.id, ip_str);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        debug!("[Node {}] Failed to get user status for {}: {}", self.id, from_id, e);
+                                                    }
+                                                }
+                                            }
+                                            Ok(None) => {
+                                                debug!("[Node {}] No IP recorded for requester {}", self.id, from_id);
+                                            }
+                                            Err(e) => {
+                                                debug!("[Node {}] Error fetching requester IP: {}", self.id, e);
                                             }
                                         }
                                     } else {

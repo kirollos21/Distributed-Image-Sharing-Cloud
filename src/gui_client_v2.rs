@@ -127,6 +127,8 @@ pub struct ClientAppV2 {
     last_heartbeat: Option<std::time::Instant>,
     last_poll: Option<std::time::Instant>,
     poll_in_progress: Option<Promise<Result<u32, String>>>,  // Number of new images received
+    last_firebase_image_check: Option<std::time::Instant>,
+    known_firebase_image_ids: std::collections::HashSet<String>,  // Track which images we've already processed
     
     // Pending Firebase updates (for offline support)
     pending_firebase_updates: Vec<PendingFirebaseUpdate>,
@@ -306,6 +308,8 @@ impl ClientAppV2 {
             last_heartbeat: None,
             last_poll: None,
             poll_in_progress: None,
+            last_firebase_image_check: None,
+            known_firebase_image_ids: std::collections::HashSet::new(),
             pending_firebase_updates: Vec::new(),
         }
     }
@@ -704,6 +708,86 @@ impl ClientAppV2 {
         
         // Sort by received time (newest first)
         self.received_images.sort_by(|a, b| b.received_at.cmp(&a.received_at));
+    }
+    
+    /// Check Firebase for new received_images and add them to the inbox
+    /// This runs every 5 seconds to detect images from accepted requests
+    fn check_firebase_for_new_images(&mut self) {
+        let user_id = self.session.user_id.clone();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        let cache_dir = Self::get_user_cache_dir(&user_id);
+        
+        // Get current set of image IDs from Firebase
+        runtime.block_on(async {
+            let firebase = FireBaseClient::new();
+            
+            match firebase.get_received_images(&user_id).await {
+                Ok(images) => {
+                    let mut new_images_saved = false;
+                    
+                    for img in images {
+                        // Check if we've already processed this image
+                        if !self.known_firebase_image_ids.contains(&img.image_id) {
+                            eprintln!("[FIREBASE LISTENER] New image detected: {} from {}", 
+                                     img.image_id, img.from_user);
+                            
+                            // Mark as known
+                            self.known_firebase_image_ids.insert(img.image_id.clone());
+                            
+                            // Save to local cache
+                            let filename = format!("{}_{}.enc", img.from_user.replace('#', "_"), img.image_id);
+                            let file_path = cache_dir.join(&filename);
+                            
+                            // Only save if not already cached
+                            if !file_path.exists() {
+                                if let Ok(encrypted_data) = base64::engine::general_purpose::STANDARD.decode(&img.encrypted_data_base64) {
+                                    if std::fs::write(&file_path, &encrypted_data).is_ok() {
+                                        // Save metadata
+                                        let meta = ImageCacheMeta {
+                                            from_user: img.from_user.clone(),
+                                            remaining_views: img.remaining_views,
+                                            max_views: img.max_views,
+                                            received_at: img.received_at,
+                                            image_id: img.image_id.clone(),
+                                        };
+                                        let meta_path = file_path.with_extension("meta.json");
+                                        if std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap_or_default()).is_ok() {
+                                            eprintln!("[FIREBASE LISTENER] Successfully saved image {} to cache", img.image_id);
+                                            new_images_saved = true;
+                                            
+                                            // Add to received_images list immediately
+                                            let received_image = ReceivedImage {
+                                                filename: filename.clone(),
+                                                from_user: img.from_user.clone(),
+                                                remaining_views: img.remaining_views,
+                                                max_views: img.max_views,
+                                                received_at: img.received_at,
+                                                file_path: file_path.to_string_lossy().to_string(),
+                                                image_id: img.image_id.clone(),
+                                            };
+                                            
+                                            // Prepend to inbox so newest appears first
+                                            self.received_images.insert(0, received_image);
+                                            
+                                            eprintln!("[FIREBASE LISTENER] Added image {} from {} to inbox! Total: {}", 
+                                                     img.image_id, img.from_user, self.received_images.len());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    if new_images_saved {
+                        // Re-sort inbox by timestamp
+                        self.received_images.sort_by(|a, b| b.received_at.cmp(&a.received_at));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[FIREBASE LISTENER] Error checking for images: {}", e);
+                }
+            }
+        });
     }
 
     /// Sync received images from Firebase (for cross-device access)
@@ -1126,6 +1210,12 @@ impl eframe::App for ClientAppV2 {
             if self.last_poll.map_or(true, |t| now.duration_since(t).as_secs() >= 30) {
                 self.poll_for_pending_images();
                 self.last_poll = Some(now);
+            }
+            
+            // Check Firebase for new received_images every 5 seconds
+            if self.last_firebase_image_check.map_or(true, |t| now.duration_since(t).as_secs() >= 5) {
+                self.check_firebase_for_new_images();
+                self.last_firebase_image_check = Some(now);
             }
             
             // Process poll results
