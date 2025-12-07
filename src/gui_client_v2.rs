@@ -122,6 +122,10 @@ pub struct ClientAppV2 {
     // Settings state
     new_username_input: String,
     username_change_in_progress: Option<Promise<Result<(), String>>>,
+    old_password_input: String,
+    new_password_input: String,
+    confirm_password_input: String,
+    password_change_in_progress: Option<Promise<Result<(), String>>>,
     settings_message: Option<(String, bool)>,  // (message, is_error)
     
     // Heartbeat & polling
@@ -304,6 +308,10 @@ impl ClientAppV2 {
             incoming_image_rx: None,
             new_username_input: String::new(),
             username_change_in_progress: None,
+            old_password_input: String::new(),
+            new_password_input: String::new(),
+            confirm_password_input: String::new(),
+            password_change_in_progress: None,
             settings_message: None,
             last_heartbeat: None,
             last_poll: None,
@@ -342,6 +350,63 @@ impl ClientAppV2 {
             });
         });
 
+        // Clear all caches except inbox and notes (they persist across sessions)
+        // Gallery cache
+        self.my_gallery.clear();
+        self.my_full_gallery.clear();
+        self.my_gallery_textures.clear();
+        self.my_full_gallery_textures.clear();
+        self.my_gallery_loaded = false;
+        self.my_gallery_loading = None;
+        self.my_full_gallery_loading = None;
+        self.gallery_upload_path = None;
+        self.gallery_upload_in_progress = None;
+        self.gallery_error = None;
+        
+        // Search results and cached textures
+        self.search_query.clear();
+        self.search_results.clear();
+        self.search_gallery_textures.clear();
+        self.search_in_progress = None;
+        self.note_input.clear();
+        self.send_note_in_progress = None;
+        
+        // Requests
+        self.image_requests.clear();
+        self.requests_loading = None;
+        self.respond_request_in_progress = None;
+        self.respond_request_error = None;
+        self.delete_request_in_progress = None;
+        self.request_image_in_progress = None;
+        self.request_popup_data = None;
+        self.request_popup_quota = 1;
+        
+        // Send Image state
+        self.selected_image_path = None;
+        self.recipient_input.clear();
+        self.recipients.clear();
+        self.view_quota = 5;
+        self.send_in_progress = None;
+        self.send_result = None;
+        self.recipient_check = None;
+        self.recipient_error = None;
+        
+        // Viewing state
+        self.selected_received_image = None;
+        self.viewing_image = None;
+        self.viewing_image_texture = None;
+        self.viewing_in_progress = None;
+        self.view_error = None;
+        
+        // Settings
+        self.new_username_input.clear();
+        self.username_change_in_progress = None;
+        self.old_password_input.clear();
+        self.new_password_input.clear();
+        self.confirm_password_input.clear();
+        self.password_change_in_progress = None;
+        self.settings_message = None;
+        
         // Reset state
         self.session = UserSession::default();
         self.current_page = Page::Login;
@@ -1269,11 +1334,11 @@ impl ClientAppV2 {
             // Logo / Title
             ui.label(RichText::new("☁️").size(64.0));
             ui.add_space(10.0);
-            ui.label(RichText::new("Distributed Image Cloud")
+            ui.label(RichText::new("Only Cyber Fans")
                 .size(28.0)
                 .color(AppColors::TEXT_PRIMARY)
                 .strong());
-            ui.label(RichText::new("Secure image sharing with steganography")
+            ui.label(RichText::new("Share your images.. For free!")
                 .size(14.0)
                 .color(AppColors::TEXT_SECONDARY));
             
@@ -2826,6 +2891,10 @@ impl ClientAppV2 {
                     // Clone results to avoid borrow issues
                     let results_clone: Vec<UserSearchResult> = self.search_results.clone();
                     let mut add_recipient: Option<String> = None;
+                    let mut send_note_action: Option<(String, String, String)> = None;
+                    
+                    // Process send note result
+                    self.process_send_note_result();
                     
                     for user in &results_clone {
                         egui::Frame::default()
@@ -2854,7 +2923,7 @@ impl ClientAppV2 {
                                         
                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                             let user_tag = format!("{}#{}", user.username, user.user_id);
-                                            if ui.small_button("➕ Add to Send").clicked() {
+                                            if ui.small_button("Add to Send").clicked() {
                                                 add_recipient = Some(user_tag);
                                             }
                                         });
@@ -2863,7 +2932,7 @@ impl ClientAppV2 {
                                     // Show gallery preview if user has gallery images
                                     if !user.gallery.is_empty() {
                                         ui.add_space(10.0);
-                                        ui.label(RichText::new(format!("📷 Gallery ({} images)", user.gallery.len()))
+                                        ui.label(RichText::new(format!("Gallery ({} images)", user.gallery.len()))
                                             .size(12.0)
                                             .color(AppColors::TEXT_SECONDARY));
                                         ui.add_space(5.0);
@@ -2913,72 +2982,55 @@ impl ClientAppV2 {
                                             }
                                         });
                                     }
+                                    
+                                    // Send note section for this user
+                                    ui.add_space(12.0);
+                                    ui.separator();
+                                    ui.add_space(8.0);
+                                    
+                                    let user_id = user.user_id.clone();
+                                    let username = user.username.clone();
+                                    
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new("Send Note:")
+                                            .size(13.0)
+                                            .color(AppColors::TEXT_SECONDARY));
+                                        
+                                        let note_text = self.note_input.entry(user_id.clone()).or_insert_with(String::new);
+                                        
+                                        let text_edit = egui::TextEdit::singleline(note_text)
+                                            .hint_text("Type note (max 200 chars)...")
+                                            .desired_width(ui.available_width() - 120.0);
+                                        ui.add(text_edit);
+                                        
+                                        let char_count = note_text.len();
+                                        let count_color = if char_count > 200 { AppColors::ERROR } else { AppColors::TEXT_SECONDARY };
+                                        ui.label(RichText::new(format!("{}/200", char_count))
+                                            .size(10.0)
+                                            .color(count_color));
+                                        
+                                        let can_send = !note_text.is_empty() && char_count <= 200 && self.send_note_in_progress.is_none();
+                                        
+                                        if ui.add_enabled(can_send, egui::Button::new("Send")
+                                            .fill(if can_send { AppColors::SUCCESS } else { AppColors::BG_SECONDARY })
+                                            .rounding(Rounding::same(4.0))).clicked() {
+                                            send_note_action = Some((user_id.clone(), username.clone(), note_text.clone()));
+                                        }
+                                    });
                                 });
                             });
-                        ui.add_space(8.0);
+                        ui.add_space(10.0);
                     }
                     
-                    // Render send note section for each user (separate pass to avoid borrow issues)
-                    ui.add_space(10.0);
-                    ui.label(RichText::new("📝 Send a Note")
-                        .size(16.0)
-                        .color(AppColors::TEXT_PRIMARY)
-                        .strong());
-                    ui.add_space(10.0);
-                    
-                    // Process send note result
-                    self.process_send_note_result();
-                    
-                    let mut send_note_action: Option<(String, String, String)> = None;
-                    
-                    for user in &results_clone {
-                        let user_id = user.user_id.clone();
-                        let username = user.username.clone();
-                        
-                        egui::Frame::default()
-                            .fill(AppColors::BG_CARD)
-                            .rounding(Rounding::same(6.0))
-                            .inner_margin(egui::Margin::same(10.0))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new(format!("To: {}#{}", username, user_id))
-                                        .size(13.0)
-                                        .color(AppColors::PRIMARY));
-                                    
-                                    let note_text = self.note_input.entry(user_id.clone()).or_insert_with(String::new);
-                                    
-                                    let text_edit = egui::TextEdit::singleline(note_text)
-                                        .hint_text("Type note (max 200 chars)...")
-                                        .desired_width(200.0);
-                                    ui.add(text_edit);
-                                    
-                                    let char_count = note_text.len();
-                                    let count_color = if char_count > 200 { AppColors::ERROR } else { AppColors::TEXT_SECONDARY };
-                                    ui.label(RichText::new(format!("{}/200", char_count))
-                                        .size(10.0)
-                                        .color(count_color));
-                                    
-                                    let can_send = !note_text.is_empty() && char_count <= 200 && self.send_note_in_progress.is_none();
-                                    
-                                    if ui.add_enabled(can_send, egui::Button::new("Send")
-                                        .fill(if can_send { AppColors::SUCCESS } else { AppColors::BG_CARD })
-                                        .rounding(Rounding::same(4.0))).clicked() {
-                                        send_note_action = Some((user_id.clone(), username.clone(), note_text.clone()));
-                                    }
-                                });
-                            });
-                        ui.add_space(5.0);
-                    }
-                    
-                    if let Some((user_id, username, content)) = send_note_action {
-                        self.send_note_to_user(&user_id, &username, &content);
-                    }
-                    
-                    // Apply deferred add recipient action
+                    // Apply deferred actions
                     if let Some(user_tag) = add_recipient {
                         if !self.recipients.contains(&user_tag) {
                             self.recipients.push(user_tag);
                         }
+                    }
+                    
+                    if let Some((user_id, username, content)) = send_note_action {
+                        self.send_note_to_user(&user_id, &username, &content);
                     }
                 }
             });
@@ -3972,114 +4024,204 @@ impl ClientAppV2 {
     // ========================================================================
     
     fn render_settings_page(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
-        ui.horizontal(|ui| {
-            ui.add_space(20.0);
-            
-            ui.vertical(|ui| {
-                ui.set_width(ui.available_width() - 40.0);
-                
-                ui.label(RichText::new("Settings")
-                    .size(24.0)
-                    .color(AppColors::TEXT_PRIMARY)
-                    .strong());
-                ui.label(RichText::new("Manage your account")
-                    .size(14.0)
-                    .color(AppColors::TEXT_SECONDARY));
-                
-                ui.add_space(25.0);
-                
-                // Account info
-                egui::Frame::default()
-                    .fill(AppColors::BG_CARD)
-                    .rounding(Rounding::same(10.0))
-                    .inner_margin(egui::Margin::same(20.0))
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("Account Information").size(16.0).strong().color(AppColors::TEXT_PRIMARY));
-                        ui.add_space(15.0);
-                        
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("Username:").color(AppColors::TEXT_SECONDARY));
-                            ui.label(RichText::new(&self.session.username).color(AppColors::TEXT_PRIMARY).strong());
-                        });
-                        
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("ID:").color(AppColors::TEXT_SECONDARY));
-                            ui.label(RichText::new(&self.session.user_id).color(AppColors::PRIMARY).strong());
-                        });
-                        
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("Full Tag:").color(AppColors::TEXT_SECONDARY));
-                            ui.label(RichText::new(format!("{}#{}", self.session.username, self.session.user_id))
-                                .color(AppColors::TEXT_PRIMARY));
-                        });
-                    });
-                
-                ui.add_space(20.0);
-                
-                // Change username
-                egui::Frame::default()
-                    .fill(AppColors::BG_CARD)
-                    .rounding(Rounding::same(10.0))
-                    .inner_margin(egui::Margin::same(20.0))
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("Change Username").size(16.0).strong().color(AppColors::TEXT_PRIMARY));
-                        ui.add_space(15.0);
-                        
-                        ui.horizontal(|ui| {
-                            let text_edit = egui::TextEdit::singleline(&mut self.new_username_input)
-                                .hint_text("New username")
-                                .min_size(Vec2::new(200.0, 32.0));
-                            ui.add(text_edit);
+        ui.centered_and_justified(|ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(30.0);
+                    
+                    ui.label(RichText::new("Settings")
+                        .size(28.0)
+                        .color(AppColors::TEXT_PRIMARY)
+                        .strong());
+                    ui.label(RichText::new("Manage your account")
+                        .size(14.0)
+                        .color(AppColors::TEXT_SECONDARY));
+                    
+                    ui.add_space(40.0);
+                    
+                    // Container for centered content
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(500.0, 0.0),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
+                            // Account info
+                            egui::Frame::default()
+                                .fill(AppColors::BG_CARD)
+                                .rounding(Rounding::same(10.0))
+                                .inner_margin(egui::Margin::same(25.0))
+                                .show(ui, |ui| {
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(RichText::new("Account Information").size(18.0).strong().color(AppColors::TEXT_PRIMARY));
+                                        ui.add_space(20.0);
+                                    });
+                                    
+                                    ui.vertical(|ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new("Username:").color(AppColors::TEXT_SECONDARY).size(14.0));
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                ui.label(RichText::new(&self.session.username).color(AppColors::TEXT_PRIMARY).strong().size(14.0));
+                                            });
+                                        });
+                                        
+                                        ui.add_space(8.0);
+                                        
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new("User ID:").color(AppColors::TEXT_SECONDARY).size(14.0));
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                ui.label(RichText::new(&self.session.user_id).color(AppColors::PRIMARY).strong().size(14.0));
+                                            });
+                                        });
+                                        
+                                        ui.add_space(8.0);
+                                        
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new("Full Tag:").color(AppColors::TEXT_SECONDARY).size(14.0));
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                ui.label(RichText::new(format!("{}#{}", self.session.username, self.session.user_id))
+                                                    .color(AppColors::TEXT_PRIMARY).size(14.0));
+                                            });
+                                        });
+                                    });
+                                });
                             
-                            let can_change = !self.new_username_input.trim().is_empty()
-                                && self.new_username_input.trim() != self.session.username
-                                && self.username_change_in_progress.is_none();
+                            ui.add_space(25.0);
                             
-                            if ui.add_enabled(can_change, egui::Button::new("Update")
-                                .fill(AppColors::PRIMARY)
-                                .rounding(Rounding::same(6.0))).clicked() {
-                                self.change_username();
-                            }
-                        });
-                        
-                        // Process change
-                        self.process_username_change();
-                        
-                        // Show loading
-                        if self.username_change_in_progress.is_some() {
-                            ui.add_space(10.0);
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label("Updating...");
-                            });
-                        }
-                        
-                        // Show message
-                        if let Some((msg, is_error)) = &self.settings_message {
-                            ui.add_space(10.0);
-                            let color = if *is_error { AppColors::ERROR } else { AppColors::SUCCESS };
-                            ui.label(RichText::new(msg).color(color));
-                        }
-                    });
-                
-                ui.add_space(20.0);
-                
-                // Connected nodes info
-                egui::Frame::default()
-                    .fill(AppColors::BG_CARD)
-                    .rounding(Rounding::same(10.0))
-                    .inner_margin(egui::Margin::same(20.0))
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("Connected Nodes").size(16.0).strong().color(AppColors::TEXT_PRIMARY));
-                        ui.add_space(10.0);
-                        
-                        for addr in &self.cloud_addresses {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new("●").color(AppColors::SUCCESS));
-                                ui.label(RichText::new(addr).color(AppColors::TEXT_SECONDARY));
-                            });
-                        }
-                    });
+                            // Change username
+                            egui::Frame::default()
+                                .fill(AppColors::BG_CARD)
+                                .rounding(Rounding::same(10.0))
+                                .inner_margin(egui::Margin::same(25.0))
+                                .show(ui, |ui| {
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(RichText::new("Change Username").size(18.0).strong().color(AppColors::TEXT_PRIMARY));
+                                        ui.add_space(20.0);
+                                        
+                                        ui.set_max_width(350.0);
+                                        
+                                        let text_edit = egui::TextEdit::singleline(&mut self.new_username_input)
+                                            .hint_text("Enter new username")
+                                            .desired_width(f32::INFINITY)
+                                            .min_size(Vec2::new(0.0, 36.0));
+                                        ui.add(text_edit);
+                                        
+                                        ui.add_space(15.0);
+                                        
+                                        let can_change = !self.new_username_input.trim().is_empty()
+                                            && self.new_username_input.trim() != self.session.username
+                                            && self.username_change_in_progress.is_none();
+                                        
+                                        if ui.add_enabled(can_change, egui::Button::new("Update Username")
+                                            .fill(AppColors::PRIMARY)
+                                            .rounding(Rounding::same(6.0))
+                                            .min_size(Vec2::new(180.0, 40.0))).clicked() {
+                                            self.change_username();
+                                        }
+                                        
+                                        // Process change
+                                        self.process_username_change();
+                                        
+                                        // Show loading
+                                        if self.username_change_in_progress.is_some() {
+                                            ui.add_space(15.0);
+                                            ui.horizontal(|ui| {
+                                                ui.spinner();
+                                                ui.label("Updating...");
+                                            });
+                                        }
+                                        
+                                        // Show message
+                                        if let Some((msg, is_error)) = &self.settings_message {
+                                            ui.add_space(15.0);
+                                            let color = if *is_error { AppColors::ERROR } else { AppColors::SUCCESS };
+                                            ui.label(RichText::new(msg).color(color).size(13.0));
+                                        }
+                                    });
+                                });
+                            
+                            ui.add_space(25.0);
+                            
+                            // Change password
+                            egui::Frame::default()
+                                .fill(AppColors::BG_CARD)
+                                .rounding(Rounding::same(10.0))
+                                .inner_margin(egui::Margin::same(25.0))
+                                .show(ui, |ui| {
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(RichText::new("Change Password").size(18.0).strong().color(AppColors::TEXT_PRIMARY));
+                                        ui.add_space(20.0);
+                                        
+                                        ui.set_max_width(350.0);
+                                        
+                                        ui.vertical(|ui| {
+                                            ui.label(RichText::new("Current Password").color(AppColors::TEXT_SECONDARY).size(13.0));
+                                            ui.add_space(5.0);
+                                            ui.add(egui::TextEdit::singleline(&mut self.old_password_input)
+                                                .password(true)
+                                                .hint_text("Enter current password")
+                                                .desired_width(f32::INFINITY)
+                                                .min_size(Vec2::new(0.0, 36.0)));
+                                            
+                                            ui.add_space(15.0);
+                                            
+                                            ui.label(RichText::new("New Password").color(AppColors::TEXT_SECONDARY).size(13.0));
+                                            ui.add_space(5.0);
+                                            ui.add(egui::TextEdit::singleline(&mut self.new_password_input)
+                                                .password(true)
+                                                .hint_text("Enter new password")
+                                                .desired_width(f32::INFINITY)
+                                                .min_size(Vec2::new(0.0, 36.0)));
+                                            
+                                            ui.add_space(15.0);
+                                            
+                                            ui.label(RichText::new("Confirm New Password").color(AppColors::TEXT_SECONDARY).size(13.0));
+                                            ui.add_space(5.0);
+                                            ui.add(egui::TextEdit::singleline(&mut self.confirm_password_input)
+                                                .password(true)
+                                                .hint_text("Confirm new password")
+                                                .desired_width(f32::INFINITY)
+                                                .min_size(Vec2::new(0.0, 36.0)));
+                                        });
+                                        
+                                        ui.add_space(20.0);
+                                        
+                                        let can_change = !self.old_password_input.is_empty()
+                                            && !self.new_password_input.is_empty()
+                                            && !self.confirm_password_input.is_empty()
+                                            && self.new_password_input == self.confirm_password_input
+                                            && self.password_change_in_progress.is_none();
+                                        
+                                        if ui.add_enabled(can_change, egui::Button::new("Update Password")
+                                            .fill(AppColors::PRIMARY)
+                                            .rounding(Rounding::same(6.0))
+                                            .min_size(Vec2::new(180.0, 40.0))).clicked() {
+                                            self.change_password();
+                                        }
+                                        
+                                        // Validation messages
+                                        if !self.new_password_input.is_empty() && !self.confirm_password_input.is_empty() 
+                                            && self.new_password_input != self.confirm_password_input {
+                                            ui.add_space(15.0);
+                                            ui.label(RichText::new("Passwords do not match").color(AppColors::WARNING).size(12.0));
+                                        }
+                                        
+                                        // Process change
+                                        self.process_password_change();
+                                        
+                                        // Show loading
+                                        if self.password_change_in_progress.is_some() {
+                                            ui.add_space(15.0);
+                                            ui.horizontal(|ui| {
+                                                ui.spinner();
+                                                ui.label("Updating password...");
+                                            });
+                                        }
+                                    });
+                                });
+                            
+                            ui.add_space(50.0);
+                        },
+                    );
+                });
             });
         });
     }
@@ -4116,6 +4258,56 @@ impl ClientAppV2 {
                     }
                 }
                 self.username_change_in_progress = None;
+            }
+        }
+    }
+
+    fn change_password(&mut self) {
+        let old_password = self.old_password_input.clone();
+        let new_password = self.new_password_input.clone();
+        let user_id = self.session.user_id.clone();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+
+        self.settings_message = None;
+
+        let promise = Promise::spawn_thread("change_password", move || {
+            runtime.block_on(async move {
+                let firebase = FireBaseClient::new();
+                
+                // First verify the old password
+                let is_valid = firebase.verify_password(&user_id, &old_password).await
+                    .map_err(|e| format!("Failed to verify password: {}", e))?;
+                
+                if !is_valid {
+                    return Err("Incorrect old password".to_string());
+                }
+                
+                // Update to new password
+                firebase.update_password(&user_id, &new_password).await
+                    .map_err(|e| format!("Failed to update password: {}", e))?;
+                
+                Ok(())
+            })
+        });
+
+        self.password_change_in_progress = Some(promise);
+    }
+
+    fn process_password_change(&mut self) {
+        if let Some(promise) = &self.password_change_in_progress {
+            if let Some(result) = promise.ready() {
+                match result {
+                    Ok(()) => {
+                        self.settings_message = Some(("Password updated successfully!".to_string(), false));
+                        self.old_password_input.clear();
+                        self.new_password_input.clear();
+                        self.confirm_password_input.clear();
+                    }
+                    Err(e) => {
+                        self.settings_message = Some((e.clone(), true));
+                    }
+                }
+                self.password_change_in_progress = None;
             }
         }
     }

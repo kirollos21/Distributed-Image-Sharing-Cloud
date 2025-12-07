@@ -79,25 +79,20 @@ impl Client {
         for retry in 0..max_retries {
             if retry > 0 {
                 info!("[Client {}] Retrying all nodes (attempt {}/{})", self.id, retry + 1, max_retries);
-                sleep(Duration::from_millis(500)).await; // Brief pause before retry
+                sleep(Duration::from_millis(200)).await; // Brief pause before retry (reduced from 500ms)
             }
             
-            // Try each node sequentially, with 2 attempts per node
+            // Try each node sequentially, with single attempt per node for faster failover
             for (i, address) in self.cloud_addresses.iter().enumerate() {
-                for attempt in 1..=2 {
-                    debug!("[Client {}] Trying node {} at {} (attempt {})", self.id, i + 1, address, attempt);
-                    
-                    match Self::send_to_node(self.id, address, message.clone()).await {
-                        Ok(response) => {
-                            debug!("[Client {}] Got response from node {} on attempt {}", self.id, i + 1, attempt);
-                            return Ok(response);
-                        }
-                        Err(e) => {
-                            warn!("[Client {}] Node {} ({}) failed on attempt {}: {}", self.id, i + 1, address, attempt, e);
-                            if attempt == 1 {
-                                sleep(Duration::from_millis(100)).await; // Brief pause before retry
-                            }
-                        }
+                debug!("[Client {}] Trying node {} at {}", self.id, i + 1, address);
+                
+                match Self::send_to_node(self.id, address, message.clone()).await {
+                    Ok(response) => {
+                        debug!("[Client {}] Got response from node {}", self.id, i + 1);
+                        return Ok(response);
+                    }
+                    Err(e) => {
+                        warn!("[Client {}] Node {} ({}) failed: {}", self.id, i + 1, address, e);
                     }
                 }
             }
@@ -335,10 +330,10 @@ impl Client {
         let mut buffer = vec![0u8; 65535]; // Max UDP packet size
 
         // Loop to receive all chunks
-        debug!("[Client {}] Waiting for response from {} (10s timeout)...", client_id, address);
+        debug!("[Client {}] Waiting for response from {} (3s timeout)...", client_id, address);
         loop {
-            // Read response with timeout
-            let n = match tokio::time::timeout(Duration::from_secs(10), socket.recv_from(&mut buffer)).await
+            // Read response with timeout - reduced from 10s to 3s for faster failure detection
+            let n = match tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buffer)).await
             {
                 Ok(Ok((n, _))) => {
                     debug!("[Client {}] Received {} bytes from {}", client_id, n, address);
@@ -349,7 +344,7 @@ impl Client {
                     return Err(format!("Receive error: {}", e));
                 }
                 Err(_) => {
-                    error!("[Client {}] Timeout waiting for response from {} (waited 10s)", client_id, address);
+                    error!("[Client {}] Timeout waiting for response from {} (waited 3s)", client_id, address);
                     return Err(format!("Timeout waiting for response from {}", address));
                 }
             };
