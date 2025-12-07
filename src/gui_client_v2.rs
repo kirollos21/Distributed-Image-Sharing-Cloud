@@ -318,19 +318,24 @@ impl ClientAppV2 {
             let note_tx_clone = note_tx.clone();
             let image_tx_clone = image_tx.clone();
             std::thread::spawn(move || {
+                eprintln!("[UDP LISTENER PORT 8009] Started");
                 let mut buf = [0u8; 65536];
                 let mut reassembler = ChunkReassembler::new();
                 loop {
                     match sock.recv_from(&mut buf) {
-                        Ok((n, _src)) => {
+                        Ok((n, src)) => {
+                            eprintln!("[UDP 8009] Received {} bytes from {}", n, src);
                             // Try to parse as ChunkedMessage first
                             if let Ok(chunked_msg) = serde_json::from_slice::<ChunkedMessage>(&buf[..n]) {
+                                eprintln!("[UDP 8009] Chunked message");
                                 // Process chunk through reassembler
                                 if let Some(complete_data) = reassembler.process_chunk(chunked_msg) {
+                                    eprintln!("[UDP 8009] Complete: {} bytes", complete_data.len());
                                     // Parse complete message
                                     if let Ok(msg) = serde_json::from_slice::<Message>(&complete_data) {
                                         match msg {
                                             Message::SendNote { note_id, from_username, content, timestamp, .. } => {
+                                                eprintln!("[UDP 8009] SendNote");
                                                 let note = NoteMeta {
                                                     note_id: note_id.clone(),
                                                     from_user: from_username.clone(),
@@ -340,6 +345,8 @@ impl ClientAppV2 {
                                                 let _ = note_tx_clone.send(note);
                                             }
                                             Message::SendImage { from_username, encrypted_image, max_views, image_id, .. } => {
+                                                eprintln!("[UDP 8009] SendImage from {} (id: {}, {} bytes, views: {})", 
+                                                         from_username, image_id, encrypted_image.len(), max_views);
                                                 let timestamp = chrono::Utc::now().timestamp();
                                                 let image_meta = ReceivedImageMeta {
                                                     image_id: image_id.clone(),
@@ -349,13 +356,18 @@ impl ClientAppV2 {
                                                     received_at: timestamp,
                                                     encrypted_data_base64: base64::engine::general_purpose::STANDARD.encode(&encrypted_image),
                                                 };
-                                                let _ = image_tx_clone.send(image_meta);
+                                                if image_tx_clone.send(image_meta).is_ok() {
+                                                    eprintln!("[UDP 8009] Sent to channel OK");
+                                                } else {
+                                                    eprintln!("[UDP 8009] Channel send FAILED");
+                                                }
                                             }
                                             _ => {}
                                         }
                                     }
                                 }
                             } else if let Ok(msg) = serde_json::from_slice::<Message>(&buf[..n]) {
+                                eprintln!("[UDP 8009] Direct message");
                                 // Direct message (not chunked) - for small messages
                                 match msg {
                                     Message::SendNote { note_id, from_username, content, timestamp, .. } => {
@@ -368,6 +380,8 @@ impl ClientAppV2 {
                                         let _ = note_tx_clone.send(note);
                                     }
                                     Message::SendImage { from_username, encrypted_image, max_views, image_id, .. } => {
+                                                eprintln!("[UDP 8009 DIRECT] SendImage from {} (id: {}, {} bytes, views: {})", 
+                                                         from_username, image_id, encrypted_image.len(), max_views);
                                         let timestamp = chrono::Utc::now().timestamp();
                                         let image_meta = ReceivedImageMeta {
                                             image_id: image_id.clone(),
@@ -377,10 +391,16 @@ impl ClientAppV2 {
                                             received_at: timestamp,
                                             encrypted_data_base64: base64::engine::general_purpose::STANDARD.encode(&encrypted_image),
                                         };
-                                        let _ = image_tx_clone.send(image_meta);
+                                                if image_tx_clone.send(image_meta).is_ok() {
+                                                    eprintln!("[UDP 8009 DIRECT] Sent to channel OK");
+                                                } else {
+                                                    eprintln!("[UDP 8009 DIRECT] Channel send FAILED");
+                                                }
                                     }
                                     _ => {}
                                 }
+                            } else {
+                                eprintln!("[UDP 8009] Parse failed");
                             }
                         }
                         Err(e) => {
@@ -987,10 +1007,10 @@ impl eframe::App for ClientAppV2 {
         // Set dark theme
         ctx.set_visuals(egui::Visuals::dark());
         
-        // Heartbeat every 10 seconds (for "last seen" info and online status) + poll for images every 30 seconds
+        // Heartbeat every 5 seconds (for "last seen" info and online status) + poll for images every 30 seconds
         if self.session.is_logged_in {
             let now = std::time::Instant::now();
-            if self.last_heartbeat.map_or(true, |t| now.duration_since(t).as_secs() >= 10) {
+            if self.last_heartbeat.map_or(true, |t| now.duration_since(t).as_secs() >= 5) {
                 self.send_heartbeat();
                 self.last_heartbeat = Some(now);
                 

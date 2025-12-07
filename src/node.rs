@@ -701,11 +701,11 @@ impl CloudNode {
                     let mut sent_directly = false;
                     match firebase.get_user_ip(&user_id).await {
                         Ok(Some(ip_str)) => {
-                            // Check if we've received a heartbeat recently (within 30 seconds)
+                            // Check if we've received a heartbeat recently (within 45 seconds - 3x the 10s interval + buffer)
                             let is_online = {
                                 let heartbeats = self.client_heartbeats.read().await;
                                 heartbeats.get(&user_id)
-                                    .map(|last_beat| last_beat.elapsed().as_secs() < 30)
+                                    .map(|last_beat| last_beat.elapsed().as_secs() < 45)
                                     .unwrap_or(false)
                             };
 
