@@ -3134,10 +3134,6 @@ impl ClientAppV2 {
     }
     
     fn respond_to_request(&mut self, request_id: &str, accepted: bool) {
-        if self.respond_request_in_progress.is_some() {
-            return;
-        }
-        
         let req_id = request_id.to_string();
         let user_id = self.session.user_id.clone();
         let is_accepted = accepted;
@@ -3289,18 +3285,29 @@ impl ClientAppV2 {
                                     
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         if req.status == "pending" {
-                                            if ui.add(egui::Button::new("❌ Reject")
-                                                .fill(AppColors::ERROR.linear_multiply(0.7))
-                                                .rounding(Rounding::same(4.0))).clicked() {
-                                                self.respond_to_request(&req.request_id, false);
-                                            }
+                                            // Check if this specific request is being processed
+                                            let is_processing = self.respond_request_in_progress.is_some();
                                             
-                                            ui.add_space(5.0);
-                                            
-                                            if ui.add(egui::Button::new("✅ Accept")
-                                                .fill(AppColors::SUCCESS.linear_multiply(0.7))
-                                                .rounding(Rounding::same(4.0))).clicked() {
-                                                self.respond_to_request(&req.request_id, true);
+                                            if is_processing {
+                                                // Show loading spinner
+                                                ui.spinner();
+                                                ui.label(RichText::new("Processing...")
+                                                    .size(12.0)
+                                                    .color(AppColors::TEXT_SECONDARY));
+                                            } else {
+                                                if ui.add(egui::Button::new("❌ Reject")
+                                                    .fill(AppColors::ERROR.linear_multiply(0.7))
+                                                    .rounding(Rounding::same(4.0))).clicked() {
+                                                    self.respond_to_request(&req.request_id, false);
+                                                }
+                                                
+                                                ui.add_space(5.0);
+                                                
+                                                if ui.add(egui::Button::new("✅ Accept")
+                                                    .fill(AppColors::SUCCESS.linear_multiply(0.7))
+                                                    .rounding(Rounding::same(4.0))).clicked() {
+                                                    self.respond_to_request(&req.request_id, true);
+                                                }
                                             }
                                         }
                                     });
