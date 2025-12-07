@@ -3369,29 +3369,28 @@ impl ClientAppV2 {
                 if is_accepted {
                     eprintln!("[DEBUG] Processing acceptance");
                     if let Some((requester_id, requester_username, image_index, quota)) = request_info {
-                        eprintln!("[DEBUG] Downloading gallery for user_id: {}", user_id);
-                        // Download the full resolution image from Firebase
+                        eprintln!("[DEBUG] Downloading single image at index {} for user_id: {}", image_index, user_id);
+                        // Download the specific requested image from Firebase
                         let firebase = FireBaseClient::new();
-                        let full_gallery = firebase.get_full_gallery(&user_id).await
+                        let image_data_base64 = firebase.get_full_gallery_image(&user_id, image_index).await
                             .map_err(|e| {
-                                eprintln!("[DEBUG] Failed to get gallery: {}", e);
-                                format!("Failed to get gallery: {}", e)
+                                eprintln!("[DEBUG] Failed to get image: {}", e);
+                                e
                             })?;
                         
-                        eprintln!("[DEBUG] Gallery has {} images, requesting index {}", full_gallery.len(), image_index);
+                        eprintln!("[DEBUG] Downloaded image data (len: {})", image_data_base64.len());
                         
-                        if image_index >= full_gallery.len() {
-                            let err = format!("Image index {} out of bounds", image_index);
-                            eprintln!("[DEBUG] {}", err);
-                            return Err(err);
-                        }
+                        // Strip data URL prefix if present (e.g., "data:image/png;base64,")
+                        let base64_data = if image_data_base64.contains("base64,") {
+                            image_data_base64.split("base64,").nth(1).unwrap_or(&image_data_base64)
+                        } else {
+                            &image_data_base64
+                        };
                         
-                        // Decode the base64 image data
-                        let image_data_base64 = &full_gallery[image_index];
-                        eprintln!("[DEBUG] Decoding base64 image data (len: {})", image_data_base64.len());
+                        eprintln!("[DEBUG] Decoding base64 image data (stripped len: {})", base64_data.len());
                         let image_data = base64::Engine::decode(
                             &base64::engine::general_purpose::STANDARD,
-                            image_data_base64
+                            base64_data
                         ).map_err(|e| {
                             eprintln!("[DEBUG] Failed to decode: {}", e);
                             format!("Failed to decode image: {}", e)

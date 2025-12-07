@@ -291,6 +291,15 @@ impl FireBaseClient {
         Ok(gallery.unwrap_or_default())
     }
 
+    pub async fn get_full_gallery_image(&self, id: &str, index: usize) -> Result<String, String> {
+        let url = format!("{}/users/{}/full_gallery/{}.json", self.base_url, id, index);
+        let resp = self.client.get(&url).send().await
+            .map_err(|e| format!("HTTP error: {}", e))?;
+        let image = resp.json::<Option<String>>().await
+            .map_err(|e| format!("JSON parse error: {}", e))?;
+        image.ok_or_else(|| format!("Image at index {} not found", index))
+    }
+
     pub async fn add_to_gallery(&self, id: &str, image_id: &str) -> Result<(), reqwest::Error> {
         let url = format!("{}/users/{}/gallery.json", self.base_url, id);
         self.client.post(&url).json(image_id).send().await?;
