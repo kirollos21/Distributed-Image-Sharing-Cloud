@@ -503,59 +503,46 @@ impl ClientAppV2 {
             let user_id_clone = user_id.clone();
             
             runtime.block_on(async move {
-                let client = Client::new(0, cloud_addresses.clone());
                 let firebase = FireBaseClient::new();
                 
-                // Query for received images from node
-                match client.query_received_images(username.clone()).await {
+                // Fetch images from Firebase (nodes upload images there for offline clients)
+                // We don't query nodes to avoid decrementing view counts during sync
+                match firebase.get_received_images(&user_id_clone).await {
                     Ok(images) => {
                         let mut saved_count = 0u32;
                         
-                        for img_info in images {
+                        for img in images {
                             // Check if we already have this image cached
-                            let filename = format!("{}_{}.enc", img_info.from_username.replace('#', "_"), img_info.image_id);
+                            let filename = format!("{}_{}.enc", img.from_user.replace('#', "_"), img.image_id);
                             let file_path = cache_dir.join(&filename);
                             
                             if !file_path.exists() {
-                                // Fetch the encrypted image data (without decrypting)
-                                match client.download_image_encrypted(username.clone(), img_info.image_id.clone()).await {
-                                    Ok(encrypted_data) => {
-                                        // Save metadata alongside the image
-                                        let meta = ImageCacheMeta {
-                                            from_user: img_info.from_username.clone(),
-                                            remaining_views: img_info.remaining_views,
-                                            max_views: img_info.remaining_views,
-                                            received_at: img_info.timestamp,
-                                            image_id: img_info.image_id.clone(),
-                                        };
-                                        
-                                        // Save encrypted image locally
-                                        if std::fs::write(&file_path, &encrypted_data).is_ok() {
-                                            // Save metadata locally
-                                            let meta_path = file_path.with_extension("meta.json");
-                                            let _ = std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap_or_default());
+                                // Decode the base64 encrypted data from Firebase
+                                if let Ok(encrypted_data) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &img.encrypted_data_base64) {
+                                    // Save metadata alongside the image
+                                    let meta = ImageCacheMeta {
+                                        from_user: img.from_user.clone(),
+                                        remaining_views: img.remaining_views,
+                                        max_views: img.max_views,
+                                        received_at: img.received_at,
+                                        image_id: img.image_id.clone(),
+                                    };
+                                    
+                                    // Save encrypted image locally
+                                    if std::fs::write(&file_path, &encrypted_data).is_ok() {
+                                        // Save metadata locally
+                                        let meta_path = file_path.with_extension("meta.json");
+                                        if std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap_or_default()).is_ok() {
                                             saved_count += 1;
-                                            
-                                            // Also upload to Firebase for cross-device sync
-                                            let firebase_meta = ReceivedImageMeta {
-                                                image_id: img_info.image_id.clone(),
-                                                from_user: img_info.from_username.clone(),
-                                                remaining_views: img_info.remaining_views,
-                                                max_views: img_info.remaining_views,
-                                                received_at: img_info.timestamp,
-                                                encrypted_data_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &encrypted_data),
-                                            };
-                                            let _ = firebase.add_received_image(&user_id_clone, &firebase_meta).await;
                                         }
                                     }
-                                    Err(_) => {}
                                 }
                             }
                         }
                         
                         Ok(saved_count)
                     }
-                    Err(e) => Err(e),
+                    Err(e) => Err(format!("Failed to fetch from Firebase: {}", e)),
                 }
             })
         });
@@ -598,6 +585,7 @@ impl ClientAppV2 {
 
     /// Sync received images from Firebase (for cross-device access)
     /// Downloads any images stored in Firebase that aren't in the local cache
+    /// Then deletes them from Firebase after successful download
     fn sync_from_firebase(&mut self) {
         let user_id = self.session.user_id.clone();
         let runtime = self.runtime.as_ref().unwrap().clone();
@@ -616,6 +604,8 @@ impl ClientAppV2 {
                         let filename = format!("{}_{}.enc", img.from_user.replace('#', "_"), img.image_id);
                         let file_path = cache_dir.join(&filename);
                         
+                        let mut should_delete = false;
+                        
                         if !file_path.exists() {
                             // Decode and save to local cache
                             if let Ok(encrypted_data) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &img.encrypted_data_base64) {
@@ -630,8 +620,23 @@ impl ClientAppV2 {
                                         image_id: img.image_id.clone(),
                                     };
                                     let meta_path = file_path.with_extension("meta.json");
-                                    let _ = std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap_or_default());
+                                    if std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap_or_default()).is_ok() {
+                                        // Successfully saved locally, mark for deletion
+                                        should_delete = true;
+                                    }
                                 }
+                            }
+                        } else {
+                            // Image already exists locally, delete from Firebase
+                            should_delete = true;
+                        }
+                        
+                        // Delete from Firebase after successful local save
+                        if should_delete {
+                            if let Err(e) = firebase.delete_received_image(&user_id, &img.image_id).await {
+                                eprintln!("[SYNC] Failed to delete image {} from Firebase: {}", img.image_id, e);
+                            } else {
+                                println!("[SYNC] Deleted image {} from Firebase after syncing to local cache", img.image_id);
                             }
                         }
                     }
@@ -749,7 +754,8 @@ impl ClientAppV2 {
                 })?;
 
                 if !success {
-                    return Err("View quota exhausted".to_string());
+                    // Quota exhausted - return the encrypted cover image as-is
+                    return Ok((encrypted_data, 0u8, None));
                 }
 
                 // Save the updated encrypted image back to disk
@@ -796,11 +802,13 @@ impl ClientAppV2 {
                 Ok((decrypted_image, remaining, pending_update))
             })
         } else {
-            // Quota exhausted: show the encrypted image file as-is (no decrypt or view-count update)
+            // Quota exhausted: show the encrypted cover image (steganographic carrier)
             Promise::spawn_thread("view_encrypted", move || {
                 let encrypted_data = std::fs::read(&file_path)
                     .map_err(|e| format!("Failed to read image: {}", e))?;
-                // remaining_views is zero
+                
+                // The encrypted_data IS the cover image - it's already a valid image
+                // We don't decrypt it, just return it as-is to show the steganographic carrier
                 Ok((encrypted_data, 0u8, None))
             })
         };
@@ -1914,10 +1922,8 @@ impl ClientAppV2 {
                             });
                         });
                 } else {
-                    // Show inbox as a simple grid
-                    let available_width = ui.available_width();
-                    let card_width = 170.0;
-                    let columns = ((available_width / card_width) as usize).max(1);
+                    // Show inbox as a simple grid with max 2 columns
+                    let columns = 2;
                     
                     // Clone data to avoid borrow issues
                     let images_data: Vec<(usize, String, u8, u8)> = self.received_images
@@ -1966,10 +1972,16 @@ impl ClientAppV2 {
                                         
                                         ui.add_space(6.0);
                                         
-                                        // View button
+                                        // View button - always enabled, but changes label based on remaining views
+                                        let button_text = if *remaining_views > 0 {
+                                            "👁 View"
+                                        } else {
+                                            "🔒 View Encrypted"
+                                        };
+                                        
                                         if ui.add_enabled(
-                                            *remaining_views > 0 && !viewing_in_progress,
-                                            egui::Button::new("👁 View")
+                                            !viewing_in_progress,
+                                            egui::Button::new(button_text)
                                                 .min_size(Vec2::new(140.0, 24.0))
                                         ).clicked() {
                                             clicked_view = Some(*i);

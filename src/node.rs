@@ -697,25 +697,8 @@ impl CloudNode {
                         username.clone()
                     };
                     
-                    // Upload to Firebase for persistence
-                    let firebase_meta = ReceivedImageMeta {
-                        image_id: image_id.clone(),
-                        from_user: from_username.clone(),
-                        remaining_views: max_views,
-                        max_views,
-                        received_at: timestamp,
-                        encrypted_data_base64: base64::engine::general_purpose::STANDARD.encode(&encrypted_image),
-                    };
-                    
-                    if let Err(e) = firebase.add_received_image(&user_id, &firebase_meta).await {
-                        warn!("[Node {}] Failed to upload image {} to Firebase for user {}: {}", 
-                              self.id, image_id, user_id, e);
-                    } else {
-                        info!("[Node {}] Uploaded image {} to Firebase for user {}", 
-                              self.id, image_id, user_id);
-                    }
-
                     // Check if recipient is online and send directly
+                    let mut sent_directly = false;
                     match firebase.get_user_ip(&user_id).await {
                         Ok(Some(ip_str)) => {
                             // Check if we've received a heartbeat recently (within 30 seconds)
@@ -741,6 +724,7 @@ impl CloudNode {
                                         Ok(()) => {
                                             info!("[Node {}] Sent image {} directly to online user {} at {}",
                                                   self.id, image_id, user_id, ip_str);
+                                            sent_directly = true;
                                         }
                                         Err(e) => {
                                             warn!("[Node {}] Failed to send image {} to {} at {}: {}",
@@ -751,8 +735,7 @@ impl CloudNode {
                                     debug!("[Node {}] Recipient IP '{}' could not be parsed", self.id, ip_str);
                                 }
                             } else {
-                                debug!("[Node {}] Recipient {} is offline (no recent heartbeat), image stored in Firebase",
-                                      self.id, user_id);
+                                debug!("[Node {}] Recipient {} is offline (no recent heartbeat)", self.id, user_id);
                             }
                         }
                         Ok(None) => {
@@ -762,10 +745,29 @@ impl CloudNode {
                             warn!("[Node {}] Error fetching recipient IP for {}: {}", self.id, user_id, e);
                         }
                     }
+
+                    // Only upload to Firebase if direct send failed or recipient offline
+                    if !sent_directly {
+                        let firebase_meta = ReceivedImageMeta {
+                            image_id: image_id.clone(),
+                            from_user: from_username.clone(),
+                            remaining_views: max_views,
+                            max_views,
+                            received_at: timestamp,
+                            encrypted_data_base64: base64::engine::general_purpose::STANDARD.encode(&encrypted_image),
+                        };
+                        
+                        if let Err(e) = firebase.add_received_image(&user_id, &firebase_meta).await {
+                            warn!("[Node {}] Failed to upload image {} to Firebase for user {}: {}", 
+                                  self.id, image_id, user_id, e);
+                        } else {
+                            info!("[Node {}] Uploaded image {} to Firebase for offline user {}", 
+                                  self.id, image_id, user_id);
+                        }
+                    }
                 }
 
-                info!("[Node {}] Processed image {} from {} (saved to Firebase, sent to online recipients)",
-                      self.id, image_id, from_username);
+                info!("[Node {}] Processed image {} from {}", self.id, image_id, from_username);
 
                 Some(Message::SendImageResponse {
                     success: true,
