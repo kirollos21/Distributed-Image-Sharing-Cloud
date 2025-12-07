@@ -713,6 +713,8 @@ impl CloudNode {
 
             Message::Heartbeat { from_node, load, processed_count } => {
                 // Record that we received a heartbeat from this node
+                debug!("[Node {}] Received heartbeat from Node {} (load: {:.2}, processed: {})",
+                      self.id, from_node, load, processed_count);
                 {
                     let now = Instant::now();
                     let mut heartbeats = self.last_heartbeat.write().await;
@@ -2032,6 +2034,8 @@ impl CloudNode {
             let current_load = *self.current_load.read().await;
             let current_processed = *self.processed_requests.read().await;
 
+            debug!("[Node {}] Sending heartbeats to {} peers", self.id, self.peer_addresses.len());
+
             // Send heartbeat to all peers
             for (peer_id, peer_addr) in &self.peer_addresses {
                 let message = Message::Heartbeat {
@@ -2043,8 +2047,9 @@ impl CloudNode {
                 match serde_json::to_vec(&message) {
                     Ok(message_bytes) => {
                         match heartbeat_socket.send_to(&message_bytes, peer_addr).await {
-                            Ok(_) => {
-                                // Heartbeat sent successfully (silent success)
+                            Ok(n) => {
+                                debug!("[Node {}] Sent heartbeat to Node {} at {} ({} bytes)",
+                                      self.id, peer_id, peer_addr, n);
                             }
                             Err(e) => {
                                 // Log error but continue - temporary network issues shouldn't crash the task
