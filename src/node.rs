@@ -1219,13 +1219,13 @@ impl CloudNode {
                                             Ok(Some(ip_str)) => {
                                                 // Check if user is online
                                                 match firebase.get_user_info(&from_id).await {
-                                                    Ok(Some(user_info)) => {
+                                                    Ok(user_info) => {
                                                         if matches!(user_info.status, crate::firebase::UserStatus::Online) {
                                                             // User is online, send image via UDP for instant delivery
                                                             if let Ok(encrypted_data) = base64::engine::general_purpose::STANDARD.decode(image_b64) {
                                                                 let push_msg = Message::SendImage {
                                                                     from_username: to_id.clone(),
-                                                                    to_username: from_id.clone(),
+                                                                    to_usernames: vec![from_id.clone()],
                                                                     encrypted_image: encrypted_data,
                                                                     max_views: quota,
                                                                     image_id: request_id.clone(),
