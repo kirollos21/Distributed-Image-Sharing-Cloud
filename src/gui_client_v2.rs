@@ -1146,9 +1146,13 @@ impl eframe::App for ClientAppV2 {
             if let Some(rx) = &self.incoming_request_rx {
                 while let Ok(request) = rx.try_recv() {
                     eprintln!("[DEBUG] ✅ Received image request via UDP: {} from {} (quota: {})", request.request_id, request.from_username, request.quota);
-                    // Prepend to requests list so newest appear first
-                    self.image_requests.insert(0, request);
-                    eprintln!("[DEBUG] ✅ Added to requests list, total requests: {}", self.image_requests.len());
+                    // Only add if not already in the list (deduplicate by request_id)
+                    if !self.image_requests.iter().any(|r| r.request_id == request.request_id) {
+                        self.image_requests.insert(0, request);
+                        eprintln!("[DEBUG] ✅ Added to requests list, total requests: {}", self.image_requests.len());
+                    } else {
+                        eprintln!("[DEBUG] ⏭️ Skipped duplicate request: {}", request.request_id);
+                    }
                 }
             } else {
                 // This shouldn't happen but let's log it
@@ -3313,7 +3317,10 @@ impl ClientAppV2 {
         
         if let Some(res) = result {
             match res {
-                Ok(requests) => {
+                Ok(mut requests) => {
+                    // Deduplicate requests by request_id
+                    let mut seen = std::collections::HashSet::new();
+                    requests.retain(|r| seen.insert(r.request_id.clone()));
                     self.image_requests = requests;
                 }
                 Err(_) => {

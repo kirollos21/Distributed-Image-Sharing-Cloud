@@ -376,11 +376,23 @@ impl CloudNode {
         // BUT: Never forward a message that was already forwarded (prevents double-forwarding)
         let messages_requiring_leader = matches!(
             actual_message,
+            // Write operations
             Message::RequestImage { .. } |
             Message::SendImage { .. } |
             Message::SendNote { .. } |
             Message::RespondToImageRequest { .. } |
-            Message::DeleteImageRequest { .. }
+            Message::DeleteImageRequest { .. } |
+            Message::ClientLogin { .. } |
+            Message::ClientLogout { .. } |
+            Message::ViewImage { .. } |
+            // Read operations
+            Message::QueryReceivedImages { .. } |
+            Message::GetPendingNotes { .. } |
+            Message::GetUserList |
+            Message::GetUserInfo { .. } |
+            Message::GetUserGallery { .. } |
+            Message::GetImageRequests { .. } |
+            Message::CheckUsernameAvailable { .. }
         );
         
         if messages_requiring_leader && !is_already_forwarded {
@@ -728,10 +740,19 @@ impl CloudNode {
                         timestamp: now,
                     });
 
-                    // If this node was marked as failed, remove it from failed set
+                    // If this node was marked as failed, remove it from failed set and update Firebase
                     let mut failed = self.failed_nodes.write().await;
                     if failed.remove(&from_node) {
                         info!("[Node {}] Node {} recovered (heartbeat received)", self.id, from_node);
+                        
+                        // Update Firebase to mark the recovered node as Active
+                        drop(failed); // Release lock before async operation
+                        let firebase = FireBaseClient::new();
+                        if let Err(e) = firebase.update_node_status(from_node, &crate::firebase::NodeStatus::Active).await {
+                            error!("[Node {}] Failed to update Firebase status for recovered Node {}: {}", self.id, from_node, e);
+                        } else {
+                            info!("[Node {}] Updated Firebase: Node {} marked as Active", self.id, from_node);
+                        }
                     }
                 }
 
@@ -1138,16 +1159,19 @@ impl CloudNode {
                 let firebase = FireBaseClient::new();
                 let status = if accepted { "accepted" } else { "rejected" };
                 
-                // First, get the request to find the from_user_id and to_user_id
-                // We need to determine which user is responding
+                // First, get the request to find the from_user_id, to_user_id, image_index, and quota
                 let mut from_id = String::new();
                 let mut to_id = String::new();
+                let mut image_index = 0;
+                let mut quota = 1;
                 
                 // Check incoming requests (user_id is the recipient)
                 if let Ok(incoming) = firebase.get_incoming_image_requests(&user_id).await {
                     if let Some(req) = incoming.iter().find(|r| r.request_id == request_id) {
                         from_id = req.from_user_id.clone();
                         to_id = user_id.clone();
+                        image_index = req.image_index;
+                        quota = req.quota;
                     }
                 }
                 
@@ -1163,6 +1187,44 @@ impl CloudNode {
                     Ok(_) => {
                         info!("[Node {}] Updated request {} status to {}", 
                               self.id, request_id, status);
+                        
+                        // If accepted, send the image from full_gallery to the requester's inbox
+                        if accepted {
+                            match firebase.get_full_gallery(&to_id).await {
+                                Ok(gallery) => {
+                                    if image_index < gallery.len() {
+                                        let image_b64 = &gallery[image_index];
+                                        
+                                        // Store encrypted image in requester's inbox
+                                        let received_meta = crate::firebase::ReceivedImageMeta {
+                                            image_id: request_id.clone(),
+                                            from_user: to_id.clone(),
+                                            remaining_views: quota,
+                                            max_views: quota,
+                                            received_at: chrono::Utc::now().timestamp(),
+                                            encrypted_data_base64: image_b64.clone(),
+                                        };
+                                        
+                                        match firebase.add_received_image(&from_id, &received_meta).await {
+                                            Ok(_) => {
+                                                info!("[Node {}] Sent image to requester {}'s inbox", self.id, from_id);
+                                            }
+                                            Err(e) => {
+                                                error!("[Node {}] Failed to store image in inbox: {}", self.id, e);
+                                            }
+                                        }
+                                    } else {
+                                        warn!("[Node {}] Image index {} out of bounds for user {}", 
+                                              self.id, image_index, to_id);
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("[Node {}] Failed to get full gallery for user {}: {}", 
+                                           self.id, to_id, e);
+                                }
+                            }
+                        }
+                        
                         Some(Message::RespondToImageRequestResponse {
                             success: true,
                             error: None,
@@ -2116,6 +2178,14 @@ impl CloudNode {
                 for failed_node in newly_failed_nodes {
                     failed.insert(failed_node);
                     warn!("[Node {}] FAILURE DETECTED: Node {} is not responding", self.id, failed_node);
+
+                    // Update Firebase to mark the failed node as Inactive
+                    let firebase = FireBaseClient::new();
+                    if let Err(e) = firebase.update_node_status(failed_node, &crate::firebase::NodeStatus::Inactive).await {
+                        error!("[Node {}] Failed to update Firebase status for failed Node {}: {}", self.id, failed_node, e);
+                    } else {
+                        info!("[Node {}] Updated Firebase: Node {} marked as Inactive", self.id, failed_node);
+                    }
 
                     // Check if the failed node is the coordinator
                     let manager = self.election_manager.lock().await;
