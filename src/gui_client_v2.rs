@@ -106,6 +106,7 @@ pub struct ClientAppV2 {
     image_requests: Vec<ImageRequest>,  // All requests (incoming and outgoing)
     requests_loading: Option<Promise<Result<Vec<ImageRequest>, String>>>,
     respond_request_in_progress: Option<Promise<Result<(String, bool), String>>>,  // Returns (request_id, accepted) on success
+    respond_request_error: Option<String>,  // Error from responding to request
     delete_request_in_progress: Option<Promise<Result<String, String>>>,  // Returns request_id on success
     incoming_request_rx: Option<mpsc::Receiver<ImageRequest>>,  // Incoming requests from UDP listener
     
@@ -293,6 +294,7 @@ impl ClientAppV2 {
             image_requests: Vec::new(),
             requests_loading: None,
             respond_request_in_progress: None,
+            respond_request_error: None,
             delete_request_in_progress: None,
             incoming_request_rx: None,
             notes: Vec::new(),
@@ -3333,6 +3335,8 @@ impl ClientAppV2 {
     }
     
     fn respond_to_request(&mut self, request_id: &str, accepted: bool) {
+        eprintln!("[DEBUG] respond_to_request called: request_id={}, accepted={}", request_id, accepted);
+        
         let req_id = request_id.to_string();
         let user_id = self.session.user_id.clone();
         let username = self.session.username.clone();
@@ -3345,57 +3349,94 @@ impl ClientAppV2 {
             .find(|r| r.request_id == req_id)
             .map(|r| (r.from_user_id.clone(), r.from_username.clone(), r.image_index, r.quota));
         
+        eprintln!("[DEBUG] Request info: {:?}", request_info);
+        
         let promise = Promise::spawn_thread("respond_request", move || {
+            eprintln!("[DEBUG] Promise thread started");
             runtime.block_on(async move {
                 let client = match crate::client::Client::from_firebase(0).await {
-                    Ok(c) => c,
-                    Err(e) => return Err(format!("Failed to connect to node: {}", e)),
+                    Ok(c) => {
+                        eprintln!("[DEBUG] Client created successfully");
+                        c
+                    }
+                    Err(e) => {
+                        eprintln!("[DEBUG] Failed to create client: {}", e);
+                        return Err(format!("Failed to connect to node: {}", e));
+                    }
                 };
                 
                 // If accepting, download image from Firebase and send it to requester
                 if is_accepted {
+                    eprintln!("[DEBUG] Processing acceptance");
                     if let Some((requester_id, requester_username, image_index, quota)) = request_info {
+                        eprintln!("[DEBUG] Downloading gallery for user_id: {}", user_id);
                         // Download the full resolution image from Firebase
                         let firebase = FireBaseClient::new();
                         let full_gallery = firebase.get_full_gallery(&user_id).await
-                            .map_err(|e| format!("Failed to get gallery: {}", e))?;
+                            .map_err(|e| {
+                                eprintln!("[DEBUG] Failed to get gallery: {}", e);
+                                format!("Failed to get gallery: {}", e)
+                            })?;
+                        
+                        eprintln!("[DEBUG] Gallery has {} images, requesting index {}", full_gallery.len(), image_index);
                         
                         if image_index >= full_gallery.len() {
-                            return Err(format!("Image index {} out of bounds", image_index));
+                            let err = format!("Image index {} out of bounds", image_index);
+                            eprintln!("[DEBUG] {}", err);
+                            return Err(err);
                         }
                         
                         // Decode the base64 image data
                         let image_data_base64 = &full_gallery[image_index];
+                        eprintln!("[DEBUG] Decoding base64 image data (len: {})", image_data_base64.len());
                         let image_data = base64::Engine::decode(
                             &base64::engine::general_purpose::STANDARD,
                             image_data_base64
-                        ).map_err(|e| format!("Failed to decode image: {}", e))?;
+                        ).map_err(|e| {
+                            eprintln!("[DEBUG] Failed to decode: {}", e);
+                            format!("Failed to decode image: {}", e)
+                        })?;
+                        
+                        eprintln!("[DEBUG] Image data decoded, size: {} bytes", image_data.len());
                         
                         // Encrypt and send to requester using normal flow
                         let recipient = format!("{}#{}", requester_username, requester_id);
                         let from_user = format!("{}#{}", username, user_id);
                         
+                        eprintln!("[DEBUG] Encrypting image for recipient: {}", recipient);
                         let encrypted = crate::encryption::encrypt_image(
                             image_data,
                             vec![recipient.clone()],
                             quota + 1,  // +1 for initial view during encryption
-                        ).await.map_err(|e| format!("Encryption failed: {}", e))?;
+                        ).await.map_err(|e| {
+                            eprintln!("[DEBUG] Encryption failed: {}", e);
+                            format!("Encryption failed: {}", e)
+                        })?;
+                        
+                        eprintln!("[DEBUG] Image encrypted, size: {} bytes", encrypted.len());
                         
                         // Send to cloud
                         let client_sender = Client::new(0, cloud_addresses);
                         let image_id = format!("img_{}", chrono::Utc::now().timestamp_millis());
                         
+                        eprintln!("[DEBUG] Sending image {} to cloud", image_id);
                         client_sender.send_image(
                             from_user,
                             vec![recipient],
                             encrypted,
                             quota + 1,
-                            image_id,
-                        ).await.map_err(|e| format!("Failed to send image: {}", e))?;
+                            image_id.clone(),
+                        ).await.map_err(|e| {
+                            eprintln!("[DEBUG] Failed to send image: {}", e);
+                            format!("Failed to send image: {}", e)
+                        })?;
+                        
+                        eprintln!("[DEBUG] Image {} sent successfully", image_id);
                     }
                 }
                 
                 // Update request status in Firebase
+                eprintln!("[DEBUG] Updating request status in Firebase");
                 let message = crate::messages::Message::RespondToImageRequest {
                     request_id: req_id.clone(),
                     user_id,
@@ -3405,18 +3446,28 @@ impl ClientAppV2 {
                 match client.send_with_retry(message).await {
                     Ok(crate::messages::Message::RespondToImageRequestResponse { success, error }) => {
                         if success {
+                            eprintln!("[DEBUG] Request status updated successfully");
                             Ok((req_id, is_accepted))
                         } else {
-                            Err(error.unwrap_or_else(|| "Response failed".to_string()))
+                            let err = error.unwrap_or_else(|| "Response failed".to_string());
+                            eprintln!("[DEBUG] Request status update failed: {}", err);
+                            Err(err)
                         }
                     }
-                    Ok(_) => Err("Unexpected response from server".to_string()),
-                    Err(e) => Err(format!("Failed to respond: {}", e)),
+                    Ok(_) => {
+                        eprintln!("[DEBUG] Unexpected response from server");
+                        Err("Unexpected response from server".to_string())
+                    }
+                    Err(e) => {
+                        eprintln!("[DEBUG] Failed to respond: {}", e);
+                        Err(format!("Failed to respond: {}", e))
+                    }
                 }
             })
         });
         
         self.respond_request_in_progress = Some(promise);
+        eprintln!("[DEBUG] Promise stored, waiting for completion");
     }
     
     fn process_respond_request(&mut self) {
@@ -3429,13 +3480,18 @@ impl ClientAppV2 {
         if let Some(res) = result {
             match res {
                 Ok((request_id, accepted)) => {
+                    // Clear any previous error
+                    self.respond_request_error = None;
                     // Update the local request status instead of reloading everything
                     if let Some(request) = self.image_requests.iter_mut().find(|r| r.request_id == request_id) {
                         request.status = if accepted { "accepted".to_string() } else { "rejected".to_string() };
                     }
+                    eprintln!("✓ Successfully {} request {}", if accepted { "accepted" } else { "rejected" }, request_id);
                 }
-                Err(_e) => {
-                    // Error handling can be added if needed
+                Err(e) => {
+                    // Store and display the error
+                    eprintln!("✗ Error responding to request: {}", e);
+                    self.respond_request_error = Some(e);
                 }
             }
             self.respond_request_in_progress = None;
@@ -3527,6 +3583,26 @@ impl ClientAppV2 {
                 }
                 
                 ui.add_space(20.0);
+                
+                // Show error from responding to request
+                if let Some(error) = &self.respond_request_error.clone() {
+                    ui.add_space(10.0);
+                    let error_text = error.clone();
+                    egui::Frame::default()
+                        .fill(AppColors::ERROR.linear_multiply(0.2))
+                        .rounding(Rounding::same(6.0))
+                        .inner_margin(egui::Margin::same(10.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("✗").color(AppColors::ERROR).size(16.0));
+                                ui.label(RichText::new(&error_text).color(AppColors::ERROR));
+                                if ui.small_button("✕").clicked() {
+                                    self.respond_request_error = None;
+                                }
+                            });
+                        });
+                    ui.add_space(10.0);
+                }
                 
                 // Show loading
                 if self.requests_loading.is_some() {
