@@ -49,6 +49,12 @@ pub enum Message {
     Ok { from_node: NodeId },
     Coordinator { node_id: NodeId, load: f64 },
 
+    // Forwarding wrapper - wraps any message with original client address
+    ForwardedMessage {
+        original_message: Box<Message>,
+        client_address: String, // Original client's address for direct response
+    },
+
     // Session management messages
     SessionRegister {
         client_id: String,
@@ -295,6 +301,9 @@ impl fmt::Display for Message {
             Message::Ok { from_node } => write!(f, "OK from Node {}", from_node),
             Message::Coordinator { node_id, load } => {
                 write!(f, "COORDINATOR Node {} (load: {:.2})", node_id, load)
+            }
+            Message::ForwardedMessage { client_address, .. } => {
+                write!(f, "FORWARDED_MESSAGE from client {}", client_address)
             }
             Message::SessionRegister { username, .. } => {
                 write!(f, "SESSION_REGISTER username: {}", username)

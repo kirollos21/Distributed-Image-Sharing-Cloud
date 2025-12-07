@@ -251,13 +251,13 @@ impl CloudNode {
         debug!("[Node {}] Received from {}: {}", self.id, addr, message);
 
         // Process message based on type
-        let response = self.process_message(message, addr).await;
+        let (response, target_addr) = self.process_message(message, addr).await;
 
         // Send response if any
         if let Some(response) = response {
             let response_bytes = serde_json::to_vec(&response)?;
 
-            debug!("[Node {}] Sending response: {} bytes", self.id, response_bytes.len());
+            debug!("[Node {}] Sending response: {} bytes to {}", self.id, response_bytes.len(), target_addr);
 
             // Only use chunking for large responses (client messages with image data)
             // Node-to-node messages are small and sent directly
@@ -272,7 +272,7 @@ impl CloudNode {
                 // Fragment response for client
                 let chunks = ChunkedMessage::fragment(response_bytes);
 
-                debug!("[Node {}] Sending {} chunks to {}", self.id, chunks.len(), addr);
+                debug!("[Node {}] Sending {} chunks to {}", self.id, chunks.len(), target_addr);
 
                 // Cache chunks for potential retransmission
                 if let ChunkedMessage::MultiPacket { ref chunk_id, .. } = chunks[0] {
@@ -284,7 +284,7 @@ impl CloudNode {
                 // Send all chunks with delay to prevent UDP packet loss and buffer exhaustion
                 for (i, chunk) in chunks.iter().enumerate() {
                     let chunk_bytes = serde_json::to_vec(&chunk)?;
-                    socket.send_to(&chunk_bytes, addr).await?;
+                    socket.send_to(&chunk_bytes, target_addr).await?;
 
                         // Delay between chunks to prevent overwhelming receiver's socket buffer
                         // 10ms provides good balance between throughput and reliability
@@ -294,11 +294,11 @@ impl CloudNode {
                         }
                 }
 
-                debug!("[Node {}] Sent {} chunks to {}", self.id, chunks.len(), addr);
+                debug!("[Node {}] Sent {} chunks to {}", self.id, chunks.len(), target_addr);
             } else {
                 // Send directly for node-to-node communication
-                socket.send_to(&response_bytes, addr).await?;
-                debug!("[Node {}] Sent direct response to {}", self.id, addr);
+                socket.send_to(&response_bytes, target_addr).await?;
+                debug!("[Node {}] Sent direct response to {}", self.id, target_addr);
             }
         }
 
@@ -351,8 +351,96 @@ impl CloudNode {
     }
 
     /// Process incoming message
-    async fn process_message(&self, message: Message, addr: SocketAddr) -> Option<Message> {
-        match message {
+    async fn process_message(&self, message: Message, addr: SocketAddr) -> (Option<Message>, SocketAddr) {
+        // First, check if this is a forwarded message (from another node)
+        // If so, unwrap it and process with the original client address
+        // A forwarded message should NEVER be forwarded again (prevents infinite loops)
+        let (actual_message, client_addr, is_already_forwarded) = match message {
+            Message::ForwardedMessage { original_message, client_address } => {
+                // This is a forwarded message - extract the original message and client address
+                let original_addr = match client_address.parse::<SocketAddr>() {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        warn!("[Node {}] Failed to parse client address: {}", self.id, e);
+                        return (None, addr);
+                    }
+                };
+                info!("[Node {}] Processing forwarded message from client {}", self.id, original_addr);
+                (*original_message, original_addr, true) // Mark as already forwarded
+            }
+            other => (other, addr, false) // Not forwarded yet
+        };
+        
+        // Check if this message should be handled by the leader (coordinator)
+        // If this node is NOT the coordinator, wrap and forward to the coordinator
+        // BUT: Never forward a message that was already forwarded (prevents double-forwarding)
+        let messages_requiring_leader = matches!(
+            actual_message,
+            Message::RequestImage { .. } |
+            Message::SendImage { .. } |
+            Message::SendNote { .. } |
+            Message::RespondToImageRequest { .. } |
+            Message::DeleteImageRequest { .. }
+        );
+        
+        if messages_requiring_leader && !is_already_forwarded {
+            let election_mgr = self.election_manager.lock().await;
+            let is_coordinator = election_mgr.is_coordinator();
+            let coordinator_id = election_mgr.current_coordinator;
+            drop(election_mgr);
+            
+            if !is_coordinator {
+                // This node is not the leader - wrap message with client address and forward to coordinator
+                if let Some(coord_id) = coordinator_id {
+                    if let Some(coordinator_addr) = self.peer_addresses.get(&coord_id) {
+                        info!("[Node {}] Forwarding message to coordinator (Node {}) at {} (client: {})", 
+                              self.id, coord_id, coordinator_addr, client_addr);
+                        
+                        // Wrap the message with the original client address
+                        let forwarded_msg = Message::ForwardedMessage {
+                            original_message: Box::new(actual_message.clone()),
+                            client_address: client_addr.to_string(),
+                        };
+                        
+                        // Forward to the coordinator via UDP
+                        let socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!("[Node {}] Failed to create socket for forwarding: {}", self.id, e);
+                                // Fall through to handle locally
+                                return (None, client_addr);
+                            }
+                        };
+                        
+                        let msg_bytes = match serde_json::to_vec(&forwarded_msg) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                warn!("[Node {}] Failed to serialize message: {}", self.id, e);
+                                return (None, client_addr);
+                            }
+                        };
+                        
+                        if let Err(e) = socket.send_to(&msg_bytes, coordinator_addr).await {
+                            warn!("[Node {}] Failed to send to coordinator: {}, will process locally", self.id, e);
+                            // Fall through to process locally
+                        } else {
+                            info!("[Node {}] Successfully forwarded to coordinator, coordinator will respond directly to client", self.id);
+                            // Don't wait for response - coordinator will send directly to client
+                            // Return None so this node doesn't send anything back
+                            return (None, addr); // Return None and use addr (not client_addr) since we're not sending anything
+                        }
+                    } else {
+                        warn!("[Node {}] Coordinator address not found, will process locally", self.id);
+                    }
+                } else {
+                    warn!("[Node {}] No coordinator elected yet, will process locally", self.id);
+                }
+            }
+        }
+        
+        // Either this node IS the coordinator, or forwarding failed, or it's a read-only message
+        // Process the message locally and send response to client_addr (the original client)
+        let response = match actual_message {
             Message::SessionRegister { client_id, username } => {
                 // Check centralized users.txt file first
                 if Self::user_exists_in_file(&username).await {
@@ -412,7 +500,7 @@ impl CloudNode {
                     let mut in_flight = self.in_flight_requests.write().await;
                     if in_flight.contains(&request_id) {
                         warn!("[Node {}] Ignoring duplicate request {} (already in flight)", self.id, request_id);
-                        return None;
+                        return (None, client_addr);
                     } else {
                         // Mark request as in-flight
                         in_flight.insert(request_id.clone());
@@ -1063,10 +1151,10 @@ impl CloudNode {
                 
                 if from_id.is_empty() {
                     // Not found, return error
-                    return Some(Message::RespondToImageRequestResponse {
+                    return (Some(Message::RespondToImageRequestResponse {
                         success: false,
                         error: Some("Request not found".to_string()),
-                    });
+                    }), client_addr);
                 }
                 
                 match firebase.update_image_request_status(&from_id, &to_id, &request_id, status).await {
@@ -1118,10 +1206,10 @@ impl CloudNode {
                 }
                 
                 if from_id.is_empty() {
-                    return Some(Message::DeleteImageRequestResponse {
+                    return (Some(Message::DeleteImageRequestResponse {
                         success: false,
                         error: Some("Request not found".to_string()),
-                    });
+                    }), client_addr);
                 }
                 
                 match firebase.delete_image_request(&from_id, &to_id, &request_id).await {
@@ -1466,7 +1554,10 @@ impl CloudNode {
             }
 
             _ => None,
-        }
+        };
+        
+        // Return response and client address (client_addr is the original client, not the forwarding node)
+        (response, client_addr)
     }
 
     /// Process encryption request

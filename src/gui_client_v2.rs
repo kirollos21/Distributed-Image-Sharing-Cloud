@@ -2462,7 +2462,7 @@ impl ClientAppV2 {
                                     .rounding(Rounding::same(8.0))
                                     .inner_margin(egui::Margin::same(8.0))
                                     .show(ui, |ui| {
-                                        ui.set_width(100.0);
+                                        ui.set_width(175.0);
                                         
                                         if i < self.my_full_gallery.len() {
                                             let data_url = &self.my_full_gallery[i];
@@ -2474,9 +2474,9 @@ impl ClientAppV2 {
                                             }
                                             
                                             if let Some(texture) = &self.my_full_gallery_textures[i] {
-                                                ui.add(egui::Image::new(texture).max_size(Vec2::new(80.0, 80.0)));
+                                                ui.add(egui::Image::new(texture).max_size(Vec2::new(150.0, 150.0)));
                                             } else {
-                                                ui.add_sized([80.0, 80.0], egui::Label::new(
+                                                ui.add_sized([50.0, 50.0], egui::Label::new(
                                                     RichText::new("🖼️").size(30.0)
                                                 ));
                                             }
@@ -2510,7 +2510,7 @@ impl ClientAppV2 {
                                     .rounding(Rounding::same(8.0))
                                     .inner_margin(egui::Margin::same(8.0))
                                     .show(ui, |ui| {
-                                        ui.set_width(100.0);
+                                        ui.set_width(130.0);
                                         
                                         if i < self.my_gallery.len() {
                                             let data_url = &self.my_gallery[i];
@@ -2522,9 +2522,9 @@ impl ClientAppV2 {
                                             }
                                             
                                             if let Some(texture) = &self.my_gallery_textures[i] {
-                                                ui.add(egui::Image::new(texture).max_size(Vec2::new(80.0, 80.0)));
+                                                ui.add(egui::Image::new(texture).fit_to_exact_size(Vec2::new(130.0, 130.0)));
                                             } else {
-                                                ui.add_sized([80.0, 80.0], egui::Label::new(
+                                                ui.add_sized([50.0, 50.0], egui::Label::new(
                                                     RichText::new("🖼️").size(30.0)
                                                 ));
                                             }
@@ -2532,6 +2532,7 @@ impl ClientAppV2 {
                                             ui.add_sized([80.0, 80.0], egui::Label::new(""));
                                         }
                                     });
+                                ui.add_space(20.0);
                             }
                         });
                     
