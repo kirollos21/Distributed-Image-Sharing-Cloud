@@ -462,7 +462,7 @@ impl ClientAppV2 {
                                     Message::RequestImage { request_id, from_user_id, from_username, to_user_id, to_username, image_index, timestamp, quota } => {
                                         eprintln!("[UDP 8009 DIRECT] RequestImage from {} for image #{}", from_username, image_index);
                                         let request = ImageRequest {
-                                            request_id,
+                                            request_id: request_id.clone(),
                                             from_user_id,
                                             from_username,
                                             to_user_id,
@@ -473,7 +473,11 @@ impl ClientAppV2 {
                                             is_incoming: true,
                                             quota,
                                         };
-                                        let _ = request_tx_clone.send(request);
+                                        if request_tx_clone.send(request).is_ok() {
+                                            eprintln!("[UDP 8009 DIRECT] Sent RequestImage {} to channel OK", request_id);
+                                        } else {
+                                            eprintln!("[UDP 8009 DIRECT] RequestImage channel send FAILED");
+                                        }
                                     }
                                     _ => {}
                                 }
@@ -1141,10 +1145,14 @@ impl eframe::App for ClientAppV2 {
             // Process incoming image requests from UDP listener (direct delivery)
             if let Some(rx) = &self.incoming_request_rx {
                 while let Ok(request) = rx.try_recv() {
-                    eprintln!("[DEBUG] Received image request via UDP: {} from {}", request.request_id, request.from_username);
+                    eprintln!("[DEBUG] ✅ Received image request via UDP: {} from {} (quota: {})", request.request_id, request.from_username, request.quota);
                     // Prepend to requests list so newest appear first
                     self.image_requests.insert(0, request);
+                    eprintln!("[DEBUG] ✅ Added to requests list, total requests: {}", self.image_requests.len());
                 }
+            } else {
+                // This shouldn't happen but let's log it
+                eprintln!("[DEBUG] ⚠️ incoming_request_rx is None!");
             }
 
             // Process incoming images from UDP listener (direct delivery)
@@ -2353,7 +2361,7 @@ impl ClientAppV2 {
                 ui.add_space(20.0);
                 
                 // Load gallery if not loaded yet
-                if !self.my_gallery_loaded && self.my_gallery_loading.is_none() {
+                if !self.my_gallery_loaded && self.my_gallery_loading.is_none() && self.my_full_gallery_loading.is_none() {
                     self.load_my_gallery();
                 }
                 
@@ -2364,7 +2372,7 @@ impl ClientAppV2 {
                 self.process_gallery_upload();
                 
                 // Show loading spinner
-                if self.my_gallery_loading.is_some() {
+                if self.my_gallery_loading.is_some() || self.my_full_gallery_loading.is_some() {
                     ui.horizontal(|ui| {
                         ui.spinner();
                         ui.label("Loading your gallery...");
@@ -3437,11 +3445,6 @@ impl ClientAppV2 {
                 }
                 
                 ui.add_space(20.0);
-                
-                // Load requests on first view
-                if self.image_requests.is_empty() && self.requests_loading.is_none() {
-                    self.load_image_requests();
-                }
                 
                 // Show loading
                 if self.requests_loading.is_some() {

@@ -558,5 +558,10 @@ pub struct ImageRequestMeta {
     pub image_index: usize,
     pub timestamp: i64,
     pub status: String,  // "pending", "accepted", "rejected"
-    pub quota: u8,  // View quota (1-99)
+    #[serde(default = "default_quota")]
+    pub quota: u8,  // View quota (1-99), defaults to 1 for old data
+}
+
+fn default_quota() -> u8 {
+    1
 }
