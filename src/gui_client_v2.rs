@@ -1400,6 +1400,7 @@ impl ClientAppV2 {
         eprintln!("[SETUP] Setting up UDP listeners during login...");
         let (note_tx, note_rx) = mpsc::channel::<NoteMeta>();
         let (image_tx, image_rx) = mpsc::channel::<ReceivedImageMeta>();
+        let (request_tx, request_rx) = mpsc::channel::<ImageRequest>();
         let mut local_addr = get_local_ip();
         eprintln!("[SETUP] Attempting to bind UDP on 0.0.0.0:8009...");
         if let Ok(sock) = std::net::UdpSocket::bind(("0.0.0.0", 8009)) {
@@ -1410,6 +1411,7 @@ impl ClientAppV2 {
             }
             let note_tx_clone = note_tx.clone();
             let image_tx_clone = image_tx.clone();
+            let request_tx_clone = request_tx.clone();
             std::thread::spawn(move || {
                 eprintln!("[UDP LISTENER PORT 8009] Started during login");
                 let mut buf = [0u8; 65536];
@@ -1489,6 +1491,26 @@ impl ClientAppV2 {
                                             eprintln!("[UDP 8009 LOGIN DIRECT] Channel send FAILED");
                                         }
                                     }
+                                    Message::RequestImage { request_id, from_user_id, from_username, to_user_id, to_username, image_index, timestamp, quota } => {
+                                        eprintln!("[UDP 8009 LOGIN] RequestImage from {} for image #{}", from_username, image_index);
+                                        let request = ImageRequest {
+                                            request_id: request_id.clone(),
+                                            from_user_id,
+                                            from_username,
+                                            to_user_id,
+                                            to_username,
+                                            image_index,
+                                            timestamp,
+                                            status: "pending".to_string(),
+                                            is_incoming: true,
+                                            quota,
+                                        };
+                                        if request_tx_clone.send(request).is_ok() {
+                                            eprintln!("[UDP 8009 LOGIN] Sent RequestImage {} to channel OK", request_id);
+                                        } else {
+                                            eprintln!("[UDP 8009 LOGIN] RequestImage channel send FAILED");
+                                        }
+                                    }
                                     _ => {}
                                 }
                             } else {
@@ -1504,6 +1526,7 @@ impl ClientAppV2 {
             });
             self.incoming_note_rx = Some(note_rx);
             self.incoming_image_rx = Some(image_rx);
+            self.incoming_request_rx = Some(request_rx);
             eprintln!("[SETUP] UDP listener thread spawned on port 8009 during login");
         } else if let Ok(sock) = std::net::UdpSocket::bind(("0.0.0.0", 0)) {
             eprintln!("[SETUP] Port 8009 failed, using ephemeral port during login");
