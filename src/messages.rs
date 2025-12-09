@@ -273,6 +273,36 @@ pub enum Message {
         success: bool,
         error: Option<String>,
     },
+    
+    // P2P Share notification (sent when share is accepted)
+    ShareAccepted {
+        share_id: String,
+        image_id: String,
+        from_user_id: String,
+        from_username: String,
+        to_user_id: String,
+        to_username: String,
+        encrypted_data: Vec<u8>,  // The encrypted image
+        views_total: u8,
+    },
+    
+    // P2P Note delivery
+    DirectNote {
+        note_id: String,
+        from_user: String,
+        to_user: String,
+        content: String,
+        timestamp: i64,
+    },
+    
+    // P2P View increase notification
+    ViewsIncreased {
+        share_id: String,
+        image_id: String,
+        to_user_id: String,
+        new_views_remaining: u8,
+        new_views_total: u8,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -435,6 +465,15 @@ impl fmt::Display for Message {
             }
             Message::DeleteImageRequestResponse { success, .. } => {
                 write!(f, "DELETE_IMAGE_REQUEST_RESPONSE (success: {})", success)
+            }
+            Message::ShareAccepted { share_id, image_id, from_username, to_username, views_total, .. } => {
+                write!(f, "SHARE_ACCEPTED {} (image: {}) from {} to {} (views: {})", share_id, image_id, from_username, to_username, views_total)
+            }
+            Message::DirectNote { note_id, from_user, to_user, .. } => {
+                write!(f, "DIRECT_NOTE {} from {} to {}", note_id, from_user, to_user)
+            }
+            Message::ViewsIncreased { share_id, image_id, new_views_total, .. } => {
+                write!(f, "VIEWS_INCREASED {} (image: {}, new total: {})", share_id, image_id, new_views_total)
             }
         }
     }

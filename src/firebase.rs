@@ -281,6 +281,17 @@ impl FireBaseClient {
         Ok(())
     }
     
+    /// Check if a user is online (last_seen within 60 seconds)
+    pub async fn is_user_online(&self, user_id: &str) -> Result<bool, reqwest::Error> {
+        if let Some(user) = self.get_user(user_id).await? {
+            let now = chrono::Utc::now().timestamp();
+            let is_online = (now - user.last_seen) < 60;
+            Ok(is_online)
+        } else {
+            Ok(false)
+        }
+    }
+    
     /// Update full resolution gallery (stores original images for sending when requested)
     pub async fn update_full_gallery(&self, id: &str, full_gallery: &Vec<String>) -> Result<(), reqwest::Error> {
         let url = format!("{}/users/{}/full_gallery.json", self.base_url, id);
@@ -647,6 +658,8 @@ pub struct ShareMetadata {
     pub views_total: u8,
     pub created_at: i64,
     pub updated_at: i64,
+    #[serde(default)]
+    pub downloaded: bool,  // True if image has been downloaded to a device
 }
 
 impl FireBaseClient {
@@ -775,6 +788,20 @@ impl FireBaseClient {
     pub async fn update_share_views(&self, image_id: &str, user_id: &str, views_remaining: u8) -> Result<(), reqwest::Error> {
         let url = format!("{}/image_shares/{}/{}/views_remaining.json", self.base_url, image_id, user_id);
         self.client.put(&url).json(&views_remaining).send().await?;
+        Ok(())
+    }
+    
+    /// Update both total and remaining views for a share
+    pub async fn update_share_total_views(&self, image_id: &str, user_id: &str, views_total: u8, views_remaining: u8) -> Result<(), reqwest::Error> {
+        let total_url = format!("{}/image_shares/{}/{}/views_total.json", self.base_url, image_id, user_id);
+        let remaining_url = format!("{}/image_shares/{}/{}/views_remaining.json", self.base_url, image_id, user_id);
+        
+        let (r1, r2) = tokio::join!(
+            self.client.put(&total_url).json(&views_total).send(),
+            self.client.put(&remaining_url).json(&views_remaining).send()
+        );
+        r1?;
+        r2?;
         Ok(())
     }
     
@@ -981,6 +1008,13 @@ impl FireBaseClient {
     pub async fn delete_share_metadata(&self, user_id: &str, share_id: &str) -> Result<(), reqwest::Error> {
         let url = format!("{}/share_metadata/{}/{}.json", self.base_url, user_id, share_id);
         self.client.delete(&url).send().await?;
+        Ok(())
+    }
+    
+    /// Mark share metadata as downloaded (one device only)
+    pub async fn mark_share_downloaded(&self, user_id: &str, share_id: &str) -> Result<(), reqwest::Error> {
+        let url = format!("{}/share_metadata/{}/{}/downloaded.json", self.base_url, user_id, share_id);
+        self.client.put(&url).json(&true).send().await?;
         Ok(())
     }
 }

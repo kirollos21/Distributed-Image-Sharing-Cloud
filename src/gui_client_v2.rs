@@ -150,6 +150,8 @@ pub struct ClientAppV2 {
     image_shares_loading: Option<Promise<Result<Vec<ImageShare>, String>>>,
     current_image_shares: Vec<ImageShare>,
     revoke_share_in_progress: Option<Promise<Result<(), String>>>,
+    editing_share_views: Option<(String, u8)>,  // (share_id, new_views)
+    update_share_views_in_progress: Option<Promise<Result<(), String>>>,
     
     // Shared With Me (images others shared with me)
     shared_with_me: Vec<(CloudImage, ImageShare)>,
@@ -380,6 +382,8 @@ impl ClientAppV2 {
             image_shares_loading: None,
             current_image_shares: Vec::new(),
             revoke_share_in_progress: None,
+            editing_share_views: None,
+            update_share_views_in_progress: None,
             shared_with_me: Vec::new(),
             shared_with_me_loading: None,
             shared_with_me_loaded: false,
@@ -565,6 +569,41 @@ impl ClientAppV2 {
                                                     eprintln!("[UDP 8009] Channel send FAILED");
                                                 }
                                             }
+                                            Message::ShareAccepted { share_id, image_id, from_username, encrypted_data, views_total, .. } => {
+                                                eprintln!("[UDP 8009] ShareAccepted from {} (image: {}, {} bytes, views: {})", 
+                                                         from_username, image_id, encrypted_data.len(), views_total);
+                                                
+                                                // Save encrypted image and metadata locally
+                                                let user_id = ""; // Will be filled from session
+                                                let dir_path = format!("./received_images/{}", user_id);
+                                                if let Err(e) = std::fs::create_dir_all(&dir_path) {
+                                                    eprintln!("[UDP 8009] Failed to create directory: {}", e);
+                                                } else {
+                                                    // Save encrypted image
+                                                    let enc_path = format!("{}/{}.enc", dir_path, image_id);
+                                                    if let Err(e) = std::fs::write(&enc_path, &encrypted_data) {
+                                                        eprintln!("[UDP 8009] Failed to save encrypted image: {}", e);
+                                                    } else {
+                                                        eprintln!("[UDP 8009] Saved encrypted image to {}", enc_path);
+                                                        
+                                                        // Save metadata
+                                                        let meta = serde_json::json!({
+                                                            "image_id": image_id,
+                                                            "share_id": share_id,
+                                                            "from_user": from_username,
+                                                            "views_remaining": views_total,
+                                                            "views_total": views_total,
+                                                            "downloaded": true,
+                                                        });
+                                                        let meta_path = format!("{}/{}.meta.json", dir_path, image_id);
+                                                        if let Err(e) = std::fs::write(&meta_path, meta.to_string()) {
+                                                            eprintln!("[UDP 8009] Failed to save metadata: {}", e);
+                                                        } else {
+                                                            eprintln!("[UDP 8009] Saved metadata to {}", meta_path);
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             Message::RequestImage { request_id, from_user_id, from_username, to_user_id, to_username, image_index, timestamp, quota } => {
                                                 eprintln!("[UDP 8009] RequestImage from {} for image #{}", from_username, image_index);
                                                 let request = ImageRequest {
@@ -615,6 +654,40 @@ impl ClientAppV2 {
                                                 } else {
                                                     eprintln!("[UDP 8009 DIRECT] Channel send FAILED");
                                                 }
+                                    }
+                                    Message::ShareAccepted { share_id, image_id, from_username, to_user_id, encrypted_data, views_total, .. } => {
+                                        eprintln!("[UDP 8009 DIRECT] ShareAccepted from {} (image: {}, {} bytes, views: {})", 
+                                                 from_username, image_id, encrypted_data.len(), views_total);
+                                        
+                                        // Save encrypted image and metadata locally
+                                        let dir_path = format!("./received_images/{}", to_user_id);
+                                        if let Err(e) = std::fs::create_dir_all(&dir_path) {
+                                            eprintln!("[UDP 8009 DIRECT] Failed to create directory: {}", e);
+                                        } else {
+                                            // Save encrypted image
+                                            let enc_path = format!("{}/{}.enc", dir_path, image_id);
+                                            if let Err(e) = std::fs::write(&enc_path, &encrypted_data) {
+                                                eprintln!("[UDP 8009 DIRECT] Failed to save encrypted image: {}", e);
+                                            } else {
+                                                eprintln!("[UDP 8009 DIRECT] Saved encrypted image to {}", enc_path);
+                                                
+                                                // Save metadata
+                                                let meta = serde_json::json!({
+                                                    "image_id": image_id,
+                                                    "share_id": share_id,
+                                                    "from_user": from_username,
+                                                    "views_remaining": views_total,
+                                                    "views_total": views_total,
+                                                    "downloaded": true,
+                                                });
+                                                let meta_path = format!("{}/{}.meta.json", dir_path, image_id);
+                                                if let Err(e) = std::fs::write(&meta_path, meta.to_string()) {
+                                                    eprintln!("[UDP 8009 DIRECT] Failed to save metadata: {}", e);
+                                                } else {
+                                                    eprintln!("[UDP 8009 DIRECT] Saved metadata to {}", meta_path);
+                                                }
+                                            }
+                                        }
                                     }
                                     Message::RequestImage { request_id, from_user_id, from_username, to_user_id, to_username, image_index, timestamp, quota } => {
                                         eprintln!("[UDP 8009 DIRECT] RequestImage from {} for image #{}", from_username, image_index);
@@ -5329,24 +5402,36 @@ impl ClientAppV2 {
                     // Download encrypted image and metadata from Firebase
                     eprintln!("[VIEW] Downloading encrypted image and metadata from Firebase...");
                     
-                    // Get the cloud image
-                    let image = firebase.get_cloud_image(&image_id).await
-                        .map_err(|e| format!("Failed to get image: {}", e))?
-                        .ok_or_else(|| "Image not found".to_string())?;
-                    
-                    // Get metadata from Firebase
+                    // Get metadata from Firebase FIRST to check downloaded flag
                     metadata = firebase.get_share_metadata(&user_id, &share_clone.share_id).await
                         .map_err(|e| format!("Failed to get metadata: {}", e))?
                         .ok_or_else(|| "Share metadata not found".to_string())?;
+                    
+                    // Check if image was already downloaded on another device
+                    if metadata.downloaded {
+                        return Err("This image has already been downloaded on another device. You can only download shared images on one device for security reasons.".to_string());
+                    }
                     
                     if metadata.views_remaining == 0 {
                         return Err("No views remaining. Request more views from the owner.".to_string());
                     }
                     
+                    // Get the cloud image
+                    let image = firebase.get_cloud_image(&image_id).await
+                        .map_err(|e| format!("Failed to get image: {}", e))?
+                        .ok_or_else(|| "Image not found".to_string())?;
+                    
                     // Decode encrypted data
                     encrypted_data = base64::engine::general_purpose::STANDARD
                         .decode(&image.encrypted_data)
                         .map_err(|e| format!("Failed to decode image: {}", e))?;
+                    
+                    // Mark as downloaded in Firebase to prevent download on other devices
+                    firebase.mark_share_downloaded(&user_id, &share_clone.share_id).await
+                        .map_err(|e| format!("Failed to mark as downloaded: {}", e))?;
+                    
+                    // Update local metadata to reflect downloaded status
+                    metadata.downloaded = true;
                     
                     // Save encrypted image and metadata locally
                     std::fs::create_dir_all(&cache_dir)
@@ -5360,7 +5445,7 @@ impl ClientAppV2 {
                     std::fs::write(&metadata_path, metadata_json)
                         .map_err(|e| format!("Failed to save metadata: {}", e))?;
                     
-                    eprintln!("[VIEW] Downloaded and cached encrypted image + metadata");
+                    eprintln!("[VIEW] Downloaded and cached encrypted image + metadata (marked as downloaded)");
                 }
                 
                 // Decrypt the image
@@ -5701,11 +5786,58 @@ impl ClientAppV2 {
                         views_total: request.requested_views,
                         created_at: timestamp,
                         updated_at: timestamp,
+                        downloaded: false,
                     };
                     firebase.create_share_metadata(&metadata).await
                         .map_err(|e| format!("Failed to create share metadata: {}", e))?;
                     
                     eprintln!("[SHARE] Created share and metadata for {} on image {}", request.from_username, request.image_id);
+                    
+                    // Check if requester is online and send P2P notification
+                    match firebase.is_user_online(&request.from_user_id).await {
+                        Ok(true) => {
+                            // User is online - try to send directly
+                            if let Ok(Some(user_ip)) = firebase.get_user_ip(&request.from_user_id).await {
+                                eprintln!("[P2P] Requester {} is online at {}, sending direct notification", request.from_username, user_ip);
+                                
+                                // Get encrypted image data from Firebase
+                                if let Ok(Some(image)) = firebase.get_cloud_image(&request.image_id).await {
+                                    let encrypted_data = match base64::engine::general_purpose::STANDARD.decode(&image.encrypted_data) {
+                                        Ok(data) => data,
+                                        Err(e) => {
+                                            eprintln!("[P2P] Failed to decode encrypted data: {}", e);
+                                            return Ok((request_id_clone, accepted));
+                                        }
+                                    };
+                                    
+                                    // Send ShareAccepted message via P2P
+                                    let share_msg = Message::ShareAccepted {
+                                        share_id: share_id.clone(),
+                                        image_id: request.image_id.clone(),
+                                        from_user_id: user_id.clone(),
+                                        from_username: username.clone(),
+                                        to_user_id: request.from_user_id.clone(),
+                                        to_username: request.from_username.clone(),
+                                        encrypted_data,
+                                        views_total: request.requested_views,
+                                    };
+                                    
+                                    // Send via UDP
+                                    if let Err(e) = send_p2p_message(&user_ip, share_msg).await {
+                                        eprintln!("[P2P] Failed to send direct notification: {}", e);
+                                    } else {
+                                        eprintln!("[P2P] Successfully sent share notification to {}", request.from_username);
+                                    }
+                                }
+                            }
+                        }
+                        Ok(false) => {
+                            eprintln!("[P2P] Requester {} is offline, they will fetch from Firebase", request.from_username);
+                        }
+                        Err(e) => {
+                            eprintln!("[P2P] Error checking online status: {}", e);
+                        }
+                    }
                 }
                 
                 Ok((request_id_clone, accepted))
@@ -6047,6 +6179,7 @@ impl ClientAppV2 {
     fn render_share_item(&mut self, ui: &mut egui::Ui, share: &ImageShare) {
         let share_id = share.share_id.clone();
         let share_clone = share.clone();
+        let is_editing = self.editing_share_views.as_ref().map(|(id, _)| id == &share_id).unwrap_or(false);
         
         egui::Frame::default()
             .fill(AppColors::BG_CARD)
@@ -6059,9 +6192,22 @@ impl ClientAppV2 {
                             .size(15.0)
                             .color(AppColors::TEXT_PRIMARY)
                             .strong());
-                        ui.label(RichText::new(format!("Views: {} / {}", share.views_remaining, share.views_total))
-                            .size(13.0)
-                            .color(AppColors::TEXT_SECONDARY));
+                        
+                        if is_editing {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Total views:").size(13.0).color(AppColors::TEXT_SECONDARY));
+                                if let Some((_, ref mut new_views)) = self.editing_share_views {
+                                    ui.add(egui::DragValue::new(new_views)
+                                        .speed(1)
+                                        .clamp_range(1..=255)
+                                        .suffix(" views"));
+                                }
+                            });
+                        } else {
+                            ui.label(RichText::new(format!("Views: {} / {}", share.views_remaining, share.views_total))
+                                .size(13.0)
+                                .color(AppColors::TEXT_SECONDARY));
+                        }
                         
                         let date = chrono::DateTime::from_timestamp(share.shared_at, 0)
                             .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
@@ -6072,15 +6218,87 @@ impl ClientAppV2 {
                     });
                     
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add(egui::Button::new(RichText::new("🗑️ Revoke").size(12.0))
-                            .fill(AppColors::ERROR.linear_multiply(0.8))
-                            .rounding(Rounding::same(4.0))
-                            .min_size(Vec2::new(80.0, 28.0))).clicked() {
-                            self.revoke_share(&share_clone);
+                        if is_editing {
+                            if ui.add(egui::Button::new(RichText::new("✖ Cancel").size(11.0))
+                                .fill(AppColors::ERROR.linear_multiply(0.6))
+                                .rounding(Rounding::same(4.0))
+                                .min_size(Vec2::new(70.0, 26.0))).clicked() {
+                                self.editing_share_views = None;
+                            }
+                            ui.add_space(5.0);
+                            if ui.add(egui::Button::new(RichText::new("✓ Save").size(11.0))
+                                .fill(AppColors::PRIMARY)
+                                .rounding(Rounding::same(4.0))
+                                .min_size(Vec2::new(70.0, 26.0))).clicked() {
+                                if let Some((_, new_views)) = self.editing_share_views.take() {
+                                    self.update_share_quota(&share_clone, new_views);
+                                }
+                            }
+                        } else {
+                            if ui.add(egui::Button::new(RichText::new("🗑️ Revoke").size(11.0))
+                                .fill(AppColors::ERROR.linear_multiply(0.8))
+                                .rounding(Rounding::same(4.0))
+                                .min_size(Vec2::new(75.0, 26.0))).clicked() {
+                                self.revoke_share(&share_clone);
+                            }
+                            ui.add_space(5.0);
+                            if ui.add(egui::Button::new(RichText::new("✏️ Edit").size(11.0))
+                                .fill(AppColors::PRIMARY.linear_multiply(0.8))
+                                .rounding(Rounding::same(4.0))
+                                .min_size(Vec2::new(75.0, 26.0))).clicked() {
+                                self.editing_share_views = Some((share_id.clone(), share.views_total));
+                            }
                         }
                     });
                 });
             });
+    }
+    
+    fn update_share_quota(&mut self, share: &ImageShare, new_total_views: u8) {
+        let share_id_for_update = share.share_id.clone();
+        let share = share.clone();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        
+        let promise = Promise::spawn_thread("update_share_quota", move || {
+            runtime.block_on(async move {
+                let firebase = FireBaseClient::new();
+                
+                // Calculate new remaining views (keep the same proportion if possible)
+                let views_used = share.views_total.saturating_sub(share.views_remaining);
+                let new_remaining = new_total_views.saturating_sub(views_used);
+                
+                // Update ImageShare record
+                firebase.update_share_total_views(&share.image_id, &share.user_id, new_total_views, new_remaining).await
+                    .map_err(|e| format!("Failed to update share views: {}", e))?;
+                
+                // Update ShareMetadata file
+                firebase.update_share_metadata_views(&share.user_id, &share.share_id, new_remaining).await
+                    .map_err(|e| format!("Failed to update metadata views: {}", e))?;
+                
+                // Also update the total in metadata
+                let url = format!("https://dist-b6621-default-rtdb.europe-west1.firebasedatabase.app/share_metadata/{}/{}/views_total.json",
+                    share.user_id, share.share_id);
+                firebase.update_field(&url, &new_total_views).await
+                    .map_err(|e| format!("Failed to update metadata total: {}", e))?;
+                
+                eprintln!("[UPDATE_QUOTA] Updated quota for {} on image {} - total: {}, remaining: {}",
+                    share.username, share.image_id, new_total_views, new_remaining);
+                
+                Ok(())
+            })
+        });
+        
+        self.update_share_views_in_progress = Some(promise);
+        
+        // Update in local list immediately
+        for s in &mut self.current_image_shares {
+            if s.share_id == share_id_for_update {
+                let views_used = s.views_total.saturating_sub(s.views_remaining);
+                s.views_total = new_total_views;
+                s.views_remaining = new_total_views.saturating_sub(views_used);
+                break;
+            }
+        }
     }
     
     fn revoke_share(&mut self, share: &ImageShare) {
@@ -6170,4 +6388,38 @@ fn get_local_ip() -> String {
         }
     }
     "127.0.0.1".to_string()
+}
+
+// Helper function to send P2P messages via UDP
+async fn send_p2p_message(target_ip: &str, message: Message) -> Result<(), String> {
+    use tokio::net::UdpSocket;
+    
+    let socket = UdpSocket::bind("0.0.0.0:0").await
+        .map_err(|e| format!("Failed to bind UDP socket: {}", e))?;
+    
+    // Serialize message to JSON
+    let json = serde_json::to_vec(&message)
+        .map_err(|e| format!("Failed to serialize message: {}", e))?;
+    
+    // Check if we need to chunk the message (if larger than 60KB)
+    if json.len() > 60000 {
+        // Large message - send in chunks
+        let chunks = crate::chunking::ChunkedMessage::fragment(json);
+        let target_addr = format!("{}:8009", target_ip);
+        
+        for chunk in chunks {
+            let chunk_json = serde_json::to_vec(&chunk)
+                .map_err(|e| format!("Failed to serialize chunk: {}", e))?;
+            
+            socket.send_to(&chunk_json, &target_addr).await
+                .map_err(|e| format!("Failed to send chunk: {}", e))?;
+        }
+    } else {
+        // Small message - send directly
+        let target_addr = format!("{}:8009", target_ip);
+        socket.send_to(&json, &target_addr).await
+            .map_err(|e| format!("Failed to send message: {}", e))?;
+    }
+    
+    Ok(())
 }

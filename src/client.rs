@@ -352,10 +352,10 @@ impl Client {
         let mut buffer = vec![0u8; 65535]; // Max UDP packet size
 
         // Loop to receive all chunks
-        debug!("[Client {}] Waiting for response from {} (3s timeout)...", client_id, address);
+        debug!("[Client {}] Waiting for response from {} (15s timeout)...", client_id, address);
         loop {
-            // Read response with timeout - reduced from 10s to 3s for faster failure detection
-            let n = match tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buffer)).await
+            // Read response with timeout - 15s to allow for encryption + Firebase upload
+            let n = match tokio::time::timeout(Duration::from_secs(15), socket.recv_from(&mut buffer)).await
             {
                 Ok(Ok((n, _))) => {
                     debug!("[Client {}] Received {} bytes from {}", client_id, n, address);
