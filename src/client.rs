@@ -183,6 +183,27 @@ impl Client {
         usernames: Vec<String>,
         quota: u8,
     ) -> Result<Message, String> {
+        self.send_encryption_request_with_image_id(
+            request_id,
+            client_username,
+            image_data,
+            usernames,
+            quota,
+            None,
+        ).await
+    }
+
+    /// Send an encryption request with optional image_id for cloud storage
+    /// If image_id is provided, node will update Firebase with encrypted data
+    pub async fn send_encryption_request_with_image_id(
+        &self,
+        request_id: String,
+        client_username: String,
+        image_data: Vec<u8>,
+        usernames: Vec<String>,
+        quota: u8,
+        image_id: Option<String>,
+    ) -> Result<Message, String> {
         let message = Message::EncryptionRequest {
             request_id: request_id.clone(),
             client_username,
@@ -191,6 +212,7 @@ impl Client {
             quota,
             forwarded: false,
             client_address: None, // Will be captured by first node that receives it
+            image_id,
         };
 
         debug!("[Client {}] Multicasting request: {}", self.id, request_id);

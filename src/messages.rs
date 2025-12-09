@@ -78,6 +78,7 @@ pub enum Message {
         quota: u8,
         forwarded: bool, // Prevent infinite forwarding loops
         client_address: Option<String>, // Original client address for direct response
+        image_id: Option<String>, // For cloud storage: node will update Firebase
     },
     DecryptionRequest {
         request_id: String,

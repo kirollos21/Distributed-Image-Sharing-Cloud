@@ -125,6 +125,11 @@ impl FireBaseClient {
         }
     }
 
+    /// Update a specific field in Firebase (generic PUT)
+    pub async fn update_field<T: serde::Serialize>(&self, url: &str, value: &T) -> Result<(), reqwest::Error> {
+        self.client.put(url).json(value).send().await?;
+        Ok(())
+    }
 
     pub async fn create_user(&self, info: &UserInfo) -> Result<(), reqwest::Error>
     {
@@ -583,7 +588,8 @@ pub struct CloudImage {
     pub image_id: String,
     pub owner_id: String,
     pub owner_username: String,
-    pub encrypted_data: String,  // Base64 encoded encrypted image
+    pub original_data: String,   // Base64 encoded original unencrypted image
+    pub encrypted_data: String,  // Base64 encoded LSB-steganography encrypted image (with embedded metadata)
     pub preview_data: String,    // Base64 encoded pixelated preview
     pub filename: String,
     pub created_at: i64,
@@ -628,6 +634,19 @@ pub struct ViewIncreaseRequest {
     pub additional_views: u8,
     pub status: String,          // "pending", "accepted", "rejected"
     pub timestamp: i64,
+}
+
+/// Metadata file for a shared image (user-specific quota)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareMetadata {
+    pub image_id: String,
+    pub share_id: String,
+    pub user_id: String,
+    pub username: String,
+    pub views_remaining: u8,
+    pub views_total: u8,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 impl FireBaseClient {
@@ -919,6 +938,49 @@ impl FireBaseClient {
         );
         r1?;
         r2?;
+        Ok(())
+    }
+}
+impl FireBaseClient {
+    // ==================== SHARE METADATA FILES ====================
+    
+    /// Create or update metadata file for a share
+    pub async fn create_share_metadata(&self, metadata: &ShareMetadata) -> Result<(), reqwest::Error> {
+        let url = format!("{}/share_metadata/{}/{}.json",
+            self.base_url, metadata.user_id, metadata.share_id);
+        self.client.put(&url).json(metadata).send().await?;
+        Ok(())
+    }
+    
+    /// Get metadata file for a specific share
+    pub async fn get_share_metadata(&self, user_id: &str, share_id: &str) -> Result<Option<ShareMetadata>, reqwest::Error> {
+        let url = format!("{}/share_metadata/{}/{}.json", self.base_url, user_id, share_id);
+        let resp = self.client.get(&url).send().await?;
+        Ok(resp.json().await?)
+    }
+    
+    /// Update views remaining in metadata file
+    pub async fn update_share_metadata_views(&self, user_id: &str, share_id: &str, views_remaining: u8) -> Result<(), reqwest::Error> {
+        let timestamp = chrono::Utc::now().timestamp();
+        
+        let views_url = format!("{}/share_metadata/{}/{}/views_remaining.json",
+            self.base_url, user_id, share_id);
+        let updated_url = format!("{}/share_metadata/{}/{}/updated_at.json",
+            self.base_url, user_id, share_id);
+        
+        let (r1, r2) = tokio::join!(
+            self.client.put(&views_url).json(&views_remaining).send(),
+            self.client.put(&updated_url).json(&timestamp).send()
+        );
+        r1?;
+        r2?;
+        Ok(())
+    }
+    
+    /// Delete metadata file (when views exhausted or share revoked)
+    pub async fn delete_share_metadata(&self, user_id: &str, share_id: &str) -> Result<(), reqwest::Error> {
+        let url = format!("{}/share_metadata/{}/{}.json", self.base_url, user_id, share_id);
+        self.client.delete(&url).send().await?;
         Ok(())
     }
 }

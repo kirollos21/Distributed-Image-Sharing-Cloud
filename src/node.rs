@@ -506,6 +506,7 @@ impl CloudNode {
                 quota,
                 forwarded,
                 client_address,
+                image_id,
             } => {
                 // Check if this request is already being processed (deduplication)
                 {
@@ -554,6 +555,7 @@ impl CloudNode {
                         quota,
                         forwarded: true, // Mark as forwarded from non-coordinator
                         client_address: client_addr,
+                        image_id: image_id.clone(),
                     };
 
                     match self.send_message_to_node(coordinator_id, forward_message).await {
@@ -590,7 +592,7 @@ impl CloudNode {
                     // Process encryption locally
                     let self_clone = Arc::new(self.clone());
                     let result = self_clone
-                        .process_encryption_request(request_id.clone(), image_data, usernames, quota)
+                        .process_encryption_request(request_id.clone(), image_data, usernames, quota, image_id.clone())
                         .await;
 
                     // If we have a client_address, send response directly to client
@@ -1597,6 +1599,7 @@ impl CloudNode {
         image_data: Vec<u8>,
         usernames: Vec<String>,
         quota: u8,
+        image_id: Option<String>,
     ) -> Message {
         let start_time = Instant::now();
 
@@ -1618,6 +1621,26 @@ impl CloudNode {
                     "[Node {}] Successfully encrypted request: {} (total: {})",
                     self.id, request_id, *processed
                 );
+
+                // If image_id is provided, upload encrypted data to Firebase
+                if let Some(ref img_id) = image_id {
+                    info!("[Node {}] Uploading encrypted data to Firebase for image_id: {}", self.id, img_id);
+                    
+                    let encrypted_base64 = base64::engine::general_purpose::STANDARD.encode(&encrypted_image);
+                    
+                    // Update Firebase with encrypted data
+                    let firebase = crate::firebase::FireBaseClient::new();
+                    let url = format!("https://dist-b6621-default-rtdb.europe-west1.firebasedatabase.app/cloud_images/{}/encrypted_data.json", img_id);
+                    
+                    match firebase.update_field(&url, &encrypted_base64).await {
+                        Ok(_) => {
+                            info!("[Node {}] Successfully uploaded encrypted data to Firebase for {}", self.id, img_id);
+                        }
+                        Err(e) => {
+                            error!("[Node {}] Failed to upload encrypted data to Firebase for {}: {}", self.id, img_id, e);
+                        }
+                    }
+                }
 
                 Message::EncryptionResponse {
                     request_id: request_id.clone(),

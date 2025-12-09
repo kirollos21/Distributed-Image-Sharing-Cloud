@@ -2,7 +2,7 @@
 // Features: Login, Register, My Images, Shared With Me, Browse Users, Requests, Notes, Settings
 
 use crate::client::Client;
-use crate::firebase::{FireBaseClient, UserInfo, UserStatus, ReceivedImageMeta, NoteMeta, CloudImage, ImageShare, ShareRequest, ViewIncreaseRequest};
+use crate::firebase::{FireBaseClient, UserInfo, UserStatus, ReceivedImageMeta, NoteMeta, CloudImage, ImageShare, ShareRequest, ViewIncreaseRequest, ShareMetadata};
 use crate::messages::Message;
 use crate::chunking::{ChunkReassembler, ChunkedMessage};
 use eframe::egui;
@@ -149,6 +149,7 @@ pub struct ClientAppV2 {
     selected_cloud_image: Option<String>,  // image_id of selected image for share management
     image_shares_loading: Option<Promise<Result<Vec<ImageShare>, String>>>,
     current_image_shares: Vec<ImageShare>,
+    revoke_share_in_progress: Option<Promise<Result<(), String>>>,
     
     // Shared With Me (images others shared with me)
     shared_with_me: Vec<(CloudImage, ImageShare)>,
@@ -378,6 +379,7 @@ impl ClientAppV2 {
             selected_cloud_image: None,
             image_shares_loading: None,
             current_image_shares: Vec::new(),
+            revoke_share_in_progress: None,
             shared_with_me: Vec::new(),
             shared_with_me_loading: None,
             shared_with_me_loaded: false,
@@ -1393,6 +1395,11 @@ impl eframe::App for ClientAppV2 {
         // Cloud share request popup window (new cloud model)
         if self.share_request_popup.is_some() {
             self.render_share_request_popup(ctx);
+        }
+        
+        // Manage shares popup window
+        if self.selected_cloud_image.is_some() {
+            self.render_manage_shares_popup(ctx);
         }
         
         // View increase request popup window (new cloud model)
@@ -4861,39 +4868,59 @@ impl ClientAppV2 {
                 .unwrap_or_else(|| "image.png".to_string());
             
             runtime.block_on(async move {
-                // Create pixelated preview (reuse existing pixelate function)
+                // Create pixelated preview
                 let preview_data = create_pixelated_preview(&image_data)?;
-                
-                // Encrypt image via node (encrypt for self)
-                let client = Client::new(0, cloud_addresses);
-                let recipient = format!("{}#{}", username, user_id);
-                let encrypted = crate::encryption::encrypt_image(
-                    image_data,
-                    vec![recipient],
-                    255,  // Max views for owner
-                ).await.map_err(|e| format!("Encryption failed: {}", e))?;
-                
-                let encrypted_base64 = base64::engine::general_purpose::STANDARD.encode(&encrypted);
                 
                 // Generate image ID
                 let image_id = format!("img_{}_{}", user_id, chrono::Utc::now().timestamp_millis());
                 
-                // Store in Firebase
+                // Encode original image
+                let original_base64 = base64::engine::general_purpose::STANDARD.encode(&image_data);
+                
+                // Step 1: Upload original + preview to Firebase first
                 let cloud_image = CloudImage {
                     image_id: image_id.clone(),
                     owner_id: user_id.clone(),
                     owner_username: username.clone(),
-                    encrypted_data: encrypted_base64,
+                    original_data: original_base64,
+                    encrypted_data: String::new(),  // Will be filled by node
                     preview_data,
                     filename,
                     created_at: chrono::Utc::now().timestamp(),
                 };
                 
+                eprintln!("[UPLOAD] Uploading original to Firebase...");
                 let firebase = FireBaseClient::new();
                 firebase.upload_cloud_image(&cloud_image).await
                     .map_err(|e| format!("Failed to upload to cloud: {}", e))?;
                 
-                Ok(image_id)
+                // Step 2: Send encryption request to node (node will upload encrypted version)
+                let request_id = format!("enc_{}_{}", user_id, chrono::Utc::now().timestamp_millis());
+                let recipient = format!("{}#{}", username, user_id);
+                
+                eprintln!("[UPLOAD] Sending encryption request to nodes with image_id {}...", image_id);
+                let client = Client::new(0, cloud_addresses);
+                let response = client.send_encryption_request_with_image_id(
+                    request_id,
+                    recipient.clone(),
+                    image_data,
+                    vec![recipient],  // Encrypt for self (owner)
+                    255,  // Max views for owner
+                    Some(image_id.clone()),  // Pass image_id for Firebase update
+                ).await.map_err(|e| format!("Node encryption failed: {}", e))?;
+                
+                // Verify encryption success (node handles upload)
+                match response {
+                    Message::EncryptionResponse { success, error, .. } => {
+                        if success {
+                            eprintln!("[UPLOAD] Upload complete: {}", image_id);
+                            Ok(image_id)
+                        } else {
+                            Err(format!("Encryption failed: {}", error.unwrap_or_else(|| "Unknown error".to_string())))
+                        }
+                    }
+                    _ => Err("Unexpected response from node".to_string()),
+                }
             })
         });
         
@@ -4973,6 +5000,23 @@ impl ClientAppV2 {
         self.image_shares_loading = Some(promise);
     }
     
+    fn process_image_shares_loading(&mut self) {
+        if let Some(promise) = &self.image_shares_loading {
+            if let Some(result) = promise.ready() {
+                match result {
+                    Ok(shares) => {
+                        self.current_image_shares = shares.clone();
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to load shares: {}", e);
+                        self.current_image_shares = Vec::new();
+                    }
+                }
+                self.image_shares_loading = None;
+            }
+        }
+    }
+    
     fn delete_cloud_image(&mut self, image_id: &str) {
         let image_id_for_delete = image_id.to_string();
         let image_id_for_filter = image_id.to_string();
@@ -5020,6 +5064,9 @@ impl ClientAppV2 {
                 // Process loading
                 self.process_shared_with_me_loading(ctx);
                 
+                // Process viewing result
+                self.process_viewing_shared_result(ctx);
+                
                 if self.shared_with_me_loading.is_some() {
                     ui.horizontal(|ui| {
                         ui.spinner();
@@ -5041,6 +5088,41 @@ impl ClientAppV2 {
                 }
             });
         });
+        
+        // Image viewer popup
+        let mut close_viewer = false;
+        if self.viewing_shared_texture.is_some() {
+            egui::Window::new("View Image")
+                .collapsible(false)
+                .resizable(true)
+                .default_size(Vec2::new(600.0, 500.0))
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    if let Some(texture) = &self.viewing_shared_texture {
+                        ui.vertical_centered(|ui| {
+                            // Show the image
+                            let available_size = ui.available_size();
+                            let max_size = Vec2::new(available_size.x - 20.0, available_size.y - 60.0);
+                            ui.add(egui::Image::from_texture(texture).fit_to_exact_size(max_size));
+                            
+                            ui.add_space(10.0);
+                            
+                            // Close button
+                            if ui.add(egui::Button::new(RichText::new("✖ Close").size(14.0))
+                                .fill(AppColors::ERROR)
+                                .rounding(Rounding::same(6.0))
+                                .min_size(Vec2::new(100.0, 36.0))).clicked() {
+                                close_viewer = true;
+                            }
+                        });
+                    }
+                });
+        }
+        
+        if close_viewer {
+            self.viewing_shared_texture = None;
+            self.viewing_shared_image = None;
+        }
     }
     
     fn render_shared_image_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, image: &CloudImage, share: &ImageShare) {
@@ -5154,6 +5236,55 @@ impl ClientAppV2 {
         }
     }
     
+    fn process_viewing_shared_result(&mut self, ctx: &egui::Context) {
+        if let Some(promise) = &self.viewing_shared_in_progress {
+            if let Some(result) = promise.ready() {
+                match result {
+                    Ok((image_data, new_views)) => {
+                        // Save decrypted image locally for offline viewing
+                        if let Some(image_id) = &self.viewing_shared_image {
+                            let cache_dir = Self::get_user_cache_dir(&self.session.user_id);
+                            let local_path = cache_dir.join(format!("{}.png", image_id));
+                            
+                            if let Err(e) = std::fs::write(&local_path, &image_data) {
+                                eprintln!("Failed to save shared image locally: {}", e);
+                            } else {
+                                eprintln!("Saved shared image to: {}", local_path.display());
+                            }
+                        }
+                        
+                        // Load the decrypted image as a texture
+                        if let Ok(img) = image::load_from_memory(&image_data) {
+                            let rgba = img.to_rgba8();
+                            let size = [rgba.width() as usize, rgba.height() as usize];
+                            let pixels = rgba.into_raw();
+                            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                            let texture = ctx.load_texture("shared_viewed_image", color_image, egui::TextureOptions::default());
+                            self.viewing_shared_texture = Some(texture);
+                            self.shared_view_error = None;
+                            
+                            // Update remaining views in our local list
+                            if let Some(image_id) = &self.viewing_shared_image {
+                                for (_, share) in &mut self.shared_with_me {
+                                    if share.image_id == *image_id {
+                                        share.views_remaining = *new_views;
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            self.shared_view_error = Some("Failed to decode image".to_string());
+                        }
+                    }
+                    Err(e) => {
+                        self.shared_view_error = Some(e.clone());
+                    }
+                }
+                self.viewing_shared_in_progress = None;
+            }
+        }
+    }
+
     fn view_shared_image(&mut self, image_id: &str, share: &ImageShare) {
         let image_id = image_id.to_string();
         let user_id = self.session.user_id.clone();
@@ -5168,26 +5299,102 @@ impl ClientAppV2 {
             runtime.block_on(async move {
                 let firebase = FireBaseClient::new();
                 
-                // Get the cloud image
-                let image = firebase.get_cloud_image(&image_id).await
-                    .map_err(|e| format!("Failed to get image: {}", e))?
-                    .ok_or_else(|| "Image not found".to_string())?;
+                // Check local metadata file first
+                let cache_dir = std::path::PathBuf::from(format!("./received_images/{}", user_id));
+                let metadata_path = cache_dir.join(format!("{}.meta.json", image_id));
+                let encrypted_path = cache_dir.join(format!("{}.enc", image_id));
                 
-                // Decode encrypted data
-                let encrypted_data = base64::engine::general_purpose::STANDARD
-                    .decode(&image.encrypted_data)
-                    .map_err(|e| format!("Failed to decode image: {}", e))?;
+                let mut metadata: ShareMetadata;
+                let encrypted_data: Vec<u8>;
                 
-                // Decrypt the image directly using encryption module
-                let (decrypted, _metadata) = crate::encryption::decrypt_image(encrypted_data).await
+                // Check if we have local files
+                if metadata_path.exists() && encrypted_path.exists() {
+                    // Load local metadata
+                    let metadata_str = std::fs::read_to_string(&metadata_path)
+                        .map_err(|e| format!("Failed to read local metadata: {}", e))?;
+                    metadata = serde_json::from_str(&metadata_str)
+                        .map_err(|e| format!("Failed to parse local metadata: {}", e))?;
+                    
+                    // Check if we have views remaining
+                    if metadata.views_remaining == 0 {
+                        return Err("No views remaining. Request more views from the owner.".to_string());
+                    }
+                    
+                    // Load encrypted data from local file
+                    encrypted_data = std::fs::read(&encrypted_path)
+                        .map_err(|e| format!("Failed to read local encrypted image: {}", e))?;
+                    
+                    eprintln!("[VIEW] Using local cached image and metadata (views remaining: {})", metadata.views_remaining);
+                } else {
+                    // Download encrypted image and metadata from Firebase
+                    eprintln!("[VIEW] Downloading encrypted image and metadata from Firebase...");
+                    
+                    // Get the cloud image
+                    let image = firebase.get_cloud_image(&image_id).await
+                        .map_err(|e| format!("Failed to get image: {}", e))?
+                        .ok_or_else(|| "Image not found".to_string())?;
+                    
+                    // Get metadata from Firebase
+                    metadata = firebase.get_share_metadata(&user_id, &share_clone.share_id).await
+                        .map_err(|e| format!("Failed to get metadata: {}", e))?
+                        .ok_or_else(|| "Share metadata not found".to_string())?;
+                    
+                    if metadata.views_remaining == 0 {
+                        return Err("No views remaining. Request more views from the owner.".to_string());
+                    }
+                    
+                    // Decode encrypted data
+                    encrypted_data = base64::engine::general_purpose::STANDARD
+                        .decode(&image.encrypted_data)
+                        .map_err(|e| format!("Failed to decode image: {}", e))?;
+                    
+                    // Save encrypted image and metadata locally
+                    std::fs::create_dir_all(&cache_dir)
+                        .map_err(|e| format!("Failed to create cache dir: {}", e))?;
+                    
+                    std::fs::write(&encrypted_path, &encrypted_data)
+                        .map_err(|e| format!("Failed to save encrypted image: {}", e))?;
+                    
+                    let metadata_json = serde_json::to_string_pretty(&metadata)
+                        .map_err(|e| format!("Failed to serialize metadata: {}", e))?;
+                    std::fs::write(&metadata_path, metadata_json)
+                        .map_err(|e| format!("Failed to save metadata: {}", e))?;
+                    
+                    eprintln!("[VIEW] Downloaded and cached encrypted image + metadata");
+                }
+                
+                // Decrypt the image
+                let (decrypted, _) = crate::encryption::decrypt_image(encrypted_data).await
                     .map_err(|e| format!("Decryption failed: {}", e))?;
                 
-                // Decrement views
-                let new_views = share_clone.views_remaining.saturating_sub(1);
-                firebase.update_share_views(&image_id, &user_id, new_views).await
-                    .map_err(|e| format!("Failed to update views: {}", e))?;
+                // Decrement views in local metadata
+                metadata.views_remaining = metadata.views_remaining.saturating_sub(1);
+                metadata.updated_at = chrono::Utc::now().timestamp();
                 
-                Ok((decrypted, new_views))
+                // Save updated metadata locally
+                let metadata_json = serde_json::to_string_pretty(&metadata)
+                    .map_err(|e| format!("Failed to serialize metadata: {}", e))?;
+                std::fs::write(&metadata_path, metadata_json)
+                    .map_err(|e| format!("Failed to update local metadata: {}", e))?;
+                
+                // Update Firebase metadata
+                firebase.update_share_metadata_views(&user_id, &share_clone.share_id, metadata.views_remaining).await
+                    .map_err(|e| format!("Failed to update remote metadata: {}", e))?;
+                
+                // Also update ImageShare record for consistency
+                firebase.update_share_views(&image_id, &user_id, metadata.views_remaining).await
+                    .map_err(|e| format!("Failed to update share views: {}", e))?;
+                
+                eprintln!("[VIEW] View consumed. Remaining: {}", metadata.views_remaining);
+                
+                // Delete local files if no views remaining
+                if metadata.views_remaining == 0 {
+                    let _ = std::fs::remove_file(&metadata_path);
+                    let _ = std::fs::remove_file(&encrypted_path);
+                    eprintln!("[VIEW] No views remaining - deleted local files");
+                }
+                
+                Ok((decrypted, metadata.views_remaining))
             })
         });
         
@@ -5467,19 +5674,38 @@ impl ClientAppV2 {
                 firebase.update_share_request_status(&request, status).await
                     .map_err(|e| format!("Failed to update status: {}", e))?;
                 
-                // If accepted, create the share
+                // If accepted, create the share and metadata file
                 if accepted {
+                    let share_id = format!("share_{}_{}", request.image_id, request.from_user_id);
+                    let timestamp = chrono::Utc::now().timestamp();
+                    
                     let share = ImageShare {
-                        share_id: format!("share_{}_{}", request.image_id, request.from_user_id),
+                        share_id: share_id.clone(),
                         image_id: request.image_id.clone(),
                         user_id: request.from_user_id.clone(),
                         username: request.from_username.clone(),
                         views_remaining: request.requested_views,
                         views_total: request.requested_views,
-                        shared_at: chrono::Utc::now().timestamp(),
+                        shared_at: timestamp,
                     };
                     firebase.create_image_share(&share).await
                         .map_err(|e| format!("Failed to create share: {}", e))?;
+                    
+                    // Create ShareMetadata file for the requester
+                    let metadata = ShareMetadata {
+                        image_id: request.image_id.clone(),
+                        share_id: share_id.clone(),
+                        user_id: request.from_user_id.clone(),
+                        username: request.from_username.clone(),
+                        views_remaining: request.requested_views,
+                        views_total: request.requested_views,
+                        created_at: timestamp,
+                        updated_at: timestamp,
+                    };
+                    firebase.create_share_metadata(&metadata).await
+                        .map_err(|e| format!("Failed to create share metadata: {}", e))?;
+                    
+                    eprintln!("[SHARE] Created share and metadata for {} on image {}", request.from_username, request.image_id);
                 }
                 
                 Ok((request_id_clone, accepted))
@@ -5506,10 +5732,19 @@ impl ClientAppV2 {
                 firebase.update_view_increase_request_status(&request, status).await
                     .map_err(|e| format!("Failed to update status: {}", e))?;
                 
-                // If accepted, add views
+                // If accepted, add views to both ImageShare and ShareMetadata
                 if accepted {
                     firebase.add_share_views(&request.image_id, &request.from_user_id, request.additional_views).await
                         .map_err(|e| format!("Failed to add views: {}", e))?;
+                    
+                    // Update ShareMetadata file with new quota
+                    if let Ok(Some(share)) = firebase.get_image_share(&request.image_id, &request.from_user_id).await {
+                        firebase.update_share_metadata_views(&request.from_user_id, &request.share_id, share.views_remaining).await
+                            .map_err(|e| format!("Failed to update metadata: {}", e))?;
+                        
+                        eprintln!("[VIEW_INCREASE] Updated metadata for {} on image {} - new quota: {}", 
+                            request.from_username, request.image_id, share.views_remaining);
+                    }
                 }
                 
                 Ok((request_id_clone, accepted))
@@ -5751,6 +5986,130 @@ impl ClientAppV2 {
                 self.view_requests_loading = None;
             }
         }
+    }
+    
+    fn render_manage_shares_popup(&mut self, ctx: &egui::Context) {
+        if self.selected_cloud_image.is_none() {
+            return;
+        }
+        
+        // Process loading
+        self.process_image_shares_loading();
+        
+        let mut close_popup = false;
+        
+        egui::Window::new("Manage Shares")
+            .collapsible(false)
+            .resizable(true)
+            .default_size(Vec2::new(600.0, 400.0))
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.heading("Who has access to this image");
+                ui.add_space(10.0);
+                
+                if self.image_shares_loading.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Loading shares...");
+                    });
+                } else if self.current_image_shares.is_empty() {
+                    ui.label(RichText::new("No one has access to this image yet")
+                        .size(14.0)
+                        .color(AppColors::TEXT_SECONDARY));
+                    ui.label(RichText::new("Share requests will appear in the Requests page")
+                        .size(12.0)
+                        .color(AppColors::TEXT_SECONDARY));
+                } else {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for share in &self.current_image_shares.clone() {
+                            self.render_share_item(ui, share);
+                            ui.add_space(5.0);
+                        }
+                    });
+                }
+                
+                ui.add_space(15.0);
+                
+                if ui.add(egui::Button::new(RichText::new("✖ Close").size(14.0))
+                    .fill(AppColors::ERROR)
+                    .rounding(Rounding::same(6.0))
+                    .min_size(Vec2::new(100.0, 36.0))).clicked() {
+                    close_popup = true;
+                }
+            });
+        
+        if close_popup {
+            self.selected_cloud_image = None;
+            self.current_image_shares.clear();
+        }
+    }
+    
+    fn render_share_item(&mut self, ui: &mut egui::Ui, share: &ImageShare) {
+        let share_id = share.share_id.clone();
+        let share_clone = share.clone();
+        
+        egui::Frame::default()
+            .fill(AppColors::BG_CARD)
+            .rounding(Rounding::same(8.0))
+            .inner_margin(egui::Margin::same(12.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(&share.username)
+                            .size(15.0)
+                            .color(AppColors::TEXT_PRIMARY)
+                            .strong());
+                        ui.label(RichText::new(format!("Views: {} / {}", share.views_remaining, share.views_total))
+                            .size(13.0)
+                            .color(AppColors::TEXT_SECONDARY));
+                        
+                        let date = chrono::DateTime::from_timestamp(share.shared_at, 0)
+                            .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+                            .unwrap_or_default();
+                        ui.label(RichText::new(format!("Shared: {}", date))
+                            .size(11.0)
+                            .color(AppColors::TEXT_SECONDARY));
+                    });
+                    
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(egui::Button::new(RichText::new("🗑️ Revoke").size(12.0))
+                            .fill(AppColors::ERROR.linear_multiply(0.8))
+                            .rounding(Rounding::same(4.0))
+                            .min_size(Vec2::new(80.0, 28.0))).clicked() {
+                            self.revoke_share(&share_clone);
+                        }
+                    });
+                });
+            });
+    }
+    
+    fn revoke_share(&mut self, share: &ImageShare) {
+        let share_id_for_remove = share.share_id.clone();
+        let share = share.clone();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        
+        let promise = Promise::spawn_thread("revoke_share", move || {
+            runtime.block_on(async move {
+                let firebase = FireBaseClient::new();
+                
+                // Delete ImageShare record
+                firebase.delete_image_share(&share.image_id, &share.user_id).await
+                    .map_err(|e| format!("Failed to delete share: {}", e))?;
+                
+                // Delete ShareMetadata file
+                firebase.delete_share_metadata(&share.user_id, &share.share_id).await
+                    .map_err(|e| format!("Failed to delete metadata: {}", e))?;
+                
+                eprintln!("[REVOKE] Revoked access for {} on image {}", share.username, share.image_id);
+                
+                Ok(())
+            })
+        });
+        
+        self.revoke_share_in_progress = Some(promise);
+        
+        // Remove from local list immediately
+        self.current_image_shares.retain(|s| s.share_id != share_id_for_remove);
     }
 }
 
