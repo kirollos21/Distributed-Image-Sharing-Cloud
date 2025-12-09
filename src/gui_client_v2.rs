@@ -1,13 +1,14 @@
 // New clean GUI client for Distributed Image Cloud
-// Features: Login, Register, Send Images, Inbox, Notes, My Gallery, Browse Users, Settings
+// Features: Login, Register, My Images, Shared With Me, Browse Users, Requests, Notes, Settings
 
 use crate::client::Client;
-use crate::firebase::{FireBaseClient, UserInfo, UserStatus, ReceivedImageMeta, NoteMeta};
+use crate::firebase::{FireBaseClient, UserInfo, UserStatus, ReceivedImageMeta, NoteMeta, CloudImage, ImageShare, ShareRequest, ViewIncreaseRequest};
 use crate::messages::Message;
 use crate::chunking::{ChunkReassembler, ChunkedMessage};
 use eframe::egui;
 use egui::{Color32, RichText, Vec2, Rounding};
 use poll_promise::Promise;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::mpsc;
 use base64::Engine;
@@ -20,12 +21,11 @@ use base64::Engine;
 pub enum Page {
     #[default]
     Login,
-    SendImage,
-    Inbox,       // Images sent TO you (private, with view quota)
-    Notes,       // Text notes from other users (synced)
-    MyGallery,   // Your public gallery (up to 5 pixelated images)
-    BrowseUsers, // Search users and see their galleries
-    Requests,    // Image requests (incoming and outgoing)
+    MyImages,       // Images I own (uploaded by me) - can manage shares
+    SharedWithMe,   // Images shared with me - can view with quota
+    BrowseUsers,    // Search users and request access to their images  
+    Requests,       // Share requests and view increase requests (incoming/outgoing)
+    Notes,          // Text notes from other users
     Settings,
 }
 
@@ -135,6 +135,55 @@ pub struct ClientAppV2 {
     
     // Pending Firebase updates (for offline support)
     pending_firebase_updates: Vec<PendingFirebaseUpdate>,
+    
+    // ==================== NEW CLOUD MODEL STATE ====================
+    
+    // My Images (images I own in the cloud)
+    my_cloud_images: Vec<CloudImage>,
+    my_cloud_images_loading: Option<Promise<Result<Vec<CloudImage>, String>>>,
+    my_cloud_images_loaded: bool,  // Flag to track if initial load is complete
+    my_cloud_images_textures: std::collections::HashMap<String, egui::TextureHandle>,  // image_id -> preview texture
+    upload_image_path: Option<String>,
+    upload_in_progress: Option<Promise<Result<String, String>>>,  // Returns image_id on success
+    upload_error: Option<String>,
+    selected_cloud_image: Option<String>,  // image_id of selected image for share management
+    image_shares_loading: Option<Promise<Result<Vec<ImageShare>, String>>>,
+    current_image_shares: Vec<ImageShare>,
+    
+    // Shared With Me (images others shared with me)
+    shared_with_me: Vec<(CloudImage, ImageShare)>,
+    shared_with_me_loading: Option<Promise<Result<Vec<(CloudImage, ImageShare)>, String>>>,
+    shared_with_me_loaded: bool,
+    shared_textures: std::collections::HashMap<String, egui::TextureHandle>,  // image_id -> preview texture
+    viewing_shared_image: Option<String>,  // image_id being viewed
+    viewing_shared_in_progress: Option<Promise<Result<(Vec<u8>, u8), String>>>,  // (decrypted_data, remaining_views)
+    shared_view_error: Option<String>,
+    viewing_shared_texture: Option<egui::TextureHandle>,
+    
+    // Share Requests (incoming = someone wants access to my image, outgoing = I requested access)
+    incoming_share_requests: Vec<ShareRequest>,
+    outgoing_share_requests: Vec<ShareRequest>,
+    share_requests_loading: Option<Promise<Result<(Vec<ShareRequest>, Vec<ShareRequest>), String>>>,
+    share_requests_loaded: bool,
+    respond_share_request_in_progress: Option<Promise<Result<(String, bool), String>>>,
+    
+    // View Increase Requests
+    incoming_view_requests: Vec<ViewIncreaseRequest>,
+    outgoing_view_requests: Vec<ViewIncreaseRequest>,
+    view_requests_loading: Option<Promise<Result<(Vec<ViewIncreaseRequest>, Vec<ViewIncreaseRequest>), String>>>,
+    view_requests_loaded: bool,
+    respond_view_request_in_progress: Option<Promise<Result<(String, bool), String>>>,
+    
+    // Request popups
+    share_request_popup: Option<(String, String, String)>,  // (image_id, owner_id, owner_username)
+    share_request_views: u8,
+    view_increase_popup: Option<(String, String, String, String)>,  // (image_id, share_id, owner_id, owner_username)
+    view_increase_amount: u8,
+    
+    // Browse users cloud images
+    browse_user_cloud_images: HashMap<String, Vec<CloudImage>>,  // user_id -> their cloud images
+    browse_user_cloud_loading: Option<Promise<Result<(String, Vec<CloudImage>), String>>>,  // (user_id, images)
+    browse_cloud_textures: HashMap<String, egui::TextureHandle>,  // image_id -> preview texture
 }
 
 /// Pending Firebase update for offline support
@@ -164,7 +213,7 @@ pub struct UserSearchResult {
     pub user_id: String,
     pub status: String,
     pub last_seen: i64,
-    pub gallery: Vec<String>,  // Base64 data URLs of pixelated gallery images
+    pub cloud_images: Vec<CloudImage>,  // Cloud images with pixelated previews
 }
 
 #[derive(Clone)]
@@ -317,22 +366,61 @@ impl ClientAppV2 {
             last_poll: None,
             poll_in_progress: None,
             pending_firebase_updates: Vec::new(),
+            
+            // New cloud model state
+            my_cloud_images: Vec::new(),
+            my_cloud_images_loading: None,
+            my_cloud_images_loaded: false,
+            my_cloud_images_textures: std::collections::HashMap::new(),
+            upload_image_path: None,
+            upload_in_progress: None,
+            upload_error: None,
+            selected_cloud_image: None,
+            image_shares_loading: None,
+            current_image_shares: Vec::new(),
+            shared_with_me: Vec::new(),
+            shared_with_me_loading: None,
+            shared_with_me_loaded: false,
+            shared_textures: std::collections::HashMap::new(),
+            viewing_shared_image: None,
+            viewing_shared_in_progress: None,
+            shared_view_error: None,
+            viewing_shared_texture: None,
+            incoming_share_requests: Vec::new(),
+            outgoing_share_requests: Vec::new(),
+            share_requests_loading: None,
+            share_requests_loaded: false,
+            respond_share_request_in_progress: None,
+            incoming_view_requests: Vec::new(),
+            outgoing_view_requests: Vec::new(),
+            view_requests_loading: None,
+            view_requests_loaded: false,
+            respond_view_request_in_progress: None,
+            share_request_popup: None,
+            share_request_views: 5,
+            view_increase_popup: None,
+            view_increase_amount: 5,
+            browse_user_cloud_images: HashMap::new(),
+            browse_user_cloud_loading: None,
+            browse_cloud_textures: HashMap::new(),
         }
     }
 
     fn send_heartbeat(&self) {
+        // Heartbeat to nodes removed - status now based on last_seen timestamp
+        // Update last_seen directly in Firebase instead
         if !self.session.is_logged_in || self.session.user_id.is_empty() {
             return;
         }
         
         let user_id = self.session.user_id.clone();
-        let cloud_addresses = self.cloud_addresses.clone();
         let runtime = self.runtime.as_ref().unwrap().clone();
 
         std::thread::spawn(move || {
-            let client = Client::new(0, cloud_addresses);
             let _ = runtime.block_on(async move {
-                client.client_heartbeat(user_id).await
+                let firebase = FireBaseClient::new();
+                let timestamp = chrono::Utc::now().timestamp();
+                let _ = firebase.update_last_seen(&user_id, timestamp).await;
             });
         });
     }
@@ -1177,10 +1265,10 @@ impl eframe::App for ClientAppV2 {
         // Set dark theme
         ctx.set_visuals(egui::Visuals::dark());
         
-        // Heartbeat every 5 seconds (for "last seen" info and online status) + poll for images every 30 seconds
+        // Update last_seen every 30 seconds (for online status detection) + poll for images
         if self.session.is_logged_in {
             let now = std::time::Instant::now();
-            if self.last_heartbeat.map_or(true, |t| now.duration_since(t).as_secs() >= 5) {
+            if self.last_heartbeat.map_or(true, |t| now.duration_since(t).as_secs() >= 30) {
                 self.send_heartbeat();
                 self.last_heartbeat = Some(now);
                 
@@ -1300,6 +1388,16 @@ impl eframe::App for ClientAppV2 {
         // Image request popup window
         if self.request_popup_data.is_some() {
             self.render_request_popup(ctx);
+        }
+        
+        // Cloud share request popup window (new cloud model)
+        if self.share_request_popup.is_some() {
+            self.render_share_request_popup(ctx);
+        }
+        
+        // View increase request popup window (new cloud model)
+        if self.view_increase_popup.is_some() {
+            self.render_view_increase_popup(ctx);
         }
 
         // Image viewer popup window
@@ -1725,7 +1823,7 @@ impl ClientAppV2 {
                     
                     Ok((username, generated_id.clone(), format!("Account created! Your ID is: {}", generated_id)))
                 } else {
-                    // LOGIN: Verify credentials via node
+                    // LOGIN: Verify credentials directly via Firebase
                     // Parse username#id format
                     if !username.contains('#') {
                         return Err("Please use format: username#id (e.g., john#42)".to_string());
@@ -1739,31 +1837,30 @@ impl ClientAppV2 {
                     let user_id = parts[0].to_string();
                     let expected_username = parts[1].to_string();
                     
-                    let client = Client::new(0, cloud_addresses);
-                    let local_ip = local_addr.clone();
-
-                    match client.client_login(user_id.clone(), password, local_ip).await {
-                        Ok(Message::ClientLoginResponse { success, user_info, error }) => {
-                            if success {
-                                if let Some(info) = user_info {
-                                    if info.username != expected_username {
-                                        return Err("Username doesn't match this ID".to_string());
-                                    }
-                                    Ok((info.username, user_id, "Login successful".to_string()))
-                                } else {
-                                    Err("Login succeeded but no user info returned".to_string())
-                                }
-                            } else {
-                                Err(error.unwrap_or_else(|| "Login failed".to_string()))
+                    // Get user directly from Firebase
+                    match firebase.get_user(&user_id).await {
+                        Ok(Some(user_info)) => {
+                            // Verify username matches
+                            if user_info.username != expected_username {
+                                return Err("Username doesn't match this ID".to_string());
                             }
+                            // Verify password
+                            if user_info.password != password {
+                                return Err("Invalid password".to_string());
+                            }
+                            // Update user status to online
+                            let local_ip = local_addr.clone();
+                            let _ = firebase.update_user_status(&user_id, &UserStatus::Online).await;
+                            let _ = firebase.update_user_ip(&user_id, &local_ip).await;
+                            let _ = firebase.update_last_seen(&user_id, chrono::Utc::now().timestamp()).await;
+                            
+                            Ok((user_info.username, user_id, "Login successful".to_string()))
                         }
-                        Ok(_) => Err("Unexpected response from server".to_string()),
+                        Ok(None) => {
+                            Err("User not found. Please check your ID.".to_string())
+                        }
                         Err(e) => {
-                            if e.contains("SYSTEM_MAINTENANCE") {
-                                Err("🔧 System Under Maintenance".to_string())
-                            } else {
-                                Err(format!("Connection error: {}", e))
-                            }
+                            Err(format!("Failed to connect to database: {}", e))
                         }
                     }
                 }
@@ -1791,7 +1888,7 @@ impl ClientAppV2 {
                                 user_id: id.clone(),
                                 is_logged_in: true,
                             };
-                            self.current_page = Page::SendImage;
+                            self.current_page = Page::MyImages;
                             self.username_input.clear();
                             self.password_input.clear();
                             
@@ -1845,12 +1942,11 @@ impl ClientAppV2 {
         egui::ScrollArea::vertical().show(ui, |ui| {
             match self.current_page {
                 Page::Login => {},  // Shouldn't happen when logged in
-                Page::SendImage => self.render_send_image_page(ui, ctx),
-                Page::Inbox => self.render_inbox_page(ui, ctx),
-                Page::Notes => self.render_notes_page(ui, ctx),
-                Page::MyGallery => self.render_my_gallery_page(ui, ctx),
+                Page::MyImages => self.render_my_images_page(ui, ctx),
+                Page::SharedWithMe => self.render_shared_with_me_page(ui, ctx),
                 Page::BrowseUsers => self.render_browse_users_page(ui, ctx),
-                Page::Requests => self.render_requests_page(ui, ctx),
+                Page::Requests => self.render_requests_page_new(ui, ctx),
+                Page::Notes => self.render_notes_page(ui, ctx),
                 Page::Settings => self.render_settings_page(ui, ctx),
             }
         });
@@ -1895,12 +1991,11 @@ impl ClientAppV2 {
             ui.add_space(20.0);
             
             let tabs = [
-                (Page::SendImage, "📤", "Send"),
-                (Page::Inbox, "📥", "Inbox"),
-                (Page::Notes, "📝", "Notes"),
-                (Page::MyGallery, "🖼️", "Gallery"),
+                (Page::MyImages, "🖼️", "My Images"),
+                (Page::SharedWithMe, "📥", "Shared"),
                 (Page::BrowseUsers, "👥", "Browse"),
                 (Page::Requests, "🔔", "Requests"),
+                (Page::Notes, "📝", "Notes"),
                 (Page::Settings, "⚙️", "Settings"),
             ];
             
@@ -1921,9 +2016,13 @@ impl ClientAppV2 {
                 if ui.add(button).clicked() {
                     self.current_page = page.clone();
                     
-                    // Load notes when switching to Notes page
-                    if page == Page::Notes {
-                        self.load_notes();
+                    // Load data when switching pages
+                    match page {
+                        Page::Notes => self.load_notes(),
+                        Page::MyImages => self.load_my_cloud_images(),
+                        Page::SharedWithMe => self.load_shared_with_me(),
+                        Page::Requests => self.load_all_requests(),
+                        _ => {}
                     }
                 }
                 
@@ -2238,13 +2337,29 @@ impl ClientAppV2 {
                     quota + 1,
                 ).await.map_err(|e| format!("Encryption failed: {}", e))?;
 
-                // Send to cloud
+                // Parse recipients to extract user IDs (format: "username#id")
+                let mut user_ids = Vec::new();
+                let mut usernames = Vec::new();
+                for recipient in &recipients {
+                    if let Some(hash_pos) = recipient.rfind('#') {
+                        let username = recipient[..hash_pos].to_string();
+                        let id = recipient[hash_pos + 1..].to_string();
+                        usernames.push(username);
+                        user_ids.push(id);
+                    } else {
+                        usernames.push(recipient.clone());
+                        user_ids.push(recipient.clone());
+                    }
+                }
+
+                // Send directly via P2P
                 let client = Client::new(0, cloud_addresses);
                 let image_id = format!("img_{}", chrono::Utc::now().timestamp_millis());
                 
-                client.send_image(
+                client.send_image_p2p(
                     from_user,
-                    recipients,
+                    user_ids,
+                    usernames,
                     encrypted,
                     quota + 1,
                     image_id,
@@ -2929,65 +3044,70 @@ impl ClientAppV2 {
                                         });
                                     });
                                     
-                                    // Show gallery preview if user has gallery images
-                                    if !user.gallery.is_empty() {
+                                    // Show cloud images (pixelated previews)
+                                    let user_id = user.user_id.clone();
+                                    let username = user.username.clone();
+                                    let cloud_images = user.cloud_images.clone();
+                                    
+                                    if cloud_images.is_empty() {
                                         ui.add_space(10.0);
-                                        ui.label(RichText::new(format!("Gallery ({} images)", user.gallery.len()))
+                                        ui.label(RichText::new("No images")
                                             .size(12.0)
                                             .color(AppColors::TEXT_SECONDARY));
+                                    } else {
+                                        ui.add_space(10.0);
+                                        ui.label(RichText::new(format!("☁️ Cloud Images ({} images)", cloud_images.len()))
+                                            .size(12.0)
+                                            .color(AppColors::SUCCESS));
                                         ui.add_space(5.0);
                                         
-                                        ui.horizontal(|ui| {
-                                            // Load/create textures for this user's gallery if not already cached
-                                            let user_id = user.user_id.clone();
-                                            let gallery = user.gallery.clone();
-                                            
-                                            if !self.search_gallery_textures.contains_key(&user_id) {
-                                                // Load textures from base64 data
-                                                let mut textures = Vec::new();
-                                                for (idx, data_url) in gallery.iter().enumerate() {
-                                                    if let Some(texture) = load_texture_from_data_url_with_name(ui.ctx(), data_url, &format!("search_gallery_{}_{}", user_id, idx)) {
-                                                        textures.push(texture);
+                                        // Show cloud image previews (pixelated)
+                                        let mut request_cloud_action = None;
+                                        ui.horizontal_wrapped(|ui| {
+                                            for image in &cloud_images {
+                                                // Load texture if not cached
+                                                let texture_key = format!("search_cloud_{}", image.image_id);
+                                                if !self.browse_cloud_textures.contains_key(&texture_key) {
+                                                    if let Some(texture) = load_texture_from_data_url_with_name(ui.ctx(), &image.preview_data, &texture_key) {
+                                                        self.browse_cloud_textures.insert(texture_key.clone(), texture);
                                                     }
                                                 }
-                                                self.search_gallery_textures.insert(user_id.clone(), textures);
-                                            }
-                                            
-                                            // Display cached textures
-                                            let mut request_action = None;
-                                            if let Some(textures) = self.search_gallery_textures.get(&user_id) {
-                                                for (idx, texture) in textures.iter().take(5).enumerate() {
-                                                    ui.vertical(|ui| {
-                                                        let size = Vec2::new(60.0, 60.0);
-                                                        let image = egui::Image::new(texture)
+                                                
+                                                ui.vertical(|ui| {
+                                                    let size = Vec2::new(70.0, 70.0);
+                                                    if let Some(texture) = self.browse_cloud_textures.get(&texture_key) {
+                                                        let img = egui::Image::from_texture(texture)
                                                             .fit_to_exact_size(size)
                                                             .rounding(Rounding::same(4.0));
                                                         
-                                                        if ui.add(egui::ImageButton::new(image)).clicked() {
-                                                            // Defer the request to avoid borrow issues
-                                                            request_action = Some((user_id.clone(), user.username.clone(), idx));
+                                                        if ui.add(egui::ImageButton::new(img)).clicked() {
+                                                            request_cloud_action = Some((
+                                                                image.image_id.clone(),
+                                                                user_id.clone(),
+                                                                username.clone(),
+                                                            ));
                                                         }
-                                                        
-                                                        ui.label(RichText::new(format!("#{}", idx + 1))
-                                                            .size(9.0)
-                                                            .color(AppColors::TEXT_SECONDARY));
-                                                    });
-                                                }
-                                            }
-                                            
-                                            // Execute deferred request - show popup instead of sending immediately
-                                            if let Some((uid, uname, idx)) = request_action {
-                                                self.request_popup_data = Some((uid, uname, idx));
-                                                self.request_popup_quota = 1;  // Default quota
+                                                    }
+                                                    
+                                                    ui.label(RichText::new(&image.filename)
+                                                        .size(9.0)
+                                                        .color(AppColors::TEXT_SECONDARY));
+                                                });
                                             }
                                         });
+                                        
+                                        // Execute deferred request - show cloud share popup
+                                        if let Some((img_id, owner_id, owner_name)) = request_cloud_action {
+                                            self.share_request_popup = Some((img_id, owner_id, owner_name));
+                                            self.share_request_views = 5;
+                                        }
                                     }
                                     
-                                    // Send note section for this user
-                                    ui.add_space(12.0);
+                                    ui.add_space(8.0);
                                     ui.separator();
                                     ui.add_space(8.0);
                                     
+                                    // Send note section
                                     let user_id = user.user_id.clone();
                                     let username = user.username.clone();
                                     
@@ -3053,13 +3173,11 @@ impl ClientAppV2 {
                 let note_id = format!("note_{}_{}", chrono::Utc::now().timestamp_millis(), rand::random::<u16>());
                 let ts = chrono::Utc::now().timestamp();
 
-                // Try to parse numeric IDs for node message routing
                 // Extract numeric portion from "username#id" if present
                 let from_id_num = from_username.rsplitn(2, '#').next().and_then(|s| s.parse::<u8>().ok());
-                let to_id_num = to_user_id.parse::<u8>().unwrap_or(0);
 
-                // If we have a valid numeric from_id and to_id, send via nodes
-                if from_id_num.is_some() && to_id_num != 0 {
+                // If we have a valid numeric from_id, send via P2P
+                if let Some(from_id_u8) = from_id_num {
                     let client = match crate::client::Client::from_firebase(0).await {
                         Ok(c) => c,
                         Err(e) => {
@@ -3077,10 +3195,10 @@ impl ClientAppV2 {
                         }
                     };
 
-                    let from_id_u8 = from_id_num.unwrap();
-                    match client.send_note(note_id.clone(), from_id_u8, to_id_num, from_username.clone(), note_content.clone(), ts).await {
+                    // Use P2P to send note directly to recipient
+                    match client.send_note_p2p(note_id.clone(), from_id_u8, to_user_id.clone(), from_username.clone(), note_content.clone(), ts).await {
                         Ok(toid) => Ok(toid),
-                        Err(e) => Err(format!("Failed to send note via nodes: {}", e)),
+                        Err(e) => Err(format!("Failed to send note: {}", e)),
                     }
                 } else {
                     // IDs are not numeric -- fallback to direct Firebase write
@@ -3125,6 +3243,7 @@ impl ClientAppV2 {
         let promise = Promise::spawn_thread("search_users", move || {
             runtime.block_on(async move {
                 let firebase = FireBaseClient::new();
+                let now = chrono::Utc::now().timestamp();
                 
                 // Search by username (return all matches)
                 let mut results = Vec::new();
@@ -3136,14 +3255,22 @@ impl ClientAppV2 {
                             continue;
                         }
 
-                        // Get gallery for this user
-                        let gallery = firebase.get_user_gallery(&id).await.unwrap_or_default();
+                        // Get cloud images for this user (pixelated previews)
+                        let cloud_images = firebase.get_user_cloud_images(&id).await.unwrap_or_default();
+                        
+                        // Determine status based on last_seen (offline if > 60 seconds ago)
+                        let status = if now - info.last_seen > 60 {
+                            "Offline".to_string()
+                        } else {
+                            "Online".to_string()
+                        };
+                        
                         results.push(UserSearchResult {
                             username: info.username,
                             user_id: id,
-                            status: format!("{:?}", info.status),
+                            status,
                             last_seen: info.last_seen,
-                            gallery,
+                            cloud_images,
                         });
                     }
                 }
@@ -3151,15 +3278,23 @@ impl ClientAppV2 {
                 // Also try searching by ID
                 if let Ok(Some(info)) = firebase.get_user(&query).await {
                     let already_added = results.iter().any(|r| r.user_id == query);
-                    if !already_added {
-                        // Get gallery for this user
-                        let gallery = firebase.get_user_gallery(&query).await.unwrap_or_default();
+                    if !already_added && query != current_user_id {
+                        // Get cloud images for this user
+                        let cloud_images = firebase.get_user_cloud_images(&query).await.unwrap_or_default();
+                        
+                        // Determine status based on last_seen
+                        let status = if now - info.last_seen > 60 {
+                            "Offline".to_string()
+                        } else {
+                            "Online".to_string()
+                        };
+                        
                         results.push(UserSearchResult {
                             username: info.username,
                             user_id: query.clone(),
-                            status: format!("{:?}", info.status),
+                            status,
                             last_seen: info.last_seen,
-                            gallery,
+                            cloud_images,
                         });
                     }
                 }
@@ -3180,6 +3315,40 @@ impl ClientAppV2 {
                 self.search_in_progress = None;
             }
         }
+        
+        // Also process cloud images loading
+        self.process_browse_cloud_loading();
+    }
+    
+    fn load_user_cloud_images(&mut self, user_id: &str) {
+        if self.browse_user_cloud_loading.is_some() {
+            return;
+        }
+        
+        let user_id = user_id.to_string();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        
+        let promise = Promise::spawn_thread("load_user_cloud", move || {
+            runtime.block_on(async move {
+                let firebase = FireBaseClient::new();
+                let images = firebase.get_user_cloud_images(&user_id).await
+                    .map_err(|e| format!("Failed to load cloud images: {}", e))?;
+                Ok((user_id, images))
+            })
+        });
+        
+        self.browse_user_cloud_loading = Some(promise);
+    }
+    
+    fn process_browse_cloud_loading(&mut self) {
+        if let Some(promise) = &self.browse_user_cloud_loading {
+            if let Some(result) = promise.ready() {
+                if let Ok((user_id, images)) = result {
+                    self.browse_user_cloud_images.insert(user_id.clone(), images.clone());
+                }
+                self.browse_user_cloud_loading = None;
+            }
+        }
     }
     
     fn request_image_from_user(&mut self, user_id: &str, username: &str, image_index: usize, quota: u8) {
@@ -3198,12 +3367,11 @@ impl ClientAppV2 {
                 let request_id = format!("req_{}_{}", chrono::Utc::now().timestamp_millis(), rand::random::<u16>());
                 let timestamp = chrono::Utc::now().timestamp();
                 
-                // Parse numeric IDs for node message routing
+                // Parse numeric from_id for P2P message
                 let from_id_num = from_user_id.parse::<u8>().ok();
-                let to_id_num = to_user_id.parse::<u8>().ok();
                 
-                // If we have valid numeric IDs, send via nodes
-                if let (Some(from_id), Some(to_id)) = (from_id_num, to_id_num) {
+                // If we have valid from_id, send via P2P
+                if let Some(from_id) = from_id_num {
                     let client = match crate::client::Client::from_firebase(0).await {
                         Ok(c) => c,
                         Err(e) => {
@@ -3226,10 +3394,11 @@ impl ClientAppV2 {
                         }
                     };
                     
-                    match client.send_image_request(
+                    // Use P2P to send image request directly to recipient
+                    match client.send_image_request_p2p(
                         request_id.clone(),
                         from_id,
-                        to_id,
+                        to_user_id.clone(),
                         format!("{}#{}", from_username, from_user_id),
                         to_username.clone(),
                         image_index,
@@ -3237,7 +3406,7 @@ impl ClientAppV2 {
                         quota
                     ).await {
                         Ok(req_id) => Ok(req_id),
-                        Err(e) => Err(format!("Failed to send request via nodes: {}", e)),
+                        Err(e) => Err(format!("Failed to send request: {}", e)),
                     }
                 } else {
                     // IDs are not numeric -- fallback to direct Firebase write
@@ -3362,7 +3531,7 @@ impl ClientAppV2 {
         self.requests_loading = Some(promise);
     }
     
-    fn process_requests_loading(&mut self) {
+    fn process_old_requests_loading(&mut self) {
         let result = if let Some(promise) = &self.requests_loading {
             promise.ready().cloned()
         } else {
@@ -3450,7 +3619,7 @@ impl ClientAppV2 {
                         
                         eprintln!("[DEBUG] Image data decoded, size: {} bytes", image_data.len());
                         
-                        // Encrypt and send to requester using normal flow
+                        // Encrypt and send to requester using P2P
                         let recipient = format!("{}#{}", requester_username, requester_id);
                         let from_user = format!("{}#{}", username, user_id);
                         
@@ -3466,14 +3635,15 @@ impl ClientAppV2 {
                         
                         eprintln!("[DEBUG] Image encrypted, size: {} bytes", encrypted.len());
                         
-                        // Send to cloud
+                        // Send directly via P2P
                         let client_sender = Client::new(0, cloud_addresses);
                         let image_id = format!("img_{}", chrono::Utc::now().timestamp_millis());
                         
-                        eprintln!("[DEBUG] Sending image {} to cloud", image_id);
-                        client_sender.send_image(
+                        eprintln!("[DEBUG] Sending image {} via P2P", image_id);
+                        client_sender.send_image_p2p(
                             from_user,
-                            vec![recipient],
+                            vec![requester_id.clone()],
+                            vec![requester_username.clone()],
                             encrypted,
                             quota + 1,
                             image_id.clone(),
@@ -3482,7 +3652,7 @@ impl ClientAppV2 {
                             format!("Failed to send image: {}", e)
                         })?;
                         
-                        eprintln!("[DEBUG] Image {} sent successfully", image_id);
+                        eprintln!("[DEBUG] Image {} sent successfully via P2P", image_id);
                     }
                 }
                 
@@ -3973,10 +4143,16 @@ impl ClientAppV2 {
         };
         
         if let Some(res) = result {
-            if let Ok(mut notes) = res {
-                // Sort by timestamp (newest first)
-                notes.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-                self.notes = notes;
+            match res {
+                Ok(mut notes) => {
+                    // Sort by timestamp (newest first)
+                    notes.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+                    self.notes = notes;
+                }
+                Err(_e) => {
+                    // On error, set to empty to show "No notes yet"
+                    self.notes = Vec::new();
+                }
             }
             self.notes_loading = None;
         }
@@ -4495,6 +4671,1107 @@ impl ClientAppV2 {
             self.close_image_viewer();
         }
     }
+    
+    // ========================================================================
+    // NEW CLOUD MODEL - My Images Page (Images I Own)
+    // ========================================================================
+    
+    fn render_my_images_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            ui.add_space(20.0);
+            
+            ui.vertical(|ui| {
+                ui.set_width(ui.available_width() - 40.0);
+                
+                ui.label(RichText::new("My Images")
+                    .size(24.0)
+                    .color(AppColors::TEXT_PRIMARY)
+                    .strong());
+                ui.label(RichText::new("Upload and manage your encrypted images")
+                    .size(14.0)
+                    .color(AppColors::TEXT_SECONDARY));
+                
+                ui.add_space(25.0);
+                
+                // Upload section
+                egui::Frame::default()
+                    .fill(AppColors::BG_CARD)
+                    .rounding(Rounding::same(10.0))
+                    .inner_margin(egui::Margin::same(20.0))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("📤 Upload New Image").size(16.0).strong().color(AppColors::TEXT_PRIMARY));
+                        ui.add_space(15.0);
+                        
+                        ui.horizontal(|ui| {
+                            if ui.add(egui::Button::new(RichText::new("📁 Choose Image").size(14.0))
+                                .fill(AppColors::PRIMARY)
+                                .rounding(Rounding::same(6.0))
+                                .min_size(Vec2::new(130.0, 36.0))).clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("Images", &["png", "jpg", "jpeg"])
+                                    .pick_file() {
+                                    self.upload_image_path = Some(path.display().to_string());
+                                }
+                            }
+                            
+                            if let Some(path) = &self.upload_image_path {
+                                ui.add_space(10.0);
+                                let filename = std::path::Path::new(path)
+                                    .file_name()
+                                    .map(|f| f.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| path.clone());
+                                ui.label(RichText::new(format!("📄 {}", filename)).color(AppColors::SUCCESS));
+                                
+                                ui.add_space(20.0);
+                                
+                                if self.upload_in_progress.is_none() {
+                                    if ui.add(egui::Button::new(RichText::new("🔐 Upload & Encrypt").size(14.0))
+                                        .fill(AppColors::SUCCESS)
+                                        .rounding(Rounding::same(6.0))
+                                        .min_size(Vec2::new(150.0, 36.0))).clicked() {
+                                        self.upload_cloud_image();
+                                    }
+                                } else {
+                                    ui.spinner();
+                                    ui.label("Uploading...");
+                                }
+                            }
+                        });
+                        
+                        // Process upload result
+                        self.process_upload_result();
+                        
+                        if let Some(ref error) = self.upload_error {
+                            ui.add_space(10.0);
+                            ui.label(RichText::new(format!("✗ {}", error)).color(AppColors::ERROR));
+                        }
+                    });
+                
+                ui.add_space(25.0);
+                
+                // My images list
+                ui.label(RichText::new("📚 Your Images").size(18.0).strong().color(AppColors::TEXT_PRIMARY));
+                ui.add_space(15.0);
+                
+                // Load images if needed (only once)
+                if !self.my_cloud_images_loaded && self.my_cloud_images_loading.is_none() {
+                    self.load_my_cloud_images();
+                }
+                
+                // Process loading
+                self.process_my_cloud_images_loading(ctx);
+                
+                if self.my_cloud_images_loading.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Loading your images...");
+                    });
+                } else if self.my_cloud_images.is_empty() {
+                    ui.label(RichText::new("No images uploaded yet").color(AppColors::TEXT_SECONDARY));
+                } else {
+                    // Display images in a grid
+                    let images = self.my_cloud_images.clone();
+                    ui.horizontal_wrapped(|ui| {
+                        for image in &images {
+                            self.render_cloud_image_card(ui, ctx, image);
+                        }
+                    });
+                }
+            });
+        });
+    }
+    
+    fn render_cloud_image_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, image: &CloudImage) {
+        let image_id = image.image_id.clone();
+        
+        egui::Frame::default()
+            .fill(AppColors::BG_CARD)
+            .rounding(Rounding::same(10.0))
+            .inner_margin(egui::Margin::same(15.0))
+            .show(ui, |ui| {
+                ui.set_width(200.0);
+                
+                // Show preview texture
+                if let Some(texture) = self.my_cloud_images_textures.get(&image_id) {
+                    let size = Vec2::new(180.0, 120.0);
+                    ui.add(egui::Image::from_texture(texture).fit_to_exact_size(size));
+                } else {
+                    // Load texture
+                    if let Some(texture) = load_texture_from_data_url_with_name(ctx, &image.preview_data, &format!("cloud_{}", image_id)) {
+                        self.my_cloud_images_textures.insert(image_id.clone(), texture);
+                    } else {
+                        ui.label(RichText::new("🖼️").size(60.0));
+                    }
+                }
+                
+                ui.add_space(10.0);
+                ui.label(RichText::new(&image.filename).size(13.0).color(AppColors::TEXT_PRIMARY).strong());
+                
+                let date = chrono::DateTime::from_timestamp(image.created_at, 0)
+                    .map(|d| d.format("%Y-%m-%d").to_string())
+                    .unwrap_or_default();
+                ui.label(RichText::new(date).size(11.0).color(AppColors::TEXT_SECONDARY));
+                
+                ui.add_space(10.0);
+                
+                // Manage shares button
+                if ui.add(egui::Button::new(RichText::new("👥 Manage Shares").size(12.0))
+                    .fill(AppColors::PRIMARY)
+                    .rounding(Rounding::same(4.0))
+                    .min_size(Vec2::new(180.0, 28.0))).clicked() {
+                    self.selected_cloud_image = Some(image_id.clone());
+                    self.load_image_shares(&image_id);
+                }
+                
+                // Delete button  
+                if ui.add(egui::Button::new(RichText::new("🗑️ Delete").size(12.0))
+                    .fill(AppColors::ERROR.linear_multiply(0.7))
+                    .rounding(Rounding::same(4.0))
+                    .min_size(Vec2::new(180.0, 28.0))).clicked() {
+                    self.delete_cloud_image(&image_id);
+                }
+            });
+        
+        ui.add_space(15.0);
+    }
+    
+    fn upload_cloud_image(&mut self) {
+        let path = match &self.upload_image_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        
+        let user_id = self.session.user_id.clone();
+        let username = self.session.username.clone();
+        let cloud_addresses = self.cloud_addresses.clone();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        
+        self.upload_error = None;
+        
+        let promise = Promise::spawn_thread("upload_cloud_image", move || {
+            // Read image file
+            let image_data = match std::fs::read(&path) {
+                Ok(data) => data,
+                Err(e) => return Err(format!("Failed to read image: {}", e)),
+            };
+            
+            let filename = std::path::Path::new(&path)
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| "image.png".to_string());
+            
+            runtime.block_on(async move {
+                // Create pixelated preview (reuse existing pixelate function)
+                let preview_data = create_pixelated_preview(&image_data)?;
+                
+                // Encrypt image via node (encrypt for self)
+                let client = Client::new(0, cloud_addresses);
+                let recipient = format!("{}#{}", username, user_id);
+                let encrypted = crate::encryption::encrypt_image(
+                    image_data,
+                    vec![recipient],
+                    255,  // Max views for owner
+                ).await.map_err(|e| format!("Encryption failed: {}", e))?;
+                
+                let encrypted_base64 = base64::engine::general_purpose::STANDARD.encode(&encrypted);
+                
+                // Generate image ID
+                let image_id = format!("img_{}_{}", user_id, chrono::Utc::now().timestamp_millis());
+                
+                // Store in Firebase
+                let cloud_image = CloudImage {
+                    image_id: image_id.clone(),
+                    owner_id: user_id.clone(),
+                    owner_username: username.clone(),
+                    encrypted_data: encrypted_base64,
+                    preview_data,
+                    filename,
+                    created_at: chrono::Utc::now().timestamp(),
+                };
+                
+                let firebase = FireBaseClient::new();
+                firebase.upload_cloud_image(&cloud_image).await
+                    .map_err(|e| format!("Failed to upload to cloud: {}", e))?;
+                
+                Ok(image_id)
+            })
+        });
+        
+        self.upload_in_progress = Some(promise);
+    }
+    
+    fn process_upload_result(&mut self) {
+        if let Some(promise) = &self.upload_in_progress {
+            if let Some(result) = promise.ready() {
+                match result {
+                    Ok(_image_id) => {
+                        self.upload_image_path = None;
+                        self.upload_error = None;
+                        // Reload images
+                        self.my_cloud_images.clear();
+                        self.my_cloud_images_loaded = false;
+                        self.load_my_cloud_images();
+                    }
+                    Err(e) => {
+                        self.upload_error = Some(e.clone());
+                    }
+                }
+                self.upload_in_progress = None;
+            }
+        }
+    }
+    
+    fn load_my_cloud_images(&mut self) {
+        if self.my_cloud_images_loading.is_some() {
+            return;
+        }
+        
+        let user_id = self.session.user_id.clone();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        
+        let promise = Promise::spawn_thread("load_cloud_images", move || {
+            runtime.block_on(async move {
+                let firebase = FireBaseClient::new();
+                firebase.get_user_cloud_images(&user_id).await
+                    .map_err(|e| format!("Failed to load images: {}", e))
+            })
+        });
+        
+        self.my_cloud_images_loading = Some(promise);
+    }
+    
+    fn process_my_cloud_images_loading(&mut self, _ctx: &egui::Context) {
+        if let Some(promise) = &self.my_cloud_images_loading {
+            if let Some(result) = promise.ready() {
+                match result {
+                    Ok(images) => {
+                        self.my_cloud_images = images.clone();
+                    }
+                    Err(_e) => {
+                        // On error, set to empty to show "No images yet"
+                        self.my_cloud_images = Vec::new();
+                    }
+                }
+                self.my_cloud_images_loaded = true;
+                self.my_cloud_images_loading = None;
+            }
+        }
+    }
+    
+    fn load_image_shares(&mut self, image_id: &str) {
+        let image_id = image_id.to_string();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        
+        let promise = Promise::spawn_thread("load_shares", move || {
+            runtime.block_on(async move {
+                let firebase = FireBaseClient::new();
+                firebase.get_image_shares(&image_id).await
+                    .map_err(|e| format!("Failed to load shares: {}", e))
+            })
+        });
+        
+        self.image_shares_loading = Some(promise);
+    }
+    
+    fn delete_cloud_image(&mut self, image_id: &str) {
+        let image_id_for_delete = image_id.to_string();
+        let image_id_for_filter = image_id.to_string();
+        let owner_id = self.session.user_id.clone();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        
+        Promise::spawn_thread("delete_image", move || {
+            runtime.block_on(async move {
+                let firebase = FireBaseClient::new();
+                let _ = firebase.delete_cloud_image(&image_id_for_delete, &owner_id).await;
+            })
+        });
+        
+        // Remove from local list
+        self.my_cloud_images.retain(|img| img.image_id != image_id_for_filter);
+        self.my_cloud_images_textures.remove(&image_id_for_filter);
+    }
+    
+    // ========================================================================
+    // NEW CLOUD MODEL - Shared With Me Page
+    // ========================================================================
+    
+    fn render_shared_with_me_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            ui.add_space(20.0);
+            
+            ui.vertical(|ui| {
+                ui.set_width(ui.available_width() - 40.0);
+                
+                ui.label(RichText::new("Shared With Me")
+                    .size(24.0)
+                    .color(AppColors::TEXT_PRIMARY)
+                    .strong());
+                ui.label(RichText::new("Images others have shared with you")
+                    .size(14.0)
+                    .color(AppColors::TEXT_SECONDARY));
+                
+                ui.add_space(25.0);
+                
+                // Load if needed (only once)
+                if !self.shared_with_me_loaded && self.shared_with_me_loading.is_none() {
+                    self.load_shared_with_me();
+                }
+                
+                // Process loading
+                self.process_shared_with_me_loading(ctx);
+                
+                if self.shared_with_me_loading.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Loading shared images...");
+                    });
+                } else if self.shared_with_me.is_empty() {
+                    ui.label(RichText::new("No images shared with you yet").color(AppColors::TEXT_SECONDARY));
+                } else {
+                    let shared = self.shared_with_me.clone();
+                    for (image, share) in &shared {
+                        self.render_shared_image_card(ui, ctx, image, share);
+                    }
+                }
+                
+                // Show view error
+                if let Some(ref error) = self.shared_view_error {
+                    ui.add_space(10.0);
+                    ui.label(RichText::new(format!("✗ {}", error)).color(AppColors::ERROR));
+                }
+            });
+        });
+    }
+    
+    fn render_shared_image_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, image: &CloudImage, share: &ImageShare) {
+        let image_id = image.image_id.clone();
+        let share_clone = share.clone();
+        
+        egui::Frame::default()
+            .fill(AppColors::BG_CARD)
+            .rounding(Rounding::same(10.0))
+            .inner_margin(egui::Margin::same(20.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    // Preview
+                    if let Some(texture) = self.shared_textures.get(&image_id) {
+                        let size = Vec2::new(150.0, 100.0);
+                        ui.add(egui::Image::from_texture(texture).fit_to_exact_size(size));
+                    } else {
+                        if let Some(texture) = load_texture_from_data_url_with_name(ctx, &image.preview_data, &format!("shared_{}", image_id)) {
+                            self.shared_textures.insert(image_id.clone(), texture);
+                        } else {
+                            ui.label(RichText::new("🖼️").size(50.0));
+                        }
+                    }
+                    
+                    ui.add_space(20.0);
+                    
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(&image.filename).size(16.0).color(AppColors::TEXT_PRIMARY).strong());
+                        ui.label(RichText::new(format!("From: {}", image.owner_username)).size(13.0).color(AppColors::TEXT_SECONDARY));
+                        
+                        ui.add_space(10.0);
+                        
+                        // Views remaining
+                        let views_color = if share.views_remaining > 0 { AppColors::SUCCESS } else { AppColors::ERROR };
+                        ui.label(RichText::new(format!("👁️ {} views remaining", share.views_remaining))
+                            .size(14.0)
+                            .color(views_color));
+                        
+                        ui.add_space(10.0);
+                        
+                        ui.horizontal(|ui| {
+                            // View button
+                            let can_view = share.views_remaining > 0 && self.viewing_shared_in_progress.is_none();
+                            let view_btn = egui::Button::new(RichText::new("👁️ View Image").size(13.0))
+                                .fill(if can_view { AppColors::PRIMARY } else { AppColors::BG_SECONDARY })
+                                .rounding(Rounding::same(6.0));
+                            
+                            if ui.add_enabled(can_view, view_btn).clicked() {
+                                self.view_shared_image(&image_id, &share_clone);
+                            }
+                            
+                            ui.add_space(10.0);
+                            
+                            // Request more views button
+                            if ui.add(egui::Button::new(RichText::new("➕ Request More Views").size(13.0))
+                                .fill(AppColors::SUCCESS.linear_multiply(0.7))
+                                .rounding(Rounding::same(6.0))).clicked() {
+                                self.view_increase_popup = Some((
+                                    image_id.clone(),
+                                    share.share_id.clone(),
+                                    image.owner_id.clone(),
+                                    image.owner_username.clone(),
+                                ));
+                            }
+                        });
+                        
+                        if self.viewing_shared_in_progress.is_some() && self.viewing_shared_image.as_ref() == Some(&image_id) {
+                            ui.spinner();
+                        }
+                    });
+                });
+            });
+        
+        ui.add_space(15.0);
+    }
+    
+    fn load_shared_with_me(&mut self) {
+        if self.shared_with_me_loading.is_some() {
+            return;
+        }
+        
+        let user_id = self.session.user_id.clone();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        
+        let promise = Promise::spawn_thread("load_shared", move || {
+            runtime.block_on(async move {
+                let firebase = FireBaseClient::new();
+                firebase.get_images_shared_with_user(&user_id).await
+                    .map_err(|e| format!("Failed to load shared images: {}", e))
+            })
+        });
+        
+        self.shared_with_me_loading = Some(promise);
+    }
+    
+    fn process_shared_with_me_loading(&mut self, _ctx: &egui::Context) {
+        if let Some(promise) = &self.shared_with_me_loading {
+            if let Some(result) = promise.ready() {
+                match result {
+                    Ok(shared) => {
+                        self.shared_with_me = shared.clone();
+                    }
+                    Err(_e) => {
+                        // On error, set to empty to show "No images shared with you yet"
+                        self.shared_with_me = Vec::new();
+                    }
+                }
+                self.shared_with_me_loaded = true;
+                self.shared_with_me_loading = None;
+            }
+        }
+    }
+    
+    fn view_shared_image(&mut self, image_id: &str, share: &ImageShare) {
+        let image_id = image_id.to_string();
+        let user_id = self.session.user_id.clone();
+        let share_clone = share.clone();
+        let cloud_addresses = self.cloud_addresses.clone();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        
+        self.viewing_shared_image = Some(image_id.clone());
+        self.shared_view_error = None;
+        
+        let promise = Promise::spawn_thread("view_shared", move || {
+            runtime.block_on(async move {
+                let firebase = FireBaseClient::new();
+                
+                // Get the cloud image
+                let image = firebase.get_cloud_image(&image_id).await
+                    .map_err(|e| format!("Failed to get image: {}", e))?
+                    .ok_or_else(|| "Image not found".to_string())?;
+                
+                // Decode encrypted data
+                let encrypted_data = base64::engine::general_purpose::STANDARD
+                    .decode(&image.encrypted_data)
+                    .map_err(|e| format!("Failed to decode image: {}", e))?;
+                
+                // Decrypt the image directly using encryption module
+                let (decrypted, _metadata) = crate::encryption::decrypt_image(encrypted_data).await
+                    .map_err(|e| format!("Decryption failed: {}", e))?;
+                
+                // Decrement views
+                let new_views = share_clone.views_remaining.saturating_sub(1);
+                firebase.update_share_views(&image_id, &user_id, new_views).await
+                    .map_err(|e| format!("Failed to update views: {}", e))?;
+                
+                Ok((decrypted, new_views))
+            })
+        });
+        
+        self.viewing_shared_in_progress = Some(promise);
+    }
+    
+    fn load_all_requests(&mut self) {
+        if self.share_requests_loading.is_some() {
+            return;
+        }
+        
+        let user_id = self.session.user_id.clone();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        
+        let promise = Promise::spawn_thread("load_requests", move || {
+            runtime.block_on(async move {
+                let firebase = FireBaseClient::new();
+                
+                let incoming = firebase.get_incoming_share_requests(&user_id).await
+                    .map_err(|e| format!("Failed to load incoming: {}", e))?;
+                let outgoing = firebase.get_outgoing_share_requests(&user_id).await
+                    .map_err(|e| format!("Failed to load outgoing: {}", e))?;
+                
+                Ok((incoming, outgoing))
+            })
+        });
+        
+        self.share_requests_loading = Some(promise);
+    }
+    
+    // ========================================================================
+    // NEW CLOUD MODEL - Requests Page
+    // ========================================================================
+    
+    fn render_requests_page_new(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            ui.add_space(20.0);
+            
+            ui.vertical(|ui| {
+                ui.set_width(ui.available_width() - 40.0);
+                
+                ui.label(RichText::new("Requests")
+                    .size(24.0)
+                    .color(AppColors::TEXT_PRIMARY)
+                    .strong());
+                ui.label(RichText::new("Manage share requests and view increase requests")
+                    .size(14.0)
+                    .color(AppColors::TEXT_SECONDARY));
+                
+                ui.add_space(25.0);
+                
+                // Load requests if not loaded (only once)
+                if !self.share_requests_loaded && self.share_requests_loading.is_none() {
+                    self.load_all_requests();
+                }
+                if !self.view_requests_loaded && self.view_requests_loading.is_none() {
+                    self.load_view_increase_requests();
+                }
+                
+                // Process loading
+                self.process_requests_loading();
+                self.process_view_requests_loading();
+                
+                if self.share_requests_loading.is_some() || self.view_requests_loading.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Loading requests...");
+                    });
+                    return;
+                }
+                
+                // Refresh button
+                if ui.add(egui::Button::new("🔄 Refresh")
+                    .fill(AppColors::PRIMARY)
+                    .rounding(Rounding::same(6.0))).clicked() {
+                    self.share_requests_loaded = false;
+                    self.view_requests_loaded = false;
+                    self.load_all_requests();
+                    self.load_view_increase_requests();
+                }
+                
+                ui.add_space(15.0);
+                
+                // Incoming share requests (people want access to my images)
+                ui.label(RichText::new("📥 Incoming Share Requests").size(18.0).strong().color(AppColors::TEXT_PRIMARY));
+                ui.add_space(10.0);
+                
+                if self.incoming_share_requests.is_empty() {
+                    ui.label(RichText::new("No pending share requests").color(AppColors::TEXT_SECONDARY));
+                } else {
+                    let requests = self.incoming_share_requests.clone();
+                    for request in &requests {
+                        self.render_incoming_share_request(ui, request);
+                    }
+                }
+                
+                ui.add_space(25.0);
+                
+                // Incoming view increase requests
+                ui.label(RichText::new("📥 View Increase Requests").size(18.0).strong().color(AppColors::TEXT_PRIMARY));
+                ui.add_space(10.0);
+                
+                if self.incoming_view_requests.is_empty() {
+                    ui.label(RichText::new("No pending view increase requests").color(AppColors::TEXT_SECONDARY));
+                } else {
+                    let requests = self.incoming_view_requests.clone();
+                    for request in &requests {
+                        self.render_incoming_view_request(ui, request);
+                    }
+                }
+                
+                ui.add_space(25.0);
+                
+                // Outgoing requests
+                ui.label(RichText::new("📤 My Outgoing Requests").size(18.0).strong().color(AppColors::TEXT_PRIMARY));
+                ui.add_space(10.0);
+                
+                if self.outgoing_share_requests.is_empty() && self.outgoing_view_requests.is_empty() {
+                    ui.label(RichText::new("No outgoing requests").color(AppColors::TEXT_SECONDARY));
+                } else {
+                    for request in &self.outgoing_share_requests.clone() {
+                        self.render_outgoing_share_request(ui, request);
+                    }
+                    for request in &self.outgoing_view_requests.clone() {
+                        self.render_outgoing_view_request(ui, request);
+                    }
+                }
+            });
+        });
+    }
+    
+    fn render_incoming_share_request(&mut self, ui: &mut egui::Ui, request: &ShareRequest) {
+        egui::Frame::default()
+            .fill(AppColors::BG_CARD)
+            .rounding(Rounding::same(8.0))
+            .inner_margin(egui::Margin::same(15.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(format!("🔔 {} wants to view your image", request.from_username))
+                            .size(14.0).color(AppColors::TEXT_PRIMARY).strong());
+                        ui.label(RichText::new(format!("Requested {} views", request.requested_views))
+                            .size(13.0).color(AppColors::TEXT_SECONDARY));
+                    });
+                    
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let request_clone = request.clone();
+                        
+                        // Reject button
+                        if ui.add(egui::Button::new(RichText::new("✗ Reject").size(12.0))
+                            .fill(AppColors::ERROR.linear_multiply(0.7))
+                            .rounding(Rounding::same(4.0))).clicked() {
+                            self.respond_to_share_request(&request_clone, false);
+                        }
+                        
+                        ui.add_space(10.0);
+                        
+                        // Accept button
+                        if ui.add(egui::Button::new(RichText::new("✓ Accept").size(12.0))
+                            .fill(AppColors::SUCCESS)
+                            .rounding(Rounding::same(4.0))).clicked() {
+                            self.respond_to_share_request(&request_clone, true);
+                        }
+                    });
+                });
+            });
+        ui.add_space(10.0);
+    }
+    
+    fn render_incoming_view_request(&mut self, ui: &mut egui::Ui, request: &ViewIncreaseRequest) {
+        egui::Frame::default()
+            .fill(AppColors::BG_CARD)
+            .rounding(Rounding::same(8.0))
+            .inner_margin(egui::Margin::same(15.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(format!("➕ {} requests {} more views", request.from_username, request.additional_views))
+                            .size(14.0).color(AppColors::TEXT_PRIMARY).strong());
+                    });
+                    
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let request_clone = request.clone();
+                        
+                        if ui.add(egui::Button::new(RichText::new("✗ Reject").size(12.0))
+                            .fill(AppColors::ERROR.linear_multiply(0.7))
+                            .rounding(Rounding::same(4.0))).clicked() {
+                            self.respond_to_view_request(&request_clone, false);
+                        }
+                        
+                        ui.add_space(10.0);
+                        
+                        if ui.add(egui::Button::new(RichText::new("✓ Accept").size(12.0))
+                            .fill(AppColors::SUCCESS)
+                            .rounding(Rounding::same(4.0))).clicked() {
+                            self.respond_to_view_request(&request_clone, true);
+                        }
+                    });
+                });
+            });
+        ui.add_space(10.0);
+    }
+    
+    fn render_outgoing_share_request(&mut self, ui: &mut egui::Ui, request: &ShareRequest) {
+        let status_color = match request.status.as_str() {
+            "accepted" => AppColors::SUCCESS,
+            "rejected" => AppColors::ERROR,
+            _ => AppColors::TEXT_SECONDARY,
+        };
+        
+        egui::Frame::default()
+            .fill(AppColors::BG_SECONDARY)
+            .rounding(Rounding::same(8.0))
+            .inner_margin(egui::Margin::same(15.0))
+            .show(ui, |ui| {
+                ui.label(RichText::new(format!("📤 Requested {} views from {}", request.requested_views, request.to_username))
+                    .size(14.0).color(AppColors::TEXT_PRIMARY));
+                ui.label(RichText::new(format!("Status: {}", request.status))
+                    .size(12.0).color(status_color));
+            });
+        ui.add_space(10.0);
+    }
+    
+    fn render_outgoing_view_request(&mut self, ui: &mut egui::Ui, request: &ViewIncreaseRequest) {
+        let status_color = match request.status.as_str() {
+            "accepted" => AppColors::SUCCESS,
+            "rejected" => AppColors::ERROR,
+            _ => AppColors::TEXT_SECONDARY,
+        };
+        
+        egui::Frame::default()
+            .fill(AppColors::BG_SECONDARY)
+            .rounding(Rounding::same(8.0))
+            .inner_margin(egui::Margin::same(15.0))
+            .show(ui, |ui| {
+                ui.label(RichText::new(format!("➕ Requested {} more views from {}", request.additional_views, request.to_username))
+                    .size(14.0).color(AppColors::TEXT_PRIMARY));
+                ui.label(RichText::new(format!("Status: {}", request.status))
+                    .size(12.0).color(status_color));
+            });
+        ui.add_space(10.0);
+    }
+    
+    fn process_requests_loading(&mut self) {
+        if let Some(promise) = &self.share_requests_loading {
+            if let Some(result) = promise.ready() {
+                match result {
+                    Ok((incoming, outgoing)) => {
+                        self.incoming_share_requests = incoming.clone();
+                        self.outgoing_share_requests = outgoing.clone();
+                    }
+                    Err(_e) => {
+                        // On error, set to empty to show "No requests yet"
+                        self.incoming_share_requests = Vec::new();
+                        self.outgoing_share_requests = Vec::new();
+                    }
+                }
+                self.share_requests_loaded = true;
+                self.share_requests_loading = None;
+            }
+        }
+    }
+    
+    fn respond_to_share_request(&mut self, request: &ShareRequest, accepted: bool) {
+        let request_id_for_filter = request.request_id.clone();
+        let request_id_clone = request.request_id.clone();
+        let request = request.clone();
+        let user_id = self.session.user_id.clone();
+        let username = self.session.username.clone();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        
+        let promise = Promise::spawn_thread("respond_share", move || {
+            runtime.block_on(async move {
+                let firebase = FireBaseClient::new();
+                
+                let status = if accepted { "accepted" } else { "rejected" };
+                firebase.update_share_request_status(&request, status).await
+                    .map_err(|e| format!("Failed to update status: {}", e))?;
+                
+                // If accepted, create the share
+                if accepted {
+                    let share = ImageShare {
+                        share_id: format!("share_{}_{}", request.image_id, request.from_user_id),
+                        image_id: request.image_id.clone(),
+                        user_id: request.from_user_id.clone(),
+                        username: request.from_username.clone(),
+                        views_remaining: request.requested_views,
+                        views_total: request.requested_views,
+                        shared_at: chrono::Utc::now().timestamp(),
+                    };
+                    firebase.create_image_share(&share).await
+                        .map_err(|e| format!("Failed to create share: {}", e))?;
+                }
+                
+                Ok((request_id_clone, accepted))
+            })
+        });
+        
+        self.respond_share_request_in_progress = Some(promise);
+        
+        // Remove from list immediately
+        self.incoming_share_requests.retain(|r| r.request_id != request_id_for_filter);
+    }
+    
+    fn respond_to_view_request(&mut self, request: &ViewIncreaseRequest, accepted: bool) {
+        let request_id_for_filter = request.request_id.clone();
+        let request_id_clone = request.request_id.clone();
+        let request = request.clone();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        
+        let promise = Promise::spawn_thread("respond_view", move || {
+            runtime.block_on(async move {
+                let firebase = FireBaseClient::new();
+                
+                let status = if accepted { "accepted" } else { "rejected" };
+                firebase.update_view_increase_request_status(&request, status).await
+                    .map_err(|e| format!("Failed to update status: {}", e))?;
+                
+                // If accepted, add views
+                if accepted {
+                    firebase.add_share_views(&request.image_id, &request.from_user_id, request.additional_views).await
+                        .map_err(|e| format!("Failed to add views: {}", e))?;
+                }
+                
+                Ok((request_id_clone, accepted))
+            })
+        });
+        
+        self.respond_view_request_in_progress = Some(promise);
+        
+        // Remove from list immediately
+        self.incoming_view_requests.retain(|r| r.request_id != request_id_for_filter);
+    }
+    
+    // ========================================================================
+    // NEW CLOUD MODEL - Share Request Popup
+    // ========================================================================
+    
+    fn render_share_request_popup(&mut self, ctx: &egui::Context) {
+        if self.share_request_popup.is_none() {
+            return;
+        }
+        
+        let mut close_popup = false;
+        let mut send_request = false;
+        
+        egui::Window::new("Request Image Access")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                if let Some((image_id, owner_id, owner_username)) = &self.share_request_popup {
+                    ui.label(RichText::new(format!("Request access to view this image from {}?", owner_username))
+                        .size(14.0)
+                        .color(AppColors::TEXT_PRIMARY));
+                    
+                    ui.add_space(15.0);
+                    
+                    // View quota selector
+                    ui.horizontal(|ui| {
+                        ui.label("Number of views:");
+                        if ui.button("➖").clicked() && self.share_request_views > 1 {
+                            self.share_request_views -= 1;
+                        }
+                        ui.label(RichText::new(format!("{} view{}", 
+                            self.share_request_views,
+                            if self.share_request_views == 1 { "" } else { "s" }
+                        )).size(14.0).strong());
+                        if ui.button("➕").clicked() && self.share_request_views < 99 {
+                            self.share_request_views += 1;
+                        }
+                    });
+                    
+                    ui.add_space(20.0);
+                    
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            close_popup = true;
+                        }
+                        ui.add_space(20.0);
+                        if ui.button("Send Request").clicked() {
+                            send_request = true;
+                        }
+                    });
+                }
+            });
+        
+        if close_popup {
+            self.share_request_popup = None;
+        }
+        
+        if send_request {
+            if let Some((image_id, owner_id, owner_username)) = self.share_request_popup.take() {
+                let views = self.share_request_views;
+                self.send_share_request(&image_id, &owner_id, &owner_username, views);
+            }
+        }
+    }
+    
+    fn send_share_request(&mut self, image_id: &str, owner_id: &str, owner_username: &str, requested_views: u8) {
+        let request = ShareRequest {
+            request_id: format!("sreq_{}_{}", self.session.user_id, chrono::Utc::now().timestamp_millis()),
+            image_id: image_id.to_string(),
+            from_user_id: self.session.user_id.clone(),
+            from_username: self.session.username.clone(),
+            to_user_id: owner_id.to_string(),
+            to_username: owner_username.to_string(),
+            requested_views,
+            status: "pending".to_string(),
+            timestamp: chrono::Utc::now().timestamp(),
+        };
+        
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        
+        Promise::spawn_thread("send_share_request", move || {
+            runtime.block_on(async move {
+                let firebase = FireBaseClient::new();
+                firebase.create_share_request(&request).await
+                    .map_err(|e| format!("Failed to send request: {}", e))
+            })
+        });
+        
+        self.share_request_views = 5; // Reset default
+    }
+    
+    // ========================================================================
+    // NEW CLOUD MODEL - View Increase Request Popup
+    // ========================================================================
+    
+    fn render_view_increase_popup(&mut self, ctx: &egui::Context) {
+        if self.view_increase_popup.is_none() {
+            return;
+        }
+        
+        let mut close_popup = false;
+        let mut send_request = false;
+        
+        egui::Window::new("Request More Views")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                if let Some((image_id, share_id, owner_id, owner_username)) = &self.view_increase_popup {
+                    ui.label(RichText::new(format!("Request additional views from {}?", owner_username))
+                        .size(14.0)
+                        .color(AppColors::TEXT_PRIMARY));
+                    
+                    ui.add_space(15.0);
+                    
+                    // Additional views selector
+                    ui.horizontal(|ui| {
+                        ui.label("Additional views:");
+                        if ui.button("➖").clicked() && self.view_increase_amount > 1 {
+                            self.view_increase_amount -= 1;
+                        }
+                        ui.label(RichText::new(format!("{} view{}", 
+                            self.view_increase_amount,
+                            if self.view_increase_amount == 1 { "" } else { "s" }
+                        )).size(14.0).strong());
+                        if ui.button("➕").clicked() && self.view_increase_amount < 99 {
+                            self.view_increase_amount += 1;
+                        }
+                    });
+                    
+                    ui.add_space(20.0);
+                    
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            close_popup = true;
+                        }
+                        ui.add_space(20.0);
+                        if ui.button("Send Request").clicked() {
+                            send_request = true;
+                        }
+                    });
+                }
+            });
+        
+        if close_popup {
+            self.view_increase_popup = None;
+        }
+        
+        if send_request {
+            if let Some((image_id, share_id, owner_id, owner_username)) = self.view_increase_popup.take() {
+                let amount = self.view_increase_amount;
+                self.send_view_increase_request(&image_id, &share_id, &owner_id, &owner_username, amount);
+            }
+        }
+    }
+    
+    fn send_view_increase_request(&mut self, image_id: &str, share_id: &str, owner_id: &str, owner_username: &str, additional_views: u8) {
+        let request = ViewIncreaseRequest {
+            request_id: format!("vreq_{}_{}", self.session.user_id, chrono::Utc::now().timestamp_millis()),
+            image_id: image_id.to_string(),
+            share_id: share_id.to_string(),
+            from_user_id: self.session.user_id.clone(),
+            from_username: self.session.username.clone(),
+            to_user_id: owner_id.to_string(),
+            to_username: owner_username.to_string(),
+            additional_views,
+            status: "pending".to_string(),
+            timestamp: chrono::Utc::now().timestamp(),
+        };
+        
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        
+        Promise::spawn_thread("send_view_increase_request", move || {
+            runtime.block_on(async move {
+                let firebase = FireBaseClient::new();
+                firebase.create_view_increase_request(&request).await
+                    .map_err(|e| format!("Failed to send request: {}", e))
+            })
+        });
+        
+        self.view_increase_amount = 5; // Reset default
+    }
+    
+    // ========================================================================
+    // NEW CLOUD MODEL - Load View Increase Requests
+    // ========================================================================
+    
+    fn load_view_increase_requests(&mut self) {
+        if self.view_requests_loading.is_some() {
+            return;
+        }
+        
+        let user_id = self.session.user_id.clone();
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        
+        let promise = Promise::spawn_thread("load_view_requests", move || {
+            runtime.block_on(async move {
+                let firebase = FireBaseClient::new();
+                
+                let incoming = firebase.get_incoming_view_increase_requests(&user_id).await
+                    .map_err(|e| format!("Failed to load incoming: {}", e))?;
+                let outgoing = firebase.get_outgoing_view_increase_requests(&user_id).await
+                    .map_err(|e| format!("Failed to load outgoing: {}", e))?;
+                
+                Ok((incoming, outgoing))
+            })
+        });
+        
+        self.view_requests_loading = Some(promise);
+    }
+    
+    fn process_view_requests_loading(&mut self) {
+        if let Some(promise) = &self.view_requests_loading {
+            if let Some(result) = promise.ready() {
+                match result {
+                    Ok((incoming, outgoing)) => {
+                        self.incoming_view_requests = incoming.clone();
+                        self.outgoing_view_requests = outgoing.clone();
+                    }
+                    Err(_e) => {
+                        // On error, set to empty
+                        self.incoming_view_requests = Vec::new();
+                        self.outgoing_view_requests = Vec::new();
+                    }
+                }
+                self.view_requests_loaded = true;
+                self.view_requests_loading = None;
+            }
+        }
+    }
+}
+
+/// Create a pixelated preview from image data
+fn create_pixelated_preview(image_data: &[u8]) -> Result<String, String> {
+    use image::{GenericImageView, DynamicImage};
+    
+    let img = image::load_from_memory(image_data)
+        .map_err(|e| format!("Failed to load image: {}", e))?;
+    
+    // Resize to very small, then back up for pixelated effect
+    let small = img.resize(20, 20, image::imageops::FilterType::Nearest);
+    let pixelated = small.resize(200, 200, image::imageops::FilterType::Nearest);
+    
+    let mut png_data = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut png_data);
+    pixelated.write_to(&mut cursor, image::ImageFormat::Png)
+        .map_err(|e| format!("Failed to encode preview: {}", e))?;
+    
+    let base64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
+    Ok(format!("data:image/png;base64,{}", base64))
 }
 
 // ============================================================================

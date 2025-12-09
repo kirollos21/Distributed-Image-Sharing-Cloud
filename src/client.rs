@@ -711,6 +711,237 @@ impl Client {
         }
     }
 
+    // ==================== P2P Direct Communication ====================
+    
+    /// Send a message directly to a peer (P2P) without waiting for response
+    /// Used for direct client-to-client communication
+    async fn send_to_peer_no_response(
+        client_id: usize,
+        peer_address: &str,
+        message: Message,
+    ) -> Result<(), String> {
+        debug!("[Client {}] P2P send to {}", client_id, peer_address);
+        
+        // Create UDP socket
+        let socket = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(format!("Socket creation failed: {}", e));
+            }
+        };
+        
+        // Serialize and send message
+        let message_bytes = serde_json::to_vec(&message).map_err(|e| e.to_string())?;
+        let chunks = ChunkedMessage::fragment(message_bytes);
+        
+        for (i, chunk) in chunks.iter().enumerate() {
+            let chunk_bytes = serde_json::to_vec(&chunk).map_err(|e| e.to_string())?;
+            socket.send_to(&chunk_bytes, peer_address).await.map_err(|e| format!("Send error: {}", e))?;
+            
+            // Small delay between chunks to prevent UDP packet loss
+            if i < chunks.len() - 1 {
+                sleep(Duration::from_millis(2)).await;
+            }
+        }
+        
+        debug!("[Client {}] P2P message sent to {}", client_id, peer_address);
+        Ok(())
+    }
+    
+    /// Send an encrypted image directly to recipients via P2P
+    /// Gets recipient IPs from Firebase and sends directly
+    pub async fn send_image_p2p(
+        &self,
+        from_username: String,
+        to_user_ids: Vec<String>,
+        to_usernames: Vec<String>,
+        encrypted_image: Vec<u8>,
+        max_views: u8,
+        image_id: String,
+    ) -> Result<String, String> {
+        let firebase = FireBaseClient::new();
+        
+        info!("[Client {}] P2P: Sending image {} to {:?}", self.id, image_id, to_usernames);
+        
+        let mut success_count = 0;
+        let mut offline_recipients: Vec<(String, String)> = Vec::new(); // (user_id, username)
+        
+        // Send to each recipient directly
+        for (i, user_id) in to_user_ids.iter().enumerate() {
+            let username = to_usernames.get(i).cloned().unwrap_or_else(|| user_id.clone());
+            
+            // Get recipient's IP from Firebase
+            match firebase.get_user_ip(user_id).await {
+                Ok(Some(ip)) if !ip.is_empty() => {
+                    // Construct peer address (use port 8009 for P2P listening - same as GUI listener)
+                    let peer_address = format!("{}:8009", ip);
+                    
+                    let message = Message::SendImage {
+                        from_username: from_username.clone(),
+                        to_usernames: vec![username.clone()],
+                        encrypted_image: encrypted_image.clone(),
+                        max_views,
+                        image_id: image_id.clone(),
+                    };
+                    
+                    match Self::send_to_peer_no_response(self.id, &peer_address, message).await {
+                        Ok(_) => {
+                            success_count += 1;
+                            info!("[Client {}] P2P: Image sent directly to {} at {}", self.id, username, peer_address);
+                        }
+                        Err(e) => {
+                            warn!("[Client {}] P2P: Failed to send to {}: {}, marking as offline", self.id, username, e);
+                            offline_recipients.push((user_id.clone(), username));
+                        }
+                    }
+                }
+                _ => {
+                    warn!("[Client {}] P2P: No IP for user {}, marking as offline", self.id, username);
+                    offline_recipients.push((user_id.clone(), username));
+                }
+            }
+        }
+        
+        // For offline recipients, store the image via node (fallback)
+        if !offline_recipients.is_empty() {
+            info!("[Client {}] P2P: {} recipients offline, using node fallback", 
+                  self.id, offline_recipients.len());
+            
+            let offline_usernames: Vec<String> = offline_recipients.iter().map(|(_, u)| u.clone()).collect();
+            
+            // Use existing node-based sending for offline users
+            let message = Message::SendImage {
+                from_username: from_username.clone(),
+                to_usernames: offline_usernames.clone(),
+                encrypted_image: encrypted_image.clone(),
+                max_views,
+                image_id: image_id.clone(),
+            };
+            
+            // Send to first available node
+            for address in &self.cloud_addresses {
+                match Self::send_to_node(self.id, address, message.clone()).await {
+                    Ok(Message::SendImageResponse { success, .. }) if success => {
+                        success_count += offline_recipients.len();
+                        info!("[Client {}] P2P: Offline recipients handled via node {}", self.id, address);
+                        break;
+                    }
+                    _ => continue,
+                }
+            }
+        }
+        
+        if success_count > 0 {
+            Ok(image_id)
+        } else {
+            Err("Failed to send image to any recipient".to_string())
+        }
+    }
+    
+    /// Send an image request directly to recipient via P2P
+    pub async fn send_image_request_p2p(
+        &self,
+        request_id: String,
+        from_id: u8,
+        to_id: String,
+        from_username: String,
+        to_username: String,
+        image_index: usize,
+        timestamp: i64,
+        quota: u8,
+    ) -> Result<String, String> {
+        let firebase = FireBaseClient::new();
+        
+        info!("[Client {}] P2P: Sending image request {} to {}", self.id, request_id, to_username);
+        
+        // Get recipient's IP from Firebase
+        match firebase.get_user_ip(&to_id).await {
+            Ok(Some(ip)) if !ip.is_empty() => {
+                let peer_address = format!("{}:8009", ip);
+                
+                let message = Message::RequestImage {
+                    request_id: request_id.clone(),
+                    from_user_id: from_id.to_string(),
+                    from_username: from_username.clone(),
+                    to_user_id: to_id.clone(),
+                    to_username: to_username.clone(),
+                    image_index,
+                    timestamp,
+                    quota,
+                };
+                
+                match Self::send_to_peer_no_response(self.id, &peer_address, message).await {
+                    Ok(_) => {
+                        info!("[Client {}] P2P: Image request sent directly to {} at {}", 
+                              self.id, to_username, peer_address);
+                        return Ok(request_id);
+                    }
+                    Err(e) => {
+                        warn!("[Client {}] P2P: Failed to send request to {}: {}, using node fallback", 
+                              self.id, to_username, e);
+                    }
+                }
+            }
+            _ => {
+                warn!("[Client {}] P2P: No IP for user {}, using node fallback", self.id, to_username);
+            }
+        }
+        
+        // Fallback to node-based sending
+        self.send_image_request(request_id, from_id, to_id.parse().unwrap_or(0), from_username, to_username, image_index, timestamp, quota).await
+    }
+    
+    /// Send a text note directly to recipient via P2P
+    pub async fn send_note_p2p(
+        &self,
+        note_id: String,
+        from_id: u8,
+        to_id: String,
+        from_username: String,
+        content: String,
+        timestamp: i64,
+    ) -> Result<String, String> {
+        let firebase = FireBaseClient::new();
+        
+        info!("[Client {}] P2P: Sending note {} to user {}", self.id, note_id, to_id);
+        
+        // Get recipient's IP from Firebase
+        match firebase.get_user_ip(&to_id).await {
+            Ok(Some(ip)) if !ip.is_empty() => {
+                let peer_address = format!("{}:8009", ip);
+                
+                let message = Message::SendNote {
+                    note_id: note_id.clone(),
+                    from_id,
+                    to_id: to_id.parse().unwrap_or(0),
+                    from_username: from_username.clone(),
+                    content: content.clone(),
+                    timestamp,
+                };
+                
+                match Self::send_to_peer_no_response(self.id, &peer_address, message).await {
+                    Ok(_) => {
+                        info!("[Client {}] P2P: Note sent directly to {} at {}", 
+                              self.id, to_id, peer_address);
+                        return Ok(to_id);
+                    }
+                    Err(e) => {
+                        warn!("[Client {}] P2P: Failed to send note to {}: {}, using node fallback", 
+                              self.id, to_id, e);
+                    }
+                }
+            }
+            _ => {
+                warn!("[Client {}] P2P: No IP for user {}, using node fallback", self.id, to_id);
+            }
+        }
+        
+        // Fallback to node-based sending
+        self.send_note(note_id, from_id, to_id.parse().unwrap_or(0), from_username, content, timestamp).await
+    }
+    
+    // ==================== End P2P Functions ====================
+
     /// Query received images for a username
     pub async fn query_received_images(
         &self,

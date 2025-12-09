@@ -574,3 +574,351 @@ pub struct ImageRequestMeta {
 fn default_quota() -> u8 {
     1
 }
+
+// ==================== CLOUD STORAGE MODEL (Like Google Drive) ====================
+
+/// Encrypted image stored in Firebase cloud
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudImage {
+    pub image_id: String,
+    pub owner_id: String,
+    pub owner_username: String,
+    pub encrypted_data: String,  // Base64 encoded encrypted image
+    pub preview_data: String,    // Base64 encoded pixelated preview
+    pub filename: String,
+    pub created_at: i64,
+}
+
+/// Share record - who has access to which image
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageShare {
+    pub share_id: String,
+    pub image_id: String,
+    pub user_id: String,
+    pub username: String,
+    pub views_remaining: u8,
+    pub views_total: u8,
+    pub shared_at: i64,
+}
+
+/// Request to access an image
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareRequest {
+    pub request_id: String,
+    pub image_id: String,
+    pub from_user_id: String,
+    pub from_username: String,
+    pub to_user_id: String,      // Owner
+    pub to_username: String,
+    pub requested_views: u8,
+    pub status: String,          // "pending", "accepted", "rejected"
+    pub timestamp: i64,
+}
+
+/// Request for additional views on an already-shared image
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewIncreaseRequest {
+    pub request_id: String,
+    pub image_id: String,
+    pub share_id: String,
+    pub from_user_id: String,
+    pub from_username: String,
+    pub to_user_id: String,      // Owner
+    pub to_username: String,
+    pub additional_views: u8,
+    pub status: String,          // "pending", "accepted", "rejected"
+    pub timestamp: i64,
+}
+
+impl FireBaseClient {
+    // ==================== CLOUD IMAGE STORAGE ====================
+    
+    /// Upload an encrypted image to cloud storage
+    pub async fn upload_cloud_image(&self, image: &CloudImage) -> Result<(), reqwest::Error> {
+        let url = format!("{}/cloud_images/{}.json", self.base_url, image.image_id);
+        self.client.put(&url).json(image).send().await?;
+        
+        // Also add to owner's image list for quick lookup
+        let owner_url = format!("{}/user_images/{}/{}.json", self.base_url, image.owner_id, image.image_id);
+        self.client.put(&owner_url).json(&true).send().await?;
+        
+        Ok(())
+    }
+    
+    /// Get a cloud image by ID
+    pub async fn get_cloud_image(&self, image_id: &str) -> Result<Option<CloudImage>, reqwest::Error> {
+        let url = format!("{}/cloud_images/{}.json", self.base_url, image_id);
+        let resp = self.client.get(&url).send().await?;
+        let image = resp.json::<Option<CloudImage>>().await?;
+        Ok(image)
+    }
+    
+    /// Get all images owned by a user
+    pub async fn get_user_cloud_images(&self, user_id: &str) -> Result<Vec<CloudImage>, reqwest::Error> {
+        // First get the list of image IDs owned by this user
+        let list_url = format!("{}/user_images/{}.json", self.base_url, user_id);
+        let resp = self.client.get(&list_url).send().await?;
+        let image_ids: Option<HashMap<String, bool>> = resp.json().await?;
+        
+        let mut images = Vec::new();
+        if let Some(ids) = image_ids {
+            for image_id in ids.keys() {
+                if let Ok(Some(img)) = self.get_cloud_image(image_id).await {
+                    images.push(img);
+                }
+            }
+        }
+        
+        // Sort by created_at descending (newest first)
+        images.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(images)
+    }
+    
+    /// Delete a cloud image
+    pub async fn delete_cloud_image(&self, image_id: &str, owner_id: &str) -> Result<(), reqwest::Error> {
+        let url = format!("{}/cloud_images/{}.json", self.base_url, image_id);
+        self.client.delete(&url).send().await?;
+        
+        // Remove from owner's list
+        let owner_url = format!("{}/user_images/{}/{}.json", self.base_url, owner_id, image_id);
+        self.client.delete(&owner_url).send().await?;
+        
+        // Also delete all shares for this image
+        let shares_url = format!("{}/image_shares/{}.json", self.base_url, image_id);
+        self.client.delete(&shares_url).send().await?;
+        
+        Ok(())
+    }
+    
+    // ==================== IMAGE SHARING ====================
+    
+    /// Create a share record (grant access to an image)
+    pub async fn create_image_share(&self, share: &ImageShare) -> Result<(), reqwest::Error> {
+        // Store under /image_shares/{image_id}/{user_id}
+        let url = format!("{}/image_shares/{}/{}.json", self.base_url, share.image_id, share.user_id);
+        self.client.put(&url).json(share).send().await?;
+        
+        // Also store under /user_shared_images/{user_id}/{image_id} for quick lookup of what's shared with a user
+        let user_url = format!("{}/user_shared_images/{}/{}.json", self.base_url, share.user_id, share.image_id);
+        self.client.put(&user_url).json(&share.share_id).send().await?;
+        
+        Ok(())
+    }
+    
+    /// Get share record for a specific user and image
+    pub async fn get_image_share(&self, image_id: &str, user_id: &str) -> Result<Option<ImageShare>, reqwest::Error> {
+        let url = format!("{}/image_shares/{}/{}.json", self.base_url, image_id, user_id);
+        let resp = self.client.get(&url).send().await?;
+        let share = resp.json::<Option<ImageShare>>().await?;
+        Ok(share)
+    }
+    
+    /// Get all images shared with a user
+    pub async fn get_images_shared_with_user(&self, user_id: &str) -> Result<Vec<(CloudImage, ImageShare)>, reqwest::Error> {
+        // Get list of image IDs shared with this user
+        let list_url = format!("{}/user_shared_images/{}.json", self.base_url, user_id);
+        let resp = self.client.get(&list_url).send().await?;
+        let image_ids: Option<HashMap<String, String>> = resp.json().await?;
+        
+        let mut results = Vec::new();
+        if let Some(ids) = image_ids {
+            for image_id in ids.keys() {
+                if let (Ok(Some(img)), Ok(Some(share))) = (
+                    self.get_cloud_image(image_id).await,
+                    self.get_image_share(image_id, user_id).await
+                ) {
+                    results.push((img, share));
+                }
+            }
+        }
+        
+        // Sort by shared_at descending
+        results.sort_by(|a, b| b.1.shared_at.cmp(&a.1.shared_at));
+        Ok(results)
+    }
+    
+    /// Get all shares for an image (for owner to see who has access)
+    pub async fn get_image_shares(&self, image_id: &str) -> Result<Vec<ImageShare>, reqwest::Error> {
+        let url = format!("{}/image_shares/{}.json", self.base_url, image_id);
+        let resp = self.client.get(&url).send().await?;
+        let shares_map: Option<HashMap<String, ImageShare>> = resp.json().await?;
+        
+        let mut shares = Vec::new();
+        if let Some(map) = shares_map {
+            for (_, share) in map {
+                shares.push(share);
+            }
+        }
+        Ok(shares)
+    }
+    
+    /// Update views remaining for a share
+    pub async fn update_share_views(&self, image_id: &str, user_id: &str, views_remaining: u8) -> Result<(), reqwest::Error> {
+        let url = format!("{}/image_shares/{}/{}/views_remaining.json", self.base_url, image_id, user_id);
+        self.client.put(&url).json(&views_remaining).send().await?;
+        Ok(())
+    }
+    
+    /// Add views to a share
+    pub async fn add_share_views(&self, image_id: &str, user_id: &str, additional_views: u8) -> Result<(), reqwest::Error> {
+        // Get current share
+        if let Some(share) = self.get_image_share(image_id, user_id).await? {
+            let new_remaining = share.views_remaining.saturating_add(additional_views);
+            let new_total = share.views_total.saturating_add(additional_views);
+            
+            let url = format!("{}/image_shares/{}/{}.json", self.base_url, image_id, user_id);
+            let updated_share = ImageShare {
+                views_remaining: new_remaining,
+                views_total: new_total,
+                ..share
+            };
+            self.client.put(&url).json(&updated_share).send().await?;
+        }
+        Ok(())
+    }
+    
+    /// Delete a share (revoke access)
+    pub async fn delete_image_share(&self, image_id: &str, user_id: &str) -> Result<(), reqwest::Error> {
+        let url = format!("{}/image_shares/{}/{}.json", self.base_url, image_id, user_id);
+        self.client.delete(&url).send().await?;
+        
+        let user_url = format!("{}/user_shared_images/{}/{}.json", self.base_url, user_id, image_id);
+        self.client.delete(&user_url).send().await?;
+        
+        Ok(())
+    }
+    
+    // ==================== SHARE REQUESTS ====================
+    
+    /// Create a share request (user wants access to an image)
+    pub async fn create_share_request(&self, request: &ShareRequest) -> Result<(), reqwest::Error> {
+        // Store in owner's incoming requests
+        let url = format!("{}/share_requests/{}/incoming/{}.json", 
+            self.base_url, request.to_user_id, request.request_id);
+        self.client.put(&url).json(request).send().await?;
+        
+        // Store in requester's outgoing requests
+        let out_url = format!("{}/share_requests/{}/outgoing/{}.json",
+            self.base_url, request.from_user_id, request.request_id);
+        self.client.put(&out_url).json(request).send().await?;
+        
+        Ok(())
+    }
+    
+    /// Get incoming share requests for a user (they are the owner)
+    pub async fn get_incoming_share_requests(&self, user_id: &str) -> Result<Vec<ShareRequest>, reqwest::Error> {
+        let url = format!("{}/share_requests/{}/incoming.json", self.base_url, user_id);
+        let resp = self.client.get(&url).send().await?;
+        let requests_map: Option<HashMap<String, ShareRequest>> = resp.json().await?;
+        
+        let mut requests = Vec::new();
+        if let Some(map) = requests_map {
+            for (_, req) in map {
+                if req.status == "pending" {
+                    requests.push(req);
+                }
+            }
+        }
+        requests.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        Ok(requests)
+    }
+    
+    /// Get outgoing share requests for a user
+    pub async fn get_outgoing_share_requests(&self, user_id: &str) -> Result<Vec<ShareRequest>, reqwest::Error> {
+        let url = format!("{}/share_requests/{}/outgoing.json", self.base_url, user_id);
+        let resp = self.client.get(&url).send().await?;
+        let requests_map: Option<HashMap<String, ShareRequest>> = resp.json().await?;
+        
+        let mut requests = Vec::new();
+        if let Some(map) = requests_map {
+            for (_, req) in map {
+                requests.push(req);
+            }
+        }
+        requests.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        Ok(requests)
+    }
+    
+    /// Update share request status
+    pub async fn update_share_request_status(&self, request: &ShareRequest, status: &str) -> Result<(), reqwest::Error> {
+        let url_to = format!("{}/share_requests/{}/incoming/{}/status.json",
+            self.base_url, request.to_user_id, request.request_id);
+        let url_from = format!("{}/share_requests/{}/outgoing/{}/status.json",
+            self.base_url, request.from_user_id, request.request_id);
+        
+        let (r1, r2) = tokio::join!(
+            self.client.put(&url_to).json(&status).send(),
+            self.client.put(&url_from).json(&status).send()
+        );
+        r1?;
+        r2?;
+        Ok(())
+    }
+    
+    // ==================== VIEW INCREASE REQUESTS ====================
+    
+    /// Create a view increase request
+    pub async fn create_view_increase_request(&self, request: &ViewIncreaseRequest) -> Result<(), reqwest::Error> {
+        // Store in owner's incoming
+        let url = format!("{}/view_increase_requests/{}/incoming/{}.json",
+            self.base_url, request.to_user_id, request.request_id);
+        self.client.put(&url).json(request).send().await?;
+        
+        // Store in requester's outgoing
+        let out_url = format!("{}/view_increase_requests/{}/outgoing/{}.json",
+            self.base_url, request.from_user_id, request.request_id);
+        self.client.put(&out_url).json(request).send().await?;
+        
+        Ok(())
+    }
+    
+    /// Get incoming view increase requests
+    pub async fn get_incoming_view_increase_requests(&self, user_id: &str) -> Result<Vec<ViewIncreaseRequest>, reqwest::Error> {
+        let url = format!("{}/view_increase_requests/{}/incoming.json", self.base_url, user_id);
+        let resp = self.client.get(&url).send().await?;
+        let requests_map: Option<HashMap<String, ViewIncreaseRequest>> = resp.json().await?;
+        
+        let mut requests = Vec::new();
+        if let Some(map) = requests_map {
+            for (_, req) in map {
+                if req.status == "pending" {
+                    requests.push(req);
+                }
+            }
+        }
+        requests.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        Ok(requests)
+    }
+    
+    /// Get outgoing view increase requests (requests I sent to others)
+    pub async fn get_outgoing_view_increase_requests(&self, user_id: &str) -> Result<Vec<ViewIncreaseRequest>, reqwest::Error> {
+        let url = format!("{}/view_increase_requests/{}/outgoing.json", self.base_url, user_id);
+        let resp = self.client.get(&url).send().await?;
+        let requests_map: Option<HashMap<String, ViewIncreaseRequest>> = resp.json().await?;
+        
+        let mut requests = Vec::new();
+        if let Some(map) = requests_map {
+            for (_, req) in map {
+                requests.push(req);
+            }
+        }
+        requests.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        Ok(requests)
+    }
+    
+    /// Update view increase request status
+    pub async fn update_view_increase_request_status(&self, request: &ViewIncreaseRequest, status: &str) -> Result<(), reqwest::Error> {
+        let url_to = format!("{}/view_increase_requests/{}/incoming/{}/status.json",
+            self.base_url, request.to_user_id, request.request_id);
+        let url_from = format!("{}/view_increase_requests/{}/outgoing/{}/status.json",
+            self.base_url, request.from_user_id, request.request_id);
+        
+        let (r1, r2) = tokio::join!(
+            self.client.put(&url_to).json(&status).send(),
+            self.client.put(&url_from).json(&status).send()
+        );
+        r1?;
+        r2?;
+        Ok(())
+    }
+}
