@@ -1017,4 +1017,11 @@ impl FireBaseClient {
         self.client.put(&url).json(&true).send().await?;
         Ok(())
     }
+    
+    /// Reset downloaded flag to allow re-download (e.g., when views are increased)
+    pub async fn reset_share_downloaded(&self, user_id: &str, share_id: &str) -> Result<(), reqwest::Error> {
+        let url = format!("{}/share_metadata/{}/{}/downloaded.json", self.base_url, user_id, share_id);
+        self.client.put(&url).json(&false).send().await?;
+        Ok(())
+    }
 }

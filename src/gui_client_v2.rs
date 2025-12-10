@@ -118,6 +118,8 @@ pub struct ClientAppV2 {
     incoming_note_rx: Option<mpsc::Receiver<NoteMeta>>,
     // Incoming image channel (from local UDP listener for direct delivery)
     incoming_image_rx: Option<mpsc::Receiver<ReceivedImageMeta>>,
+    // Incoming share accepted signal (from UDP listener when P2P share received)
+    incoming_share_accepted_rx: Option<mpsc::Receiver<()>>,
     
     // Settings state
     new_username_input: String,
@@ -157,6 +159,7 @@ pub struct ClientAppV2 {
     shared_with_me: Vec<(CloudImage, ImageShare)>,
     shared_with_me_loading: Option<Promise<Result<Vec<(CloudImage, ImageShare)>, String>>>,
     shared_with_me_loaded: bool,
+    shared_with_me_needs_reload: bool,  // Flag to trigger reload when new share received via P2P
     shared_textures: std::collections::HashMap<String, egui::TextureHandle>,  // image_id -> preview texture
     viewing_shared_image: Option<String>,  // image_id being viewed
     viewing_shared_in_progress: Option<Promise<Result<(Vec<u8>, u8), String>>>,  // (decrypted_data, remaining_views)
@@ -358,6 +361,7 @@ impl ClientAppV2 {
             note_delete_in_progress: None,
             incoming_note_rx: None,
             incoming_image_rx: None,
+            incoming_share_accepted_rx: None,
             new_username_input: String::new(),
             username_change_in_progress: None,
             old_password_input: String::new(),
@@ -387,6 +391,7 @@ impl ClientAppV2 {
             shared_with_me: Vec::new(),
             shared_with_me_loading: None,
             shared_with_me_loaded: false,
+            shared_with_me_needs_reload: false,
             shared_textures: std::collections::HashMap::new(),
             viewing_shared_image: None,
             viewing_shared_in_progress: None,
@@ -513,6 +518,7 @@ impl ClientAppV2 {
         let (note_tx, note_rx) = mpsc::channel::<NoteMeta>();
         let (image_tx, image_rx) = mpsc::channel::<ReceivedImageMeta>();
         let (request_tx, request_rx) = mpsc::channel::<ImageRequest>();
+        let (share_accepted_tx, share_accepted_rx) = mpsc::channel::<()>();  // Signal when share accepted
         let mut local_addr = get_local_ip();
         eprintln!("[SETUP] Attempting to bind UDP on 0.0.0.0:8009...");
         if let Ok(sock) = std::net::UdpSocket::bind(("0.0.0.0", 8009)) {
@@ -524,6 +530,7 @@ impl ClientAppV2 {
             let note_tx_clone = note_tx.clone();
             let image_tx_clone = image_tx.clone();
             let request_tx_clone = request_tx.clone();
+            let share_accepted_tx_clone = share_accepted_tx.clone();
             std::thread::spawn(move || {
                 eprintln!("[UDP LISTENER PORT 8009] Started");
                 let mut buf = [0u8; 65536];
@@ -685,6 +692,9 @@ impl ClientAppV2 {
                                                     eprintln!("[UDP 8009 DIRECT] Failed to save metadata: {}", e);
                                                 } else {
                                                     eprintln!("[UDP 8009 DIRECT] Saved metadata to {}", meta_path);
+                                                    eprintln!("[UDP 8009 DIRECT] ✅ New share received! Triggering UI reload...");
+                                                    // Signal that a new share was received
+                                                    let _ = share_accepted_tx_clone.send(());
                                                 }
                                             }
                                         }
@@ -725,6 +735,7 @@ impl ClientAppV2 {
             self.incoming_note_rx = Some(note_rx);
             self.incoming_image_rx = Some(image_rx);
             self.incoming_request_rx = Some(request_rx);
+            self.incoming_share_accepted_rx = Some(share_accepted_rx);
             eprintln!("[SETUP] UDP listener thread spawned on port 8009");
         } else if let Ok(sock) = std::net::UdpSocket::bind(("0.0.0.0", 0)) {
             eprintln!("[SETUP] Port 8009 failed, using ephemeral port");
@@ -1369,6 +1380,14 @@ impl eframe::App for ClientAppV2 {
                 while let Ok(note) = rx.try_recv() {
                     // Prepend to notes list so newest appear first
                     self.notes.insert(0, note);
+                }
+            }
+            
+            // Process incoming share accepted signals
+            if let Some(rx) = &self.incoming_share_accepted_rx {
+                while let Ok(_) = rx.try_recv() {
+                    eprintln!("[UPDATE] Share accepted signal received! Setting reload flag...");
+                    self.shared_with_me_needs_reload = true;
                 }
             }
             
@@ -4870,49 +4889,57 @@ impl ClientAppV2 {
             .inner_margin(egui::Margin::same(15.0))
             .show(ui, |ui| {
                 ui.set_width(200.0);
+                ui.set_min_height(280.0);  // Fixed minimum height to prevent layout shifts
                 
-                // Show preview texture
-                if let Some(texture) = self.my_cloud_images_textures.get(&image_id) {
-                    let size = Vec2::new(180.0, 120.0);
-                    ui.add(egui::Image::from_texture(texture).fit_to_exact_size(size));
-                } else {
-                    // Load texture
-                    if let Some(texture) = load_texture_from_data_url_with_name(ctx, &image.preview_data, &format!("cloud_{}", image_id)) {
-                        self.my_cloud_images_textures.insert(image_id.clone(), texture);
-                    } else {
-                        ui.label(RichText::new("🖼️").size(60.0));
+                ui.vertical(|ui| {
+                    // Show preview texture with fixed size container
+                    ui.vertical_centered(|ui| {
+                        if let Some(texture) = self.my_cloud_images_textures.get(&image_id) {
+                            let size = Vec2::new(180.0, 120.0);
+                            ui.add(egui::Image::from_texture(texture).fit_to_exact_size(size));
+                        } else {
+                            // Load texture
+                            if let Some(texture) = load_texture_from_data_url_with_name(ctx, &image.preview_data, &format!("cloud_{}", image_id)) {
+                                self.my_cloud_images_textures.insert(image_id.clone(), texture);
+                            }
+                            // Always show fixed size placeholder
+                            ui.allocate_ui(Vec2::new(180.0, 120.0), |ui| {
+                                ui.vertical_centered(|ui| {
+                                    ui.add_space(30.0);
+                                    ui.label(RichText::new("🖼️").size(60.0));
+                                });
+                            });
+                        }
+                    });
+                    
+                    ui.add_space(10.0);
+                    ui.label(RichText::new(&image.filename).size(13.0).color(AppColors::TEXT_PRIMARY).strong());
+                    
+                    let date = chrono::DateTime::from_timestamp(image.created_at, 0)
+                        .map(|d| d.format("%Y-%m-%d").to_string())
+                        .unwrap_or_default();
+                    ui.label(RichText::new(date).size(11.0).color(AppColors::TEXT_SECONDARY));
+                    
+                    ui.add_space(10.0);
+                    
+                    // Manage shares button
+                    if ui.add(egui::Button::new(RichText::new("👥 Manage Shares").size(12.0))
+                        .fill(AppColors::PRIMARY)
+                        .rounding(Rounding::same(4.0))
+                        .min_size(Vec2::new(180.0, 28.0))).clicked() {
+                        self.selected_cloud_image = Some(image_id.clone());
+                        self.load_image_shares(&image_id);
                     }
-                }
-                
-                ui.add_space(10.0);
-                ui.label(RichText::new(&image.filename).size(13.0).color(AppColors::TEXT_PRIMARY).strong());
-                
-                let date = chrono::DateTime::from_timestamp(image.created_at, 0)
-                    .map(|d| d.format("%Y-%m-%d").to_string())
-                    .unwrap_or_default();
-                ui.label(RichText::new(date).size(11.0).color(AppColors::TEXT_SECONDARY));
-                
-                ui.add_space(10.0);
-                
-                // Manage shares button
-                if ui.add(egui::Button::new(RichText::new("👥 Manage Shares").size(12.0))
-                    .fill(AppColors::PRIMARY)
-                    .rounding(Rounding::same(4.0))
-                    .min_size(Vec2::new(180.0, 28.0))).clicked() {
-                    self.selected_cloud_image = Some(image_id.clone());
-                    self.load_image_shares(&image_id);
-                }
-                
-                // Delete button  
-                if ui.add(egui::Button::new(RichText::new("🗑️ Delete").size(12.0))
-                    .fill(AppColors::ERROR.linear_multiply(0.7))
-                    .rounding(Rounding::same(4.0))
-                    .min_size(Vec2::new(180.0, 28.0))).clicked() {
-                    self.delete_cloud_image(&image_id);
-                }
+                    
+                    // Delete button  
+                    if ui.add(egui::Button::new(RichText::new("🗑️ Delete").size(12.0))
+                        .fill(AppColors::ERROR.linear_multiply(0.7))
+                        .rounding(Rounding::same(4.0))
+                        .min_size(Vec2::new(180.0, 28.0))).clicked() {
+                        self.delete_cloud_image(&image_id);
+                    }
+                });
             });
-        
-        ui.add_space(15.0);
     }
     
     fn upload_cloud_image(&mut self) {
@@ -5134,6 +5161,13 @@ impl ClientAppV2 {
                     self.load_shared_with_me();
                 }
                 
+                // Reload if flag is set (e.g., new share received via P2P)
+                if self.shared_with_me_needs_reload && self.shared_with_me_loading.is_none() {
+                    eprintln!("[SHARED] Reloading shared images due to new P2P share...");
+                    self.shared_with_me_needs_reload = false;
+                    self.load_shared_with_me();
+                }
+                
                 // Process loading
                 self.process_shared_with_me_loading(ctx);
                 
@@ -5208,17 +5242,22 @@ impl ClientAppV2 {
             .inner_margin(egui::Margin::same(20.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    // Preview
-                    if let Some(texture) = self.shared_textures.get(&image_id) {
-                        let size = Vec2::new(150.0, 100.0);
-                        ui.add(egui::Image::from_texture(texture).fit_to_exact_size(size));
-                    } else {
-                        if let Some(texture) = load_texture_from_data_url_with_name(ctx, &image.preview_data, &format!("shared_{}", image_id)) {
-                            self.shared_textures.insert(image_id.clone(), texture);
+                    // Preview with fixed size container
+                    ui.allocate_ui(Vec2::new(150.0, 100.0), |ui| {
+                        if let Some(texture) = self.shared_textures.get(&image_id) {
+                            let size = Vec2::new(150.0, 100.0);
+                            ui.add(egui::Image::from_texture(texture).fit_to_exact_size(size));
                         } else {
-                            ui.label(RichText::new("🖼️").size(50.0));
+                            if let Some(texture) = load_texture_from_data_url_with_name(ctx, &image.preview_data, &format!("shared_{}", image_id)) {
+                                self.shared_textures.insert(image_id.clone(), texture);
+                            }
+                            // Centered placeholder in fixed size container
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(25.0);
+                                ui.label(RichText::new("🖼️").size(50.0));
+                            });
                         }
-                    }
+                    });
                     
                     ui.add_space(20.0);
                     
@@ -5877,6 +5916,13 @@ impl ClientAppV2 {
                         eprintln!("[VIEW_INCREASE] Updated metadata for {} on image {} - new quota: {}", 
                             request.from_username, request.image_id, share.views_remaining);
                     }
+                    
+                    // Reset downloaded flag to allow re-download on new device
+                    firebase.reset_share_downloaded(&request.from_user_id, &request.share_id).await
+                        .map_err(|e| format!("Failed to reset downloaded flag: {}", e))?;
+                    
+                    eprintln!("[VIEW_INCREASE] Reset downloaded flag for {} on image {} - can download on new device", 
+                        request.from_username, request.image_id);
                 }
                 
                 Ok((request_id_clone, accepted))
@@ -6401,11 +6447,13 @@ async fn send_p2p_message(target_ip: &str, message: Message) -> Result<(), Strin
     let json = serde_json::to_vec(&message)
         .map_err(|e| format!("Failed to serialize message: {}", e))?;
     
+    // Use the IP:port as-is (Firebase stores the full address with port)
+    let target_addr = target_ip;
+    
     // Check if we need to chunk the message (if larger than 60KB)
     if json.len() > 60000 {
         // Large message - send in chunks
         let chunks = crate::chunking::ChunkedMessage::fragment(json);
-        let target_addr = format!("{}:8009", target_ip);
         
         for chunk in chunks {
             let chunk_json = serde_json::to_vec(&chunk)
@@ -6416,7 +6464,6 @@ async fn send_p2p_message(target_ip: &str, message: Message) -> Result<(), Strin
         }
     } else {
         // Small message - send directly
-        let target_addr = format!("{}:8009", target_ip);
         socket.send_to(&json, &target_addr).await
             .map_err(|e| format!("Failed to send message: {}", e))?;
     }
